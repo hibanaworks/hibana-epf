@@ -1,0 +1,17 @@
+[package]
+name = "hibana-epf"
+version = "0.1.0"
+edition = "2024"
+description = "EPF verifier and bytecode appliance for hibana"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hibanaworks/hibana-epf"
+homepage = "https://github.com/hibanaworks/hibana-epf"
+documentation = "https://docs.rs/hibana-epf"
+readme = "README.md"
+
+[features]
+default = []
+std = ["hibana/std"]
+
+[dependencies]
+hibana = { version = "0.1.0", git = "https://github.com/hibanaworks/hibana", branch = "main", default-features = false }
