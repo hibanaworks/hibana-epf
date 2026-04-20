@@ -398,7 +398,7 @@ impl<'code> Vm<'code> {
                             return VmAction::Trap(Trap::VerifyFailed);
                         }
                     };
-                    regs[dest] = encode_latency(ctx.transport_snapshot().latency_us);
+                    regs[dest] = encode_latency(ctx.transport_snapshot().latency_us());
                 }
                 ops::instr::GET_QUEUE => {
                     let dest = match read_reg(code, &mut pc) {
@@ -408,7 +408,7 @@ impl<'code> Vm<'code> {
                             return VmAction::Trap(Trap::VerifyFailed);
                         }
                     };
-                    regs[dest] = ctx.transport_snapshot().queue_depth.unwrap_or(0);
+                    regs[dest] = ctx.transport_snapshot().queue_depth().unwrap_or(0);
                 }
                 ops::instr::GET_CONGESTION => {
                     let dest = match read_reg(code, &mut pc) {
@@ -418,7 +418,7 @@ impl<'code> Vm<'code> {
                             return VmAction::Trap(Trap::VerifyFailed);
                         }
                     };
-                    regs[dest] = ctx.transport_snapshot().congestion_marks.unwrap_or(0);
+                    regs[dest] = ctx.transport_snapshot().congestion_marks().unwrap_or(0);
                 }
                 ops::instr::GET_RETRY => {
                     let dest = match read_reg(code, &mut pc) {
@@ -428,7 +428,7 @@ impl<'code> Vm<'code> {
                             return VmAction::Trap(Trap::VerifyFailed);
                         }
                     };
-                    regs[dest] = ctx.transport_snapshot().retransmissions.unwrap_or(0);
+                    regs[dest] = ctx.transport_snapshot().retransmissions().unwrap_or(0);
                 }
                 ops::instr::GET_SCOPE_RANGE => {
                     let dest = match read_reg(code, &mut pc) {
@@ -902,9 +902,14 @@ mod tests {
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 16);
         let mut ctx = make_ctx(Slot::EndpointTx, CapsMask::allow_all());
-        let snapshot = TransportSnapshot::new(Some(42), Some(9))
-            .with_congestion_marks(Some(7))
-            .with_retransmissions(Some(3));
+        let snapshot =
+            TransportSnapshot::from_parts(hibana::substrate::transport::TransportSnapshotParts {
+                latency_us: Some(42),
+                queue_depth: Some(9),
+                congestion_marks: Some(7),
+                retransmissions: Some(3),
+                ..hibana::substrate::transport::TransportSnapshotParts::new()
+            });
         ctx.set_transport_snapshot(snapshot);
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
@@ -1005,7 +1010,12 @@ mod tests {
     fn vm_ctx_transport_snapshot_roundtrip() {
         let mut ctx = make_ctx(Slot::Rendezvous, CapsMask::allow_all());
         assert_eq!(ctx.transport_snapshot(), TransportSnapshot::default());
-        let snapshot = TransportSnapshot::new(Some(42), Some(7));
+        let snapshot =
+            TransportSnapshot::from_parts(hibana::substrate::transport::TransportSnapshotParts {
+                latency_us: Some(42),
+                queue_depth: Some(7),
+                ..hibana::substrate::transport::TransportSnapshotParts::new()
+            });
         ctx.set_transport_snapshot(snapshot);
         assert_eq!(ctx.transport_snapshot(), snapshot);
     }

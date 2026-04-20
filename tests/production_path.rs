@@ -1,4 +1,8 @@
-use hibana::substrate::{cap::advanced::CapsMask, tap::TapEvent, transport::TransportSnapshot};
+use hibana::substrate::{
+    cap::advanced::CapsMask,
+    tap::TapEvent,
+    transport::{TransportSnapshot, TransportSnapshotParts},
+};
 use hibana_epf::{
     Action, Header, HostSlots, ScratchLease, Slot, host::HostError, loader::ImageLoader, run_with,
 };
@@ -64,7 +68,12 @@ fn production_run_with_executes_route_program_from_transport_snapshot() {
         CapsMask::allow_all(),
         None,
         None,
-        |ctx| ctx.set_transport_snapshot(TransportSnapshot::new(None, Some(3))),
+        |ctx| {
+            ctx.set_transport_snapshot(TransportSnapshot::from_parts(TransportSnapshotParts {
+                queue_depth: Some(3),
+                ..TransportSnapshotParts::new()
+            }))
+        },
     );
     assert_eq!(action, Action::Route { arm: 3 });
 }

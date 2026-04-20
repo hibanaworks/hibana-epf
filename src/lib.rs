@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod control_kinds;
 mod dispatch;
 pub mod host;
 pub mod loader;
@@ -8,12 +9,151 @@ mod slot_contract;
 pub mod verifier;
 pub mod vm;
 
+use crate::control_kinds::{
+    LABEL_POLICY_ACTIVATE, LABEL_POLICY_ANNOTATE, LABEL_POLICY_LOAD, LABEL_POLICY_REVERT,
+};
 use hibana::substrate::{
     Lane, SessionId, cap::advanced::CapsMask, tap::TapEvent, transport::TransportSnapshot,
 };
 pub use host::{HostSlots, ScratchLease};
 pub use verifier::Header;
 pub use vm::{Slot, Trap, VmCtx};
+
+pub const ROLE_CONTROLLER: u8 = 0;
+pub const ROLE_CLUSTER: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PolicyAnnotation {
+    pub digest: u32,
+}
+
+impl hibana::substrate::wire::WireEncode for PolicyAnnotation {
+    fn encoded_len(&self) -> Option<usize> {
+        Some(4)
+    }
+
+    fn encode_into(&self, out: &mut [u8]) -> Result<usize, hibana::substrate::wire::CodecError> {
+        if out.len() < 4 {
+            return Err(hibana::substrate::wire::CodecError::Truncated);
+        }
+        out[..4].copy_from_slice(&self.digest.to_be_bytes());
+        Ok(4)
+    }
+}
+
+impl hibana::substrate::wire::WirePayload for PolicyAnnotation {
+    type Decoded<'a> = Self;
+
+    fn decode_payload<'a>(
+        input: hibana::substrate::wire::Payload<'a>,
+    ) -> Result<Self::Decoded<'a>, hibana::substrate::wire::CodecError> {
+        let bytes = input.as_bytes();
+        if bytes.len() < 4 {
+            return Err(hibana::substrate::wire::CodecError::Truncated);
+        }
+        Ok(Self {
+            digest: u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        })
+    }
+}
+
+#[allow(private_bounds)]
+pub fn attach_controller<'r, 'cfg, T, U, C, const MAX_RV: usize>(
+    kit: &'r hibana::substrate::SessionKit<'cfg, T, U, C, MAX_RV>,
+    rv: hibana::substrate::RendezvousId,
+    sid: hibana::substrate::SessionId,
+) -> Result<
+    hibana::Endpoint<'r, ROLE_CONTROLLER>,
+    hibana::substrate::AttachError,
+>
+where
+    T: hibana::substrate::Transport + 'cfg,
+    U: hibana::substrate::runtime::LabelUniverse + 'cfg,
+    C: hibana::substrate::runtime::Clock + 'cfg,
+    'cfg: 'r,
+{
+    let load = hibana::g::send::<
+        hibana::g::Role<ROLE_CONTROLLER>,
+        hibana::g::Role<ROLE_CLUSTER>,
+        hibana::g::Msg<LABEL_POLICY_LOAD, u32>,
+        0,
+    >();
+    let activate = hibana::g::send::<
+        hibana::g::Role<ROLE_CONTROLLER>,
+        hibana::g::Role<ROLE_CLUSTER>,
+        hibana::g::Msg<LABEL_POLICY_ACTIVATE, u8>,
+        0,
+    >();
+    let revert = hibana::g::send::<
+        hibana::g::Role<ROLE_CONTROLLER>,
+        hibana::g::Role<ROLE_CLUSTER>,
+        hibana::g::Msg<LABEL_POLICY_REVERT, u8>,
+        0,
+    >();
+    let annotate = hibana::g::send::<
+        hibana::g::Role<ROLE_CONTROLLER>,
+        hibana::g::Role<ROLE_CLUSTER>,
+        hibana::g::Msg<LABEL_POLICY_ANNOTATE, PolicyAnnotation>,
+        0,
+    >();
+    let program = hibana::g::seq(
+        load,
+        hibana::g::seq(activate, hibana::g::seq(revert, annotate)),
+    );
+    let projected: hibana::g::advanced::RoleProgram<ROLE_CONTROLLER> =
+        hibana::g::advanced::project(&program);
+
+    kit.enter(rv, sid, &projected, hibana::substrate::binding::NoBinding)
+}
+
+#[allow(private_bounds)]
+pub fn attach_cluster<'r, 'cfg, T, U, C, const MAX_RV: usize>(
+    kit: &'r hibana::substrate::SessionKit<'cfg, T, U, C, MAX_RV>,
+    rv: hibana::substrate::RendezvousId,
+    sid: hibana::substrate::SessionId,
+) -> Result<
+    hibana::Endpoint<'r, ROLE_CLUSTER>,
+    hibana::substrate::AttachError,
+>
+where
+    T: hibana::substrate::Transport + 'cfg,
+    U: hibana::substrate::runtime::LabelUniverse + 'cfg,
+    C: hibana::substrate::runtime::Clock + 'cfg,
+    'cfg: 'r,
+{
+    let load = hibana::g::send::<
+        hibana::g::Role<ROLE_CONTROLLER>,
+        hibana::g::Role<ROLE_CLUSTER>,
+        hibana::g::Msg<LABEL_POLICY_LOAD, u32>,
+        0,
+    >();
+    let activate = hibana::g::send::<
+        hibana::g::Role<ROLE_CONTROLLER>,
+        hibana::g::Role<ROLE_CLUSTER>,
+        hibana::g::Msg<LABEL_POLICY_ACTIVATE, u8>,
+        0,
+    >();
+    let revert = hibana::g::send::<
+        hibana::g::Role<ROLE_CONTROLLER>,
+        hibana::g::Role<ROLE_CLUSTER>,
+        hibana::g::Msg<LABEL_POLICY_REVERT, u8>,
+        0,
+    >();
+    let annotate = hibana::g::send::<
+        hibana::g::Role<ROLE_CONTROLLER>,
+        hibana::g::Role<ROLE_CLUSTER>,
+        hibana::g::Msg<LABEL_POLICY_ANNOTATE, PolicyAnnotation>,
+        0,
+    >();
+    let program = hibana::g::seq(
+        load,
+        hibana::g::seq(activate, hibana::g::seq(revert, annotate)),
+    );
+    let projected: hibana::g::advanced::RoleProgram<ROLE_CLUSTER> =
+        hibana::g::advanced::project(&program);
+
+    kit.enter(rv, sid, &projected, hibana::substrate::binding::NoBinding)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ScopeTrace {
@@ -189,17 +329,17 @@ pub fn hash_policy_input(input: [u32; 4]) -> u32 {
 #[inline]
 pub fn hash_transport_snapshot(snapshot: TransportSnapshot) -> u32 {
     let mut hash = FNV32_OFFSET;
-    hash = fnv32_mix_opt_u64(hash, snapshot.latency_us);
-    hash = fnv32_mix_opt_u32(hash, snapshot.queue_depth);
-    hash = fnv32_mix_opt_u64(hash, snapshot.pacing_interval_us);
-    hash = fnv32_mix_opt_u32(hash, snapshot.congestion_marks);
-    hash = fnv32_mix_opt_u32(hash, snapshot.retransmissions);
-    hash = fnv32_mix_opt_u32(hash, snapshot.pto_count);
-    hash = fnv32_mix_opt_u64(hash, snapshot.srtt_us);
-    hash = fnv32_mix_opt_u64(hash, snapshot.latest_ack_pn);
-    hash = fnv32_mix_opt_u64(hash, snapshot.congestion_window);
-    hash = fnv32_mix_opt_u64(hash, snapshot.in_flight_bytes);
-    match snapshot.algorithm {
+    hash = fnv32_mix_opt_u64(hash, snapshot.latency_us());
+    hash = fnv32_mix_opt_u32(hash, snapshot.queue_depth());
+    hash = fnv32_mix_opt_u64(hash, snapshot.pacing_interval_us());
+    hash = fnv32_mix_opt_u32(hash, snapshot.congestion_marks());
+    hash = fnv32_mix_opt_u32(hash, snapshot.retransmissions());
+    hash = fnv32_mix_opt_u32(hash, snapshot.pto_count());
+    hash = fnv32_mix_opt_u64(hash, snapshot.srtt_us());
+    hash = fnv32_mix_opt_u64(hash, snapshot.latest_ack_pn());
+    hash = fnv32_mix_opt_u64(hash, snapshot.congestion_window());
+    hash = fnv32_mix_opt_u64(hash, snapshot.in_flight_bytes());
+    match snapshot.algorithm() {
         Some(hibana::substrate::transport::TransportAlgorithm::Cubic) => fnv32_mix_u8(hash, 1),
         Some(hibana::substrate::transport::TransportAlgorithm::Reno) => fnv32_mix_u8(hash, 2),
         Some(hibana::substrate::transport::TransportAlgorithm::Other(code)) => {
@@ -234,26 +374,26 @@ const fn opt_u32_or_zero(value: Option<u32>) -> u32 {
 #[inline]
 pub const fn replay_transport_inputs(snapshot: TransportSnapshot) -> [u32; 4] {
     [
-        saturating_u64_to_u32(snapshot.latency_us),
-        opt_u32_or_zero(snapshot.queue_depth),
-        opt_u32_or_zero(snapshot.congestion_marks),
-        opt_u32_or_zero(snapshot.retransmissions),
+        saturating_u64_to_u32(snapshot.latency_us()),
+        opt_u32_or_zero(snapshot.queue_depth()),
+        opt_u32_or_zero(snapshot.congestion_marks()),
+        opt_u32_or_zero(snapshot.retransmissions()),
     ]
 }
 
 #[inline]
 pub const fn replay_transport_presence(snapshot: TransportSnapshot) -> u8 {
     let mut mask = 0u8;
-    if snapshot.latency_us.is_some() {
+    if snapshot.latency_us().is_some() {
         mask |= 1 << 0;
     }
-    if snapshot.queue_depth.is_some() {
+    if snapshot.queue_depth().is_some() {
         mask |= 1 << 1;
     }
-    if snapshot.congestion_marks.is_some() {
+    if snapshot.congestion_marks().is_some() {
         mask |= 1 << 2;
     }
-    if snapshot.retransmissions.is_some() {
+    if snapshot.retransmissions().is_some() {
         mask |= 1 << 3;
     }
     mask
