@@ -47,10 +47,10 @@
 //! with [`Trap::VerifyFailed`]; the verifier prevents these in well-formed
 //! bytecode, but the interpreter defends against malformed images.
 
-use crate::{ScopeTrace, tap_scope};
+use crate::{OpSet, ScopeTrace, tap_scope};
 use hibana::{
     substrate::transport::TransportSnapshot,
-    substrate::{Lane, SessionId, cap::advanced::CapsMask, tap::TapEvent},
+    substrate::{Lane, SessionId, tap::TapEvent},
 };
 
 use super::{
@@ -113,7 +113,7 @@ pub(crate) struct Annotation {
 pub struct VmCtx<'a> {
     slot: Slot,
     event: &'a TapEvent,
-    caps: CapsMask,
+    caps: OpSet,
     session: Option<SessionId>,
     lane: Option<Lane>,
     scope: Option<ScopeTrace>,
@@ -125,7 +125,7 @@ pub struct VmCtx<'a> {
 }
 
 impl<'a> VmCtx<'a> {
-    pub(crate) fn new(slot: Slot, event: &'a TapEvent, caps: CapsMask) -> Self {
+    pub(crate) fn new(slot: Slot, event: &'a TapEvent, caps: OpSet) -> Self {
         Self {
             slot,
             event,
@@ -172,7 +172,7 @@ impl<'a> VmCtx<'a> {
         self.transport
     }
 
-    /// Validate that the VM is authorised to emit the given [`crate::control::cluster::effects::CpEffect`] and return it.
+    /// Validate that the VM is authorised to emit the given `ControlOp`-backed syscall and return it.
     #[inline]
     pub(crate) fn ensure_effect(&self, call: RaOp) -> Result<RaOp, SyscallError> {
         dispatch::ensure_allowed(self.slot, self.caps, call)
@@ -786,7 +786,7 @@ mod tests {
 
     const TEST_EVENT_ID: u16 = 0x0201;
 
-    fn make_ctx(slot: Slot, caps: CapsMask) -> VmCtx<'static> {
+    fn make_ctx(slot: Slot, caps: OpSet) -> VmCtx<'static> {
         // Static event used for the lifetime requirement inside VmCtx.
         static EVENT: TapEvent = TapEvent::zero();
         VmCtx::new(slot, &EVENT, caps)
@@ -807,7 +807,7 @@ mod tests {
         ];
         let mut mem = [0u8; 8];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = make_ctx(Slot::Rendezvous, CapsMask::allow_all());
+        let mut ctx = make_ctx(Slot::Rendezvous, OpSet::all_ops());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Ra(RaOp::SpliceBegin { arg: 7 }));
         assert_eq!(vm.fuel, 6);
@@ -818,7 +818,7 @@ mod tests {
         let code = [ops::instr::NOP];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 1);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::FuelExhausted));
         assert_eq!(vm.fuel, 0);
@@ -829,7 +829,7 @@ mod tests {
         let code = [0xFF];
         let mut mem = [0u8; 2];
         let mut vm = Vm::new(&code, &mut mem, 4);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::IllegalOpcode(0xFF)));
     }
@@ -848,7 +848,7 @@ mod tests {
         ];
         let mut mem = [0u8; 8];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = make_ctx(Slot::Route, CapsMask::allow_all());
+        let mut ctx = make_ctx(Slot::Route, OpSet::all_ops());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Route { arm: 2 });
     }
@@ -867,7 +867,7 @@ mod tests {
         ];
         let mut mem = [0u8; 8];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = make_ctx(Slot::Route, CapsMask::allow_all());
+        let mut ctx = make_ctx(Slot::Route, OpSet::all_ops());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Defer { retry_hint: 7 });
     }
@@ -901,7 +901,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 16);
-        let mut ctx = make_ctx(Slot::EndpointTx, CapsMask::allow_all());
+        let mut ctx = make_ctx(Slot::EndpointTx, OpSet::all_ops());
         let snapshot =
             TransportSnapshot::from_parts(hibana::substrate::transport::TransportSnapshotParts {
                 latency_us: Some(42),
@@ -955,7 +955,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 12);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, CapsMask::allow_all());
+        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(mem[0], scope.range as u8);
@@ -999,7 +999,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 12);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, CapsMask::allow_all());
+        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(mem[0], 0);
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn vm_ctx_transport_snapshot_roundtrip() {
-        let mut ctx = make_ctx(Slot::Rendezvous, CapsMask::allow_all());
+        let mut ctx = make_ctx(Slot::Rendezvous, OpSet::all_ops());
         assert_eq!(ctx.transport_snapshot(), TransportSnapshot::default());
         let snapshot =
             TransportSnapshot::from_parts(hibana::substrate::transport::TransportSnapshotParts {
@@ -1041,7 +1041,7 @@ mod tests {
         ];
         let mut mem = [0u8; 8];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::OutOfBounds));
     }
@@ -1055,7 +1055,7 @@ mod tests {
         ];
         let mut mem = [0u8; 2];
         let mut vm = Vm::new(&code, &mut mem, 4);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::IllegalSyscall));
     }
@@ -1069,7 +1069,7 @@ mod tests {
         ];
         let mut mem = [0u8; 1];
         let mut vm = Vm::new(&code, &mut mem, 4);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let abort = vm.execute(&mut ctx);
         assert_eq!(abort, VmAction::Abort { reason: 0x3039 });
     }
@@ -1101,7 +1101,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 16);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(ctx.annot_count(), 2);
@@ -1192,7 +1192,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 32);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(ctx.annot_count(), 6);
@@ -1226,7 +1226,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, CapsMask::allow_all());
+        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
         let action = vm.execute(&mut ctx);
         assert_eq!(
             action,
@@ -1257,7 +1257,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, CapsMask::allow_all());
+        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
         let action = vm.execute(&mut ctx);
         assert_eq!(
             action,
@@ -1287,7 +1287,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, CapsMask::allow_all());
+        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
         ctx.set_policy_input([11, 22, 33, 44]);
         let action = vm.execute(&mut ctx);
         assert_eq!(
@@ -1314,7 +1314,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, CapsMask::allow_all());
+        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::VerifyFailed));
     }
@@ -1345,7 +1345,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(u32::from_le_bytes(mem), 0xFF); // 0xFF00 >> 8 = 0xFF
@@ -1378,7 +1378,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(u32::from_le_bytes(mem), 2); // 4 >> 1 = 2
@@ -1416,7 +1416,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 12);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(u32::from_le_bytes(mem), 0x0FFF & 0xF0F0); // 0x00F0
@@ -1448,7 +1448,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(u32::from_le_bytes(mem), 0xAB); // 0xCDAB & 0xFF = 0xAB
@@ -1487,7 +1487,7 @@ mod tests {
 
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&full_code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         // If jump worked, we should have executed 3 instructions: LOAD_IMM, JUMP_EQ_IMM, HALT
@@ -1515,7 +1515,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         // LOAD_IMM, JUMP_EQ_IMM (no jump), HALT = 3 instructions, fuel 7
@@ -1540,7 +1540,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, CapsMask::empty());
+        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::OutOfBounds));
     }

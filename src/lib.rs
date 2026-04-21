@@ -10,10 +10,14 @@ pub mod verifier;
 pub mod vm;
 
 use crate::control_kinds::{
-    LABEL_POLICY_ACTIVATE, LABEL_POLICY_ANNOTATE, LABEL_POLICY_LOAD, LABEL_POLICY_REVERT,
+    PolicyActivateKind, PolicyAnnotateKind, PolicyLoadKind, PolicyRevertKind,
 };
 use hibana::substrate::{
-    Lane, SessionId, cap::advanced::CapsMask, tap::TapEvent, transport::TransportSnapshot,
+    Lane, SessionId,
+    cap::advanced::ControlOp,
+    cap::{ControlResourceKind, GenericCapToken},
+    tap::TapEvent,
+    transport::TransportSnapshot,
 };
 pub use host::{HostSlots, ScratchLease};
 pub use verifier::Header;
@@ -21,6 +25,41 @@ pub use vm::{Slot, Trap, VmCtx};
 
 pub const ROLE_CONTROLLER: u8 = 0;
 pub const ROLE_CLUSTER: u8 = 1;
+
+/// ```compile_fail
+/// use hibana::g;
+/// use hibana_epf::control_kinds::PolicyLoadKind;
+///
+/// let _ = g::send::<
+///     g::Role<0>,
+///     g::Role<1>,
+///     g::Msg<{ <PolicyLoadKind as hibana::substrate::cap::ControlResourceKind>::LABEL }, u32>,
+///     0,
+/// >();
+/// ```
+///
+/// EPF lifecycle controls must use `GenericCapToken<K>` and the control kind as the
+/// third message parameter. The old raw label/payload path is forbidden.
+type PolicyLoadControlMsg = hibana::g::Msg<
+    { <PolicyLoadKind as ControlResourceKind>::LABEL },
+    GenericCapToken<PolicyLoadKind>,
+    PolicyLoadKind,
+>;
+type PolicyActivateControlMsg = hibana::g::Msg<
+    { <PolicyActivateKind as ControlResourceKind>::LABEL },
+    GenericCapToken<PolicyActivateKind>,
+    PolicyActivateKind,
+>;
+type PolicyRevertControlMsg = hibana::g::Msg<
+    { <PolicyRevertKind as ControlResourceKind>::LABEL },
+    GenericCapToken<PolicyRevertKind>,
+    PolicyRevertKind,
+>;
+type PolicyAnnotateControlMsg = hibana::g::Msg<
+    { <PolicyAnnotateKind as ControlResourceKind>::LABEL },
+    GenericCapToken<PolicyAnnotateKind>,
+    PolicyAnnotateKind,
+>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PolicyAnnotation {
@@ -62,10 +101,7 @@ pub fn attach_controller<'r, 'cfg, T, U, C, const MAX_RV: usize>(
     kit: &'r hibana::substrate::SessionKit<'cfg, T, U, C, MAX_RV>,
     rv: hibana::substrate::RendezvousId,
     sid: hibana::substrate::SessionId,
-) -> Result<
-    hibana::Endpoint<'r, ROLE_CONTROLLER>,
-    hibana::substrate::AttachError,
->
+) -> Result<hibana::Endpoint<'r, ROLE_CONTROLLER>, hibana::substrate::AttachError>
 where
     T: hibana::substrate::Transport + 'cfg,
     U: hibana::substrate::runtime::LabelUniverse + 'cfg,
@@ -74,26 +110,26 @@ where
 {
     let load = hibana::g::send::<
         hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CLUSTER>,
-        hibana::g::Msg<LABEL_POLICY_LOAD, u32>,
+        hibana::g::Role<ROLE_CONTROLLER>,
+        PolicyLoadControlMsg,
         0,
     >();
     let activate = hibana::g::send::<
         hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CLUSTER>,
-        hibana::g::Msg<LABEL_POLICY_ACTIVATE, u8>,
+        hibana::g::Role<ROLE_CONTROLLER>,
+        PolicyActivateControlMsg,
         0,
     >();
     let revert = hibana::g::send::<
         hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CLUSTER>,
-        hibana::g::Msg<LABEL_POLICY_REVERT, u8>,
+        hibana::g::Role<ROLE_CONTROLLER>,
+        PolicyRevertControlMsg,
         0,
     >();
     let annotate = hibana::g::send::<
         hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CLUSTER>,
-        hibana::g::Msg<LABEL_POLICY_ANNOTATE, PolicyAnnotation>,
+        hibana::g::Role<ROLE_CONTROLLER>,
+        PolicyAnnotateControlMsg,
         0,
     >();
     let program = hibana::g::seq(
@@ -111,10 +147,7 @@ pub fn attach_cluster<'r, 'cfg, T, U, C, const MAX_RV: usize>(
     kit: &'r hibana::substrate::SessionKit<'cfg, T, U, C, MAX_RV>,
     rv: hibana::substrate::RendezvousId,
     sid: hibana::substrate::SessionId,
-) -> Result<
-    hibana::Endpoint<'r, ROLE_CLUSTER>,
-    hibana::substrate::AttachError,
->
+) -> Result<hibana::Endpoint<'r, ROLE_CLUSTER>, hibana::substrate::AttachError>
 where
     T: hibana::substrate::Transport + 'cfg,
     U: hibana::substrate::runtime::LabelUniverse + 'cfg,
@@ -123,26 +156,26 @@ where
 {
     let load = hibana::g::send::<
         hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CLUSTER>,
-        hibana::g::Msg<LABEL_POLICY_LOAD, u32>,
+        hibana::g::Role<ROLE_CONTROLLER>,
+        PolicyLoadControlMsg,
         0,
     >();
     let activate = hibana::g::send::<
         hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CLUSTER>,
-        hibana::g::Msg<LABEL_POLICY_ACTIVATE, u8>,
+        hibana::g::Role<ROLE_CONTROLLER>,
+        PolicyActivateControlMsg,
         0,
     >();
     let revert = hibana::g::send::<
         hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CLUSTER>,
-        hibana::g::Msg<LABEL_POLICY_REVERT, u8>,
+        hibana::g::Role<ROLE_CONTROLLER>,
+        PolicyRevertControlMsg,
         0,
     >();
     let annotate = hibana::g::send::<
         hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CLUSTER>,
-        hibana::g::Msg<LABEL_POLICY_ANNOTATE, PolicyAnnotation>,
+        hibana::g::Role<ROLE_CONTROLLER>,
+        PolicyAnnotateControlMsg,
         0,
     >();
     let program = hibana::g::seq(
@@ -205,6 +238,35 @@ pub enum PolicyVerdict {
     Proceed,
     RouteArm(u8),
     Reject(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OpSet {
+    bits: u16,
+}
+
+impl OpSet {
+    #[cfg(test)]
+    pub(crate) const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
+    pub(crate) const fn all_ops() -> Self {
+        Self {
+            bits: (1u16 << 14) - 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with(self, op: ControlOp) -> Self {
+        Self {
+            bits: self.bits | (1u16 << (op as u8)),
+        }
+    }
+
+    pub(crate) const fn allows(self, op: ControlOp) -> bool {
+        (self.bits & (1u16 << (op as u8))) != 0
+    }
 }
 
 #[inline]
@@ -439,7 +501,6 @@ pub fn run_with<F>(
     host_slots: &HostSlots<'_>,
     slot: Slot,
     event: &TapEvent,
-    caps: CapsMask,
     session: Option<SessionId>,
     lane: Option<Lane>,
     configure: F,
@@ -447,7 +508,8 @@ pub fn run_with<F>(
 where
     F: FnOnce(&mut VmCtx<'_>),
 {
-    let vm_action = host_slots.execute_with(slot, event, caps, session, lane, configure);
+    let vm_action =
+        host_slots.execute_with(slot, event, OpSet::all_ops(), session, lane, configure);
     let action = match vm_action {
         VmAction::Proceed => Action::Proceed,
         VmAction::Abort { reason } => Action::Abort(AbortInfo { reason, trap: None }),

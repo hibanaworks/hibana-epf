@@ -46,10 +46,27 @@ fn lifecycle_surface_uses_attach_helpers_not_raw_program_exports() {
         "pub struct PolicyActivateKind;",
         "pub struct PolicyRevertKind;",
         "pub struct PolicyAnnotateKind;",
+        "GenericCapToken<PolicyLoadKind>",
+        "GenericCapToken<PolicyActivateKind>",
+        "GenericCapToken<PolicyRevertKind>",
+        "GenericCapToken<PolicyAnnotateKind>",
     ] {
         assert!(
-            kinds.contains(required),
-            "hibana-epf must own lifecycle kind vocabulary: {required}"
+            kinds.contains(required) || src.contains(required),
+            "hibana-epf must own lifecycle kind vocabulary and use control-kind messages: {required}"
+        );
+    }
+
+    for forbidden in [
+        "Msg<LABEL_POLICY_LOAD, u32>",
+        "Msg<LABEL_POLICY_ACTIVATE, u8>",
+        "Msg<LABEL_POLICY_REVERT, u8>",
+        "Msg<LABEL_POLICY_ANNOTATE, PolicyAnnotation>",
+        "Role<ROLE_CONTROLLER>,\n        hibana::g::Role<ROLE_CLUSTER>,",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "hibana-epf attach helpers must not use the old raw label/payload path: {forbidden}"
         );
     }
 }

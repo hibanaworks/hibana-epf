@@ -1,24 +1,8 @@
 use hibana::substrate::{
     Lane, SessionId,
-    cap::advanced::{
-        CAP_HANDLE_LEN, CapError, CapsMask, ControlHandling, ControlMint, ControlScopeKind, ScopeId,
-    },
+    cap::advanced::{CAP_HANDLE_LEN, CapError, ControlOp, ControlPath, ControlScopeKind, ScopeId},
     cap::{CapShot, ControlResourceKind, ResourceKind},
 };
-
-pub(crate) const LABEL_POLICY_LOAD: u8 = 210;
-pub(crate) const LABEL_POLICY_ACTIVATE: u8 = 211;
-pub(crate) const LABEL_POLICY_REVERT: u8 = 212;
-pub(crate) const LABEL_POLICY_ANNOTATE: u8 = 213;
-
-// Mirrors the core fence-authorized lifecycle mask until the substrate exposes
-// a public effect-specific mask constructor.
-const FENCE_MASK_BITS: u16 = 1 << 7;
-
-#[inline]
-const fn fence_caps() -> CapsMask {
-    CapsMask::from_bits(FENCE_MASK_BITS)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PolicyLoadKind;
@@ -27,7 +11,6 @@ impl ResourceKind for PolicyLoadKind {
     type Handle = (u32, u16);
     const TAG: u8 = 0x4A;
     const NAME: &'static str = "PolicyLoad";
-    const AUTO_MINT_EXTERNAL: bool = false;
 
     fn encode_handle(handle: &Self::Handle) -> [u8; CAP_HANDLE_LEN] {
         let mut buf = [0u8; CAP_HANDLE_LEN];
@@ -44,28 +27,20 @@ impl ResourceKind for PolicyLoadKind {
     }
 
     fn zeroize(_handle: &mut Self::Handle) {}
-
-    fn caps_mask(_handle: &Self::Handle) -> CapsMask {
-        fence_caps()
-    }
-
-    fn scope_id(_handle: &Self::Handle) -> Option<ScopeId> {
-        None
-    }
-}
-
-impl ControlMint for PolicyLoadKind {
-    fn mint_handle(sid: SessionId, lane: Lane, _scope: ScopeId) -> Self::Handle {
-        (sid.raw(), lane.raw() as u16)
-    }
 }
 
 impl ControlResourceKind for PolicyLoadKind {
-    const LABEL: u8 = LABEL_POLICY_LOAD;
+    const LABEL: u8 = 106;
     const SCOPE: ControlScopeKind = ControlScopeKind::Policy;
+    const PATH: ControlPath = ControlPath::Local;
     const TAP_ID: u16 = 0;
     const SHOT: CapShot = CapShot::One;
-    const HANDLING: ControlHandling = ControlHandling::Canonical;
+    const OP: ControlOp = ControlOp::Fence;
+    const AUTO_MINT_WIRE: bool = false;
+
+    fn mint_handle(session: SessionId, lane: Lane, _scope: ScopeId) -> Self::Handle {
+        (session.raw(), lane.raw() as u16)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +50,6 @@ impl ResourceKind for PolicyActivateKind {
     type Handle = (u32, u16);
     const TAG: u8 = 0x4B;
     const NAME: &'static str = "PolicyActivate";
-    const AUTO_MINT_EXTERNAL: bool = false;
 
     fn encode_handle(handle: &Self::Handle) -> [u8; CAP_HANDLE_LEN] {
         PolicyLoadKind::encode_handle(handle)
@@ -86,28 +60,20 @@ impl ResourceKind for PolicyActivateKind {
     }
 
     fn zeroize(_handle: &mut Self::Handle) {}
-
-    fn caps_mask(_handle: &Self::Handle) -> CapsMask {
-        fence_caps()
-    }
-
-    fn scope_id(_handle: &Self::Handle) -> Option<ScopeId> {
-        None
-    }
-}
-
-impl ControlMint for PolicyActivateKind {
-    fn mint_handle(sid: SessionId, lane: Lane, _scope: ScopeId) -> Self::Handle {
-        (sid.raw(), lane.raw() as u16)
-    }
 }
 
 impl ControlResourceKind for PolicyActivateKind {
-    const LABEL: u8 = LABEL_POLICY_ACTIVATE;
+    const LABEL: u8 = 107;
     const SCOPE: ControlScopeKind = ControlScopeKind::Policy;
+    const PATH: ControlPath = ControlPath::Local;
     const TAP_ID: u16 = 0;
     const SHOT: CapShot = CapShot::One;
-    const HANDLING: ControlHandling = ControlHandling::Canonical;
+    const OP: ControlOp = ControlOp::TxCommit;
+    const AUTO_MINT_WIRE: bool = false;
+
+    fn mint_handle(session: SessionId, lane: Lane, _scope: ScopeId) -> Self::Handle {
+        (session.raw(), lane.raw() as u16)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,7 +83,6 @@ impl ResourceKind for PolicyRevertKind {
     type Handle = (u32, u16);
     const TAG: u8 = 0x4C;
     const NAME: &'static str = "PolicyRevert";
-    const AUTO_MINT_EXTERNAL: bool = false;
 
     fn encode_handle(handle: &Self::Handle) -> [u8; CAP_HANDLE_LEN] {
         PolicyLoadKind::encode_handle(handle)
@@ -128,28 +93,20 @@ impl ResourceKind for PolicyRevertKind {
     }
 
     fn zeroize(_handle: &mut Self::Handle) {}
-
-    fn caps_mask(_handle: &Self::Handle) -> CapsMask {
-        fence_caps()
-    }
-
-    fn scope_id(_handle: &Self::Handle) -> Option<ScopeId> {
-        None
-    }
-}
-
-impl ControlMint for PolicyRevertKind {
-    fn mint_handle(sid: SessionId, lane: Lane, _scope: ScopeId) -> Self::Handle {
-        (sid.raw(), lane.raw() as u16)
-    }
 }
 
 impl ControlResourceKind for PolicyRevertKind {
-    const LABEL: u8 = LABEL_POLICY_REVERT;
+    const LABEL: u8 = 108;
     const SCOPE: ControlScopeKind = ControlScopeKind::Policy;
+    const PATH: ControlPath = ControlPath::Local;
     const TAP_ID: u16 = 0;
     const SHOT: CapShot = CapShot::One;
-    const HANDLING: ControlHandling = ControlHandling::Canonical;
+    const OP: ControlOp = ControlOp::TxAbort;
+    const AUTO_MINT_WIRE: bool = false;
+
+    fn mint_handle(session: SessionId, lane: Lane, _scope: ScopeId) -> Self::Handle {
+        (session.raw(), lane.raw() as u16)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,7 +116,6 @@ impl ResourceKind for PolicyAnnotateKind {
     type Handle = (u32, u32);
     const TAG: u8 = 0x4D;
     const NAME: &'static str = "PolicyAnnotate";
-    const AUTO_MINT_EXTERNAL: bool = false;
 
     fn encode_handle(handle: &Self::Handle) -> [u8; CAP_HANDLE_LEN] {
         let mut buf = [0u8; CAP_HANDLE_LEN];
@@ -176,26 +132,18 @@ impl ResourceKind for PolicyAnnotateKind {
     }
 
     fn zeroize(_handle: &mut Self::Handle) {}
-
-    fn caps_mask(_handle: &Self::Handle) -> CapsMask {
-        fence_caps()
-    }
-
-    fn scope_id(_handle: &Self::Handle) -> Option<ScopeId> {
-        None
-    }
-}
-
-impl ControlMint for PolicyAnnotateKind {
-    fn mint_handle(_sid: SessionId, _lane: Lane, _scope: ScopeId) -> Self::Handle {
-        (0, 0)
-    }
 }
 
 impl ControlResourceKind for PolicyAnnotateKind {
-    const LABEL: u8 = LABEL_POLICY_ANNOTATE;
+    const LABEL: u8 = 109;
     const SCOPE: ControlScopeKind = ControlScopeKind::Policy;
+    const PATH: ControlPath = ControlPath::Local;
     const TAP_ID: u16 = 0;
     const SHOT: CapShot = CapShot::One;
-    const HANDLING: ControlHandling = ControlHandling::Canonical;
+    const OP: ControlOp = ControlOp::Fence;
+    const AUTO_MINT_WIRE: bool = false;
+
+    fn mint_handle(_session: SessionId, _lane: Lane, _scope: ScopeId) -> Self::Handle {
+        (0, 0)
+    }
 }

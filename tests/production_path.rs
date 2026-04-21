@@ -1,5 +1,4 @@
 use hibana::substrate::{
-    cap::advanced::CapsMask,
     tap::TapEvent,
     transport::{TransportSnapshot, TransportSnapshotParts},
 };
@@ -33,15 +32,9 @@ fn production_run_with_executes_route_program_from_policy_input() {
         .expect("install");
 
     static EVENT: TapEvent = TapEvent::zero();
-    let action = run_with(
-        &slots,
-        Slot::Route,
-        &EVENT,
-        CapsMask::allow_all(),
-        None,
-        None,
-        |ctx| ctx.set_policy_input([2, 0, 0, 0]),
-    );
+    let action = run_with(&slots, Slot::Route, &EVENT, None, None, |ctx| {
+        ctx.set_policy_input([2, 0, 0, 0])
+    });
     assert_eq!(action, Action::Route { arm: 2 });
 }
 
@@ -61,20 +54,12 @@ fn production_run_with_executes_route_program_from_transport_snapshot() {
         .expect("install");
 
     static EVENT: TapEvent = TapEvent::zero();
-    let action = run_with(
-        &slots,
-        Slot::Route,
-        &EVENT,
-        CapsMask::allow_all(),
-        None,
-        None,
-        |ctx| {
-            ctx.set_transport_snapshot(TransportSnapshot::from_parts(TransportSnapshotParts {
-                queue_depth: Some(3),
-                ..TransportSnapshotParts::new()
-            }))
-        },
-    );
+    let action = run_with(&slots, Slot::Route, &EVENT, None, None, |ctx| {
+        ctx.set_transport_snapshot(TransportSnapshot::from_parts(TransportSnapshotParts {
+            queue_depth: Some(3),
+            ..TransportSnapshotParts::new()
+        }))
+    });
     assert_eq!(action, Action::Route { arm: 3 });
 }
 
@@ -103,15 +88,7 @@ fn production_install_owns_active_code_and_allows_loader_reuse() {
     let staged = loader.commit_for_slot(Slot::Route).expect("verify staged");
 
     static EVENT: TapEvent = TapEvent::zero();
-    let still_active = run_with(
-        &slots,
-        Slot::Route,
-        &EVENT,
-        CapsMask::allow_all(),
-        None,
-        None,
-        |_| {},
-    );
+    let still_active = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
     assert_eq!(still_active, Action::Route { arm: 7 });
 
     let scratch = slots.uninstall(Slot::Route).expect("uninstall active");
@@ -119,15 +96,7 @@ fn production_install_owns_active_code_and_allows_loader_reuse() {
         .install_verified(Slot::Route, staged, scratch)
         .expect("reinstall staged");
 
-    let replaced = run_with(
-        &slots,
-        Slot::Route,
-        &EVENT,
-        CapsMask::allow_all(),
-        None,
-        None,
-        |_| {},
-    );
+    let replaced = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
     assert_eq!(replaced, Action::Route { arm: 2 });
 }
 
@@ -169,14 +138,6 @@ fn production_failed_install_returns_scratch_for_retry() {
         .expect("retry install");
 
     static EVENT: TapEvent = TapEvent::zero();
-    let action = run_with(
-        &slots,
-        Slot::Route,
-        &EVENT,
-        CapsMask::allow_all(),
-        None,
-        None,
-        |_| {},
-    );
+    let action = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
     assert_eq!(action, Action::Route { arm: 5 });
 }

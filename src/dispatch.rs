@@ -1,13 +1,7 @@
-use hibana::substrate::cap::advanced::CapsMask;
+use hibana::substrate::cap::advanced::ControlOp;
 
-use crate::ops;
 use crate::vm::Slot;
-
-const CP_EFFECT_SPLICE_BEGIN_BIT: u16 = 1 << 1;
-const CP_EFFECT_SPLICE_COMMIT_BIT: u16 = 1 << 3;
-const CP_EFFECT_ABORT_BIT: u16 = 1 << 9;
-const CP_EFFECT_CHECKPOINT_BIT: u16 = 1 << 10;
-const CP_EFFECT_ROLLBACK_BIT: u16 = 1 << 11;
+use crate::{OpSet, ops};
 
 /// Rendezvous control operations surfaced by the VM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,13 +15,13 @@ pub(crate) enum RaOp {
 
 impl RaOp {
     #[inline]
-    const fn required_bit(self) -> u16 {
+    const fn required_op(self) -> ControlOp {
         match self {
-            RaOp::SpliceBegin { .. } => CP_EFFECT_SPLICE_BEGIN_BIT,
-            RaOp::SpliceCommit { .. } => CP_EFFECT_SPLICE_COMMIT_BIT,
-            RaOp::SpliceAbort { .. } => CP_EFFECT_ABORT_BIT,
-            RaOp::Checkpoint => CP_EFFECT_CHECKPOINT_BIT,
-            RaOp::Rollback { .. } => CP_EFFECT_ROLLBACK_BIT,
+            RaOp::SpliceBegin { .. } => ControlOp::TopologyBegin,
+            RaOp::SpliceCommit { .. } => ControlOp::TopologyCommit,
+            RaOp::SpliceAbort { .. } => ControlOp::AbortBegin,
+            RaOp::Checkpoint => ControlOp::StateSnapshot,
+            RaOp::Rollback { .. } => ControlOp::StateRestore,
         }
     }
 }
@@ -53,11 +47,11 @@ pub(crate) fn decode_effect_call(op: u8, arg: u32) -> Result<RaOp, SyscallError>
 }
 
 /// Validate that the requested control-plane effect is permitted for the given slot.
-pub(crate) fn ensure_allowed(slot: Slot, caps: CapsMask, op: RaOp) -> Result<RaOp, SyscallError> {
-    if !matches!(slot, Slot::Rendezvous) || (caps.bits() & op.required_bit()) == 0 {
+pub(crate) fn ensure_allowed(slot: Slot, caps: OpSet, op: RaOp) -> Result<RaOp, SyscallError> {
+    if !matches!(slot, Slot::Rendezvous) || !caps.allows(op.required_op()) {
         return Err(SyscallError::NotAuthorised {
             slot,
-            opcode: op.required_bit().trailing_zeros() as u8,
+            opcode: op.required_op() as u8,
         });
     }
     Ok(op)

@@ -2,10 +2,10 @@
 
 use core::{array, cell::Cell, marker::PhantomData, ptr::NonNull};
 
-use hibana::substrate::{Lane, SessionId, cap::advanced::CapsMask, tap::TapEvent};
+use hibana::substrate::{Lane, SessionId, tap::TapEvent};
 
 use super::{
-    PolicyMode,
+    OpSet, PolicyMode,
     verifier::{Header, VerifiedImage, VerifyError},
     vm::{Slot, Vm, VmAction, VmCtx},
 };
@@ -331,7 +331,7 @@ impl<'arena> HostSlots<'arena> {
         &self,
         slot: Slot,
         event: &TapEvent,
-        caps: CapsMask,
+        caps: OpSet,
         session: Option<SessionId>,
         lane: Option<Lane>,
         configure: F,
@@ -402,7 +402,6 @@ mod tests {
         let result = slots.execute_with(
             Slot::Rendezvous,
             &EVENT,
-            CapsMask::allow_all(),
             Some(SessionId::new(7)),
             Some(Lane::new(3)),
             |_| {},
@@ -428,30 +427,14 @@ mod tests {
             .expect("install");
 
         static EVENT: TapEvent = TapEvent::zero();
-        let enforce = run_with(
-            &slots,
-            Slot::Route,
-            &EVENT,
-            CapsMask::allow_all(),
-            None,
-            None,
-            |_| {},
-        );
+        let enforce = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
         assert!(matches!(
             enforce,
             Action::Abort(AbortInfo { reason: 0x1234, .. })
         ));
 
         slots.set_policy_mode(Slot::Route, PolicyMode::Shadow);
-        let shadow = run_with(
-            &slots,
-            Slot::Route,
-            &EVENT,
-            CapsMask::allow_all(),
-            None,
-            None,
-            |_| {},
-        );
+        let shadow = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
         assert_eq!(shadow, Action::Proceed);
     }
 
