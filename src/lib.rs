@@ -257,13 +257,6 @@ impl OpSet {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn with(self, op: ControlOp) -> Self {
-        Self {
-            bits: self.bits | (1u16 << (op as u8)),
-        }
-    }
-
     pub(crate) const fn allows(self, op: ControlOp) -> bool {
         (self.bits & (1u16 << (op as u8))) != 0
     }

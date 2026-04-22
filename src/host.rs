@@ -402,6 +402,7 @@ mod tests {
         let result = slots.execute_with(
             Slot::Rendezvous,
             &EVENT,
+            OpSet::all_ops(),
             Some(SessionId::new(7)),
             Some(Lane::new(3)),
             |_| {},

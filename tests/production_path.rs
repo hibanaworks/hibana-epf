@@ -1,6 +1,7 @@
 use hibana::substrate::{
+    policy::{ContextValue, PolicyAttrs, core as policy_core},
     tap::TapEvent,
-    transport::{TransportSnapshot, TransportSnapshotParts},
+    transport::TransportSnapshot,
 };
 use hibana_epf::{
     Action, Header, HostSlots, ScratchLease, Slot, host::HostError, loader::ImageLoader, run_with,
@@ -14,6 +15,18 @@ fn header_for(code: &[u8], mem_len: u16) -> Header {
         flags: 0,
         hash: hibana_epf::verifier::compute_hash(code),
     }
+}
+
+fn queue_depth_snapshot(queue_depth: u32) -> TransportSnapshot {
+    let mut attrs = PolicyAttrs::new();
+    assert!(
+        attrs.insert(
+            policy_core::QUEUE_DEPTH,
+            ContextValue::from_u32(queue_depth),
+        ),
+        "queue depth attr must fit in PolicyAttrs"
+    );
+    TransportSnapshot::from_policy_attrs(&attrs)
 }
 
 #[test]
@@ -55,10 +68,7 @@ fn production_run_with_executes_route_program_from_transport_snapshot() {
 
     static EVENT: TapEvent = TapEvent::zero();
     let action = run_with(&slots, Slot::Route, &EVENT, None, None, |ctx| {
-        ctx.set_transport_snapshot(TransportSnapshot::from_parts(TransportSnapshotParts {
-            queue_depth: Some(3),
-            ..TransportSnapshotParts::new()
-        }))
+        ctx.set_transport_snapshot(queue_depth_snapshot(3))
     });
     assert_eq!(action, Action::Route { arm: 3 });
 }

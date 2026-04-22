@@ -4,6 +4,11 @@ use hibana::substrate::{
     cap::{CapShot, ControlResourceKind, ResourceKind},
 };
 
+const TAP_POLICY_LOAD: u16 = 0x0300 + 106;
+const TAP_POLICY_ACTIVATE: u16 = 0x0300 + 107;
+const TAP_POLICY_REVERT: u16 = 0x0300 + 108;
+const TAP_POLICY_ANNOTATE: u16 = 0x0300 + 109;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PolicyLoadKind;
 
@@ -33,7 +38,7 @@ impl ControlResourceKind for PolicyLoadKind {
     const LABEL: u8 = 106;
     const SCOPE: ControlScopeKind = ControlScopeKind::Policy;
     const PATH: ControlPath = ControlPath::Local;
-    const TAP_ID: u16 = 0;
+    const TAP_ID: u16 = TAP_POLICY_LOAD;
     const SHOT: CapShot = CapShot::One;
     const OP: ControlOp = ControlOp::Fence;
     const AUTO_MINT_WIRE: bool = false;
@@ -66,7 +71,7 @@ impl ControlResourceKind for PolicyActivateKind {
     const LABEL: u8 = 107;
     const SCOPE: ControlScopeKind = ControlScopeKind::Policy;
     const PATH: ControlPath = ControlPath::Local;
-    const TAP_ID: u16 = 0;
+    const TAP_ID: u16 = TAP_POLICY_ACTIVATE;
     const SHOT: CapShot = CapShot::One;
     const OP: ControlOp = ControlOp::TxCommit;
     const AUTO_MINT_WIRE: bool = false;
@@ -99,7 +104,7 @@ impl ControlResourceKind for PolicyRevertKind {
     const LABEL: u8 = 108;
     const SCOPE: ControlScopeKind = ControlScopeKind::Policy;
     const PATH: ControlPath = ControlPath::Local;
-    const TAP_ID: u16 = 0;
+    const TAP_ID: u16 = TAP_POLICY_REVERT;
     const SHOT: CapShot = CapShot::One;
     const OP: ControlOp = ControlOp::TxAbort;
     const AUTO_MINT_WIRE: bool = false;
@@ -138,7 +143,7 @@ impl ControlResourceKind for PolicyAnnotateKind {
     const LABEL: u8 = 109;
     const SCOPE: ControlScopeKind = ControlScopeKind::Policy;
     const PATH: ControlPath = ControlPath::Local;
-    const TAP_ID: u16 = 0;
+    const TAP_ID: u16 = TAP_POLICY_ANNOTATE;
     const SHOT: CapShot = CapShot::One;
     const OP: ControlOp = ControlOp::Fence;
     const AUTO_MINT_WIRE: bool = false;

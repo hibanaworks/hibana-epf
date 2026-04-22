@@ -782,7 +782,11 @@ fn encode_latency(value: Option<u64>) -> u32 {
 mod tests {
     use super::ops;
     use super::*;
-    use hibana::substrate::{tap::TapEvent, transport::TransportSnapshot};
+    use hibana::substrate::{
+        policy::{ContextValue, PolicyAttrs, core as policy_core},
+        tap::TapEvent,
+        transport::TransportSnapshot,
+    };
 
     const TEST_EVENT_ID: u16 = 0x0201;
 
@@ -790,6 +794,34 @@ mod tests {
         // Static event used for the lifetime requirement inside VmCtx.
         static EVENT: TapEvent = TapEvent::zero();
         VmCtx::new(slot, &EVENT, caps)
+    }
+
+    fn transport_snapshot(
+        latency_us: Option<u64>,
+        queue_depth: Option<u32>,
+        congestion_marks: Option<u32>,
+        retransmissions: Option<u32>,
+    ) -> TransportSnapshot {
+        let mut attrs = PolicyAttrs::new();
+        if let Some(value) = latency_us {
+            assert!(attrs.insert(policy_core::LATENCY_US, ContextValue::from_u64(value)));
+        }
+        if let Some(value) = queue_depth {
+            assert!(attrs.insert(policy_core::QUEUE_DEPTH, ContextValue::from_u32(value)));
+        }
+        if let Some(value) = congestion_marks {
+            assert!(attrs.insert(
+                policy_core::CONGESTION_MARKS,
+                ContextValue::from_u32(value),
+            ));
+        }
+        if let Some(value) = retransmissions {
+            assert!(attrs.insert(
+                policy_core::RETRANSMISSIONS,
+                ContextValue::from_u32(value),
+            ));
+        }
+        TransportSnapshot::from_policy_attrs(&attrs)
     }
 
     #[test]
@@ -902,14 +934,7 @@ mod tests {
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 16);
         let mut ctx = make_ctx(Slot::EndpointTx, OpSet::all_ops());
-        let snapshot =
-            TransportSnapshot::from_parts(hibana::substrate::transport::TransportSnapshotParts {
-                latency_us: Some(42),
-                queue_depth: Some(9),
-                congestion_marks: Some(7),
-                retransmissions: Some(3),
-                ..hibana::substrate::transport::TransportSnapshotParts::new()
-            });
+        let snapshot = transport_snapshot(Some(42), Some(9), Some(7), Some(3));
         ctx.set_transport_snapshot(snapshot);
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
@@ -1010,12 +1035,7 @@ mod tests {
     fn vm_ctx_transport_snapshot_roundtrip() {
         let mut ctx = make_ctx(Slot::Rendezvous, OpSet::all_ops());
         assert_eq!(ctx.transport_snapshot(), TransportSnapshot::default());
-        let snapshot =
-            TransportSnapshot::from_parts(hibana::substrate::transport::TransportSnapshotParts {
-                latency_us: Some(42),
-                queue_depth: Some(7),
-                ..hibana::substrate::transport::TransportSnapshotParts::new()
-            });
+        let snapshot = transport_snapshot(Some(42), Some(7), None, None);
         ctx.set_transport_snapshot(snapshot);
         assert_eq!(ctx.transport_snapshot(), snapshot);
     }
