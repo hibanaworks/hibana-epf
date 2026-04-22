@@ -5,6 +5,7 @@ version = 4
 [[package]]
 name = "hibana"
 version = "0.1.0"
+source = "git+https://github.com/hibanaworks/hibana?rev=5158dc0ba669baa78b292585036334e4fcc0f090#5158dc0ba669baa78b292585036334e4fcc0f090"
 
 [[package]]
 name = "hibana-epf"
