@@ -70,3 +70,16 @@ fn lifecycle_surface_uses_attach_helpers_not_raw_program_exports() {
         );
     }
 }
+
+#[test]
+fn dependency_surface_uses_exact_git_rev_with_local_overlay_config() {
+    let cargo_toml = read("Cargo.toml");
+    let cargo_config = read(".cargo/config.toml");
+
+    assert!(cargo_toml.contains("git = \"https://github.com/hibanaworks/hibana\""));
+    assert!(cargo_toml.contains("rev = \""));
+    assert!(!cargo_toml.contains("path = \"../hibana\""));
+
+    assert!(cargo_config.contains("[patch.\"https://github.com/hibanaworks/hibana\"]"));
+    assert!(cargo_config.contains("hibana = { path = \"../hibana\" }"));
+}
