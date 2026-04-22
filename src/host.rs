@@ -5,7 +5,7 @@ use core::{array, cell::Cell, marker::PhantomData, ptr::NonNull};
 use hibana::substrate::{Lane, SessionId, tap::TapEvent};
 
 use super::{
-    OpSet, PolicyMode,
+    PolicyMode,
     verifier::{Header, VerifiedImage, VerifyError},
     vm::{Slot, Vm, VmAction, VmCtx},
 };
@@ -331,7 +331,6 @@ impl<'arena> HostSlots<'arena> {
         &self,
         slot: Slot,
         event: &TapEvent,
-        caps: OpSet,
         session: Option<SessionId>,
         lane: Option<Lane>,
         configure: F,
@@ -339,7 +338,7 @@ impl<'arena> HostSlots<'arena> {
     where
         F: FnOnce(&mut VmCtx<'_>),
     {
-        let mut ctx = VmCtx::new(slot, event, caps);
+        let mut ctx = VmCtx::new(event);
         if let Some(session) = session {
             ctx.set_session(session);
         }
@@ -389,8 +388,8 @@ mod tests {
     }
 
     #[test]
-    fn host_returns_effect_directive() {
-        static CODE: [u8; 3] = [ops::instr::ACT_EFFECT, ops::effect::CHECKPOINT, 0x00];
+    fn host_traps_removed_effect_opcode() {
+        static CODE: [u8; 3] = [0x30, 0x03, 0x00];
         let mut scratch = [0u8; 64];
         let machine = setup_machine(&CODE, &mut scratch);
         let mut slots = HostSlots::new();
@@ -402,13 +401,12 @@ mod tests {
         let result = slots.execute_with(
             Slot::Rendezvous,
             &EVENT,
-            OpSet::all_ops(),
             Some(SessionId::new(7)),
             Some(Lane::new(3)),
             |_| {},
         );
 
-        assert!(matches!(result, VmAction::Ra(_)));
+        assert_eq!(result, VmAction::Trap(crate::vm::Trap::IllegalOpcode(0x30)));
         assert_eq!(
             slots.active_digest(Slot::Rendezvous),
             Some(crate::verifier::compute_hash(&CODE))

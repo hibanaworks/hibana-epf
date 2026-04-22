@@ -18,7 +18,6 @@ pub(crate) mod instr {
     pub(crate) const LOAD_MEM: u8 = 0x20;
     pub(crate) const STORE_MEM: u8 = 0x21;
 
-    pub(crate) const ACT_EFFECT: u8 = 0x30;
     pub(crate) const ACT_ABORT: u8 = 0x31;
     pub(crate) const ACT_ANNOT: u8 = 0x32;
     /// Return a route arm decision and terminate: `ACT_ROUTE rs:u8`.
@@ -52,13 +51,4 @@ pub(crate) mod instr {
     pub(crate) const JUMP_EQ_IMM: u8 = 0x52;
     /// Bitwise AND with immediate: `AND_IMM rd, rs, imm8` — rd = rs & imm8.
     pub(crate) const AND_IMM: u8 = 0x53;
-}
-
-/// Opcodes used by `ACT_EFFECT` to identify control-plane calls.
-pub(crate) mod effect {
-    pub(crate) const SPLICE_BEGIN: u8 = 0x00;
-    pub(crate) const SPLICE_COMMIT: u8 = 0x01;
-    pub(crate) const SPLICE_ABORT: u8 = 0x02;
-    pub(crate) const CHECKPOINT: u8 = 0x03;
-    pub(crate) const ROLLBACK: u8 = 0x04;
 }

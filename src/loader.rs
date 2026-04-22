@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn sequential_load_and_commit() {
-        let code = [0x01u8, 0x02, 0x03, 0x04];
+        let code = [0x00u8, 0x00, 0x00, 0x01];
         let header = build_header(&code);
         let mut loader = ImageLoader::new();
         loader.begin(header).unwrap();

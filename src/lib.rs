@@ -1,7 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub mod control_kinds;
-mod dispatch;
 pub mod host;
 pub mod loader;
 pub mod ops;
@@ -14,10 +13,9 @@ use crate::control_kinds::{
 };
 use hibana::substrate::{
     Lane, SessionId,
-    cap::advanced::ControlOp,
+    policy::{ContextValue, PolicyAttrs, core as policy_core},
     cap::{ControlResourceKind, GenericCapToken},
     tap::TapEvent,
-    transport::TransportSnapshot,
 };
 pub use host::{HostSlots, ScratchLease};
 pub use verifier::Header;
@@ -240,28 +238,6 @@ pub enum PolicyVerdict {
     Reject(u16),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OpSet {
-    bits: u16,
-}
-
-impl OpSet {
-    #[cfg(test)]
-    pub(crate) const fn empty() -> Self {
-        Self { bits: 0 }
-    }
-
-    pub(crate) const fn all_ops() -> Self {
-        Self {
-            bits: (1u16 << 14) - 1,
-        }
-    }
-
-    pub(crate) const fn allows(self, op: ControlOp) -> bool {
-        (self.bits & (1u16 << (op as u8))) != 0
-    }
-}
-
 #[inline]
 pub const fn policy_mode_tag(mode: PolicyMode) -> u8 {
     match mode {
@@ -382,24 +358,56 @@ pub fn hash_policy_input(input: [u32; 4]) -> u32 {
 }
 
 #[inline]
-pub fn hash_transport_snapshot(snapshot: TransportSnapshot) -> u32 {
+pub fn hash_transport_attrs(attrs: &PolicyAttrs) -> u32 {
     let mut hash = FNV32_OFFSET;
-    hash = fnv32_mix_opt_u64(hash, snapshot.latency_us());
-    hash = fnv32_mix_opt_u32(hash, snapshot.queue_depth());
-    hash = fnv32_mix_opt_u64(hash, snapshot.pacing_interval_us());
-    hash = fnv32_mix_opt_u32(hash, snapshot.congestion_marks());
-    hash = fnv32_mix_opt_u32(hash, snapshot.retransmissions());
-    hash = fnv32_mix_opt_u32(hash, snapshot.pto_count());
-    hash = fnv32_mix_opt_u64(hash, snapshot.srtt_us());
-    hash = fnv32_mix_opt_u64(hash, snapshot.latest_ack_pn());
-    hash = fnv32_mix_opt_u64(hash, snapshot.congestion_window());
-    hash = fnv32_mix_opt_u64(hash, snapshot.in_flight_bytes());
-    match snapshot.algorithm() {
-        Some(hibana::substrate::transport::TransportAlgorithm::Cubic) => fnv32_mix_u8(hash, 1),
-        Some(hibana::substrate::transport::TransportAlgorithm::Reno) => fnv32_mix_u8(hash, 2),
-        Some(hibana::substrate::transport::TransportAlgorithm::Other(code)) => {
-            fnv32_mix_u8(fnv32_mix_u8(hash, 3), code)
-        }
+    hash = fnv32_mix_opt_u64(hash, attrs.get(policy_core::LATENCY_US).map(ContextValue::as_u64));
+    hash = fnv32_mix_opt_u32(hash, attrs.get(policy_core::QUEUE_DEPTH).map(ContextValue::as_u32));
+    hash = fnv32_mix_opt_u64(
+        hash,
+        attrs
+            .get(policy_core::PACING_INTERVAL_US)
+            .map(ContextValue::as_u64),
+    );
+    hash = fnv32_mix_opt_u32(
+        hash,
+        attrs
+            .get(policy_core::CONGESTION_MARKS)
+            .map(ContextValue::as_u32),
+    );
+    hash = fnv32_mix_opt_u32(
+        hash,
+        attrs
+            .get(policy_core::RETRANSMISSIONS)
+            .map(ContextValue::as_u32),
+    );
+    hash = fnv32_mix_opt_u32(hash, attrs.get(policy_core::PTO_COUNT).map(ContextValue::as_u32));
+    hash = fnv32_mix_opt_u64(hash, attrs.get(policy_core::SRTT_US).map(ContextValue::as_u64));
+    hash = fnv32_mix_opt_u64(
+        hash,
+        attrs
+            .get(policy_core::LATEST_ACK_PN)
+            .map(ContextValue::as_u64),
+    );
+    hash = fnv32_mix_opt_u64(
+        hash,
+        attrs
+            .get(policy_core::CONGESTION_WINDOW)
+            .map(ContextValue::as_u64),
+    );
+    hash = fnv32_mix_opt_u64(
+        hash,
+        attrs
+            .get(policy_core::IN_FLIGHT_BYTES)
+            .map(ContextValue::as_u64),
+    );
+    match attrs
+        .get(policy_core::TRANSPORT_ALGORITHM)
+        .map(ContextValue::as_u32)
+    {
+        Some(1) => fnv32_mix_u8(hash, 1),
+        Some(2) => fnv32_mix_u8(hash, 2),
+        Some(raw) if raw >= 0x100 => fnv32_mix_u8(fnv32_mix_u8(hash, 3), (raw - 0x100) as u8),
+        Some(raw) => fnv32_mix_u8(fnv32_mix_u8(hash, 3), raw as u8),
         None => fnv32_mix_u8(hash, 0),
     }
 }
@@ -427,28 +435,44 @@ const fn opt_u32_or_zero(value: Option<u32>) -> u32 {
 }
 
 #[inline]
-pub const fn replay_transport_inputs(snapshot: TransportSnapshot) -> [u32; 4] {
+const fn attr_u32(attrs: &PolicyAttrs, id: hibana::substrate::policy::ContextId) -> Option<u32> {
+    match attrs.get(id) {
+        Some(value) => Some(value.as_u32()),
+        None => None,
+    }
+}
+
+#[inline]
+const fn attr_u64(attrs: &PolicyAttrs, id: hibana::substrate::policy::ContextId) -> Option<u64> {
+    match attrs.get(id) {
+        Some(value) => Some(value.as_u64()),
+        None => None,
+    }
+}
+
+#[inline]
+pub const fn replay_transport_inputs(attrs: &PolicyAttrs) -> [u32; 4] {
     [
-        saturating_u64_to_u32(snapshot.latency_us()),
-        opt_u32_or_zero(snapshot.queue_depth()),
-        opt_u32_or_zero(snapshot.congestion_marks()),
-        opt_u32_or_zero(snapshot.retransmissions()),
+        saturating_u64_to_u32(attr_u64(attrs, policy_core::LATENCY_US)),
+        opt_u32_or_zero(attr_u32(attrs, policy_core::QUEUE_DEPTH)),
+        opt_u32_or_zero(attr_u32(attrs, policy_core::CONGESTION_MARKS)),
+        opt_u32_or_zero(attr_u32(attrs, policy_core::RETRANSMISSIONS)),
     ]
 }
 
 #[inline]
-pub const fn replay_transport_presence(snapshot: TransportSnapshot) -> u8 {
+pub const fn replay_transport_presence(attrs: &PolicyAttrs) -> u8 {
     let mut mask = 0u8;
-    if snapshot.latency_us().is_some() {
+    if attrs.get(policy_core::LATENCY_US).is_some() {
         mask |= 1 << 0;
     }
-    if snapshot.queue_depth().is_some() {
+    if attrs.get(policy_core::QUEUE_DEPTH).is_some() {
         mask |= 1 << 1;
     }
-    if snapshot.congestion_marks().is_some() {
+    if attrs.get(policy_core::CONGESTION_MARKS).is_some() {
         mask |= 1 << 2;
     }
-    if snapshot.retransmissions().is_some() {
+    if attrs.get(policy_core::RETRANSMISSIONS).is_some() {
         mask |= 1 << 3;
     }
     mask
@@ -501,8 +525,7 @@ pub fn run_with<F>(
 where
     F: FnOnce(&mut VmCtx<'_>),
 {
-    let vm_action =
-        host_slots.execute_with(slot, event, OpSet::all_ops(), session, lane, configure);
+    let vm_action = host_slots.execute_with(slot, event, session, lane, configure);
     let action = match vm_action {
         VmAction::Proceed => Action::Proceed,
         VmAction::Abort { reason } => Action::Abort(AbortInfo { reason, trap: None }),
@@ -513,10 +536,6 @@ where
         VmAction::Tap { id, arg0, arg1 } => Action::Tap { id, arg0, arg1 },
         VmAction::Route { arm } => Action::Route { arm },
         VmAction::Defer { retry_hint } => Action::Defer { retry_hint },
-        VmAction::Ra(_) => Action::Abort(AbortInfo {
-            reason: ENGINE_FAIL_CLOSED,
-            trap: Some(Trap::IllegalSyscall),
-        }),
     };
     action.with_mode(host_slots.policy_mode(slot))
 }

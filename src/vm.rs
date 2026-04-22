@@ -22,7 +22,6 @@
 //! | `0x13` | `JUMP_GT rs, rt, imm16`         | `rs:u8, rt:u8, target:le u16` | Jump if `rs` > `rt`. |
 //! | `0x20` | `LOAD_MEM rd, rs`               | `dest:u8, addr:u8`       | Load one byte from `mem[addr]` into `rd`. |
 //! | `0x21` | `STORE_MEM rs, rd`              | `src:u8, addr:u8`        | Store low 8 bits of `rs` into `mem[addr]`. |
-//! | `0x30` | `ACT_EFFECT op, rs`             | `effect:u8, arg:u8`      | Dispatch control-plane effect (operand taken from `rs`). |
 //! | `0x31` | `ACT_ABORT imm16`               | `reason:le u16`          | Emit [`VmAction::Abort { reason }`]. |
 //! | `0x32` | `ACT_ANNOT key, rs`             | `key:le u16, val:u8`     | Store annotation in [`VmCtx`] (non-terminal), value from `rs`. |
 //! | `0x33` | `ACT_ROUTE rs`                  | `rs:u8`                  | Return route arm from `rs` and terminate. |
@@ -47,16 +46,16 @@
 //! with [`Trap::VerifyFailed`]; the verifier prevents these in well-formed
 //! bytecode, but the interpreter defends against malformed images.
 
-use crate::{OpSet, ScopeTrace, tap_scope};
+use crate::{ScopeTrace, tap_scope};
 use hibana::{
-    substrate::transport::TransportSnapshot,
-    substrate::{Lane, SessionId, tap::TapEvent},
+    substrate::{
+        Lane, SessionId,
+        policy::{ContextValue, PolicyAttrs, core as policy_core},
+        tap::TapEvent,
+    },
 };
 
-use super::{
-    dispatch::{self, RaOp, SyscallError},
-    ops,
-};
+use super::ops;
 
 const REG_COUNT: usize = 8;
 
@@ -69,7 +68,6 @@ pub enum Trap {
     FuelExhausted,
     IllegalOpcode(u8),
     OutOfBounds,
-    IllegalSyscall,
     VerifyFailed,
 }
 
@@ -80,8 +78,6 @@ pub(crate) enum VmAction {
     Abort {
         reason: u16,
     },
-    /// Execute a control-plane effect permitted by the current capability set.
-    Ra(RaOp),
     Trap(Trap),
     Tap {
         id: u16,
@@ -111,13 +107,11 @@ pub(crate) struct Annotation {
 /// Execution context punctured into the interpreter.
 #[derive(Debug)]
 pub struct VmCtx<'a> {
-    slot: Slot,
     event: &'a TapEvent,
-    caps: OpSet,
     session: Option<SessionId>,
     lane: Option<Lane>,
     scope: Option<ScopeTrace>,
-    transport: TransportSnapshot,
+    attrs: PolicyAttrs,
     policy_input: [u32; 4],
     annotations: [Annotation; ANNOT_CAP],
     annot_len: u8,
@@ -125,15 +119,13 @@ pub struct VmCtx<'a> {
 }
 
 impl<'a> VmCtx<'a> {
-    pub(crate) fn new(slot: Slot, event: &'a TapEvent, caps: OpSet) -> Self {
+    pub(crate) fn new(event: &'a TapEvent) -> Self {
         Self {
-            slot,
             event,
-            caps,
             session: None,
             lane: None,
             scope: tap_scope(event),
-            transport: TransportSnapshot::default(),
+            attrs: PolicyAttrs::EMPTY,
             policy_input: [0; 4],
             annotations: [Annotation::default(); ANNOT_CAP],
             annot_len: 0,
@@ -153,10 +145,10 @@ impl<'a> VmCtx<'a> {
         self.lane = Some(lane);
     }
 
-    /// Attach transport metrics snapshot for this invocation.
+    /// Attach packed policy attrs for this invocation.
     #[inline]
-    pub fn set_transport_snapshot(&mut self, snapshot: TransportSnapshot) {
-        self.transport = snapshot;
+    pub fn set_policy_attrs(&mut self, attrs: PolicyAttrs) {
+        self.attrs = attrs;
     }
 
     /// Attach policy input arguments for this invocation.
@@ -165,17 +157,35 @@ impl<'a> VmCtx<'a> {
         self.policy_input = input;
     }
 
-    /// Retrieve the currently attached transport metrics snapshot.
     #[inline]
-    pub(crate) fn transport_snapshot(&self) -> TransportSnapshot {
-        let _ = (self.session, self.lane);
-        self.transport
+    fn transport_latency_us(&self) -> Option<u64> {
+        self.attrs.get(policy_core::LATENCY_US).map(ContextValue::as_u64)
     }
 
-    /// Validate that the VM is authorised to emit the given `ControlOp`-backed syscall and return it.
     #[inline]
-    pub(crate) fn ensure_effect(&self, call: RaOp) -> Result<RaOp, SyscallError> {
-        dispatch::ensure_allowed(self.slot, self.caps, call)
+    fn transport_queue_depth(&self) -> Option<u32> {
+        self.attrs.get(policy_core::QUEUE_DEPTH).map(ContextValue::as_u32)
+    }
+
+    #[inline]
+    fn transport_congestion_marks(&self) -> Option<u32> {
+        self.attrs
+            .get(policy_core::CONGESTION_MARKS)
+            .map(ContextValue::as_u32)
+    }
+
+    #[inline]
+    fn transport_retransmissions(&self) -> Option<u32> {
+        self.attrs
+            .get(policy_core::RETRANSMISSIONS)
+            .map(ContextValue::as_u32)
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn policy_attrs(&self) -> &PolicyAttrs {
+        let _ = (self.session, self.lane);
+        &self.attrs
     }
 
     /// Scope trace associated with the triggering tap, when present.
@@ -398,7 +408,7 @@ impl<'code> Vm<'code> {
                             return VmAction::Trap(Trap::VerifyFailed);
                         }
                     };
-                    regs[dest] = encode_latency(ctx.transport_snapshot().latency_us());
+                    regs[dest] = encode_latency(ctx.transport_latency_us());
                 }
                 ops::instr::GET_QUEUE => {
                     let dest = match read_reg(code, &mut pc) {
@@ -408,7 +418,7 @@ impl<'code> Vm<'code> {
                             return VmAction::Trap(Trap::VerifyFailed);
                         }
                     };
-                    regs[dest] = ctx.transport_snapshot().queue_depth().unwrap_or(0);
+                    regs[dest] = ctx.transport_queue_depth().unwrap_or(0);
                 }
                 ops::instr::GET_CONGESTION => {
                     let dest = match read_reg(code, &mut pc) {
@@ -418,7 +428,7 @@ impl<'code> Vm<'code> {
                             return VmAction::Trap(Trap::VerifyFailed);
                         }
                     };
-                    regs[dest] = ctx.transport_snapshot().congestion_marks().unwrap_or(0);
+                    regs[dest] = ctx.transport_congestion_marks().unwrap_or(0);
                 }
                 ops::instr::GET_RETRY => {
                     let dest = match read_reg(code, &mut pc) {
@@ -428,7 +438,7 @@ impl<'code> Vm<'code> {
                             return VmAction::Trap(Trap::VerifyFailed);
                         }
                     };
-                    regs[dest] = ctx.transport_snapshot().retransmissions().unwrap_or(0);
+                    regs[dest] = ctx.transport_retransmissions().unwrap_or(0);
                 }
                 ops::instr::GET_SCOPE_RANGE => {
                     let dest = match read_reg(code, &mut pc) {
@@ -609,49 +619,6 @@ impl<'code> Vm<'code> {
                     };
                     regs[dest] = regs[src] & (imm as u32);
                 }
-                ops::instr::ACT_EFFECT => {
-                    let effect_opcode = match read_u8(code, &mut pc) {
-                        Some(val) => val,
-                        None => {
-                            self.fuel = fuel;
-                            return VmAction::Trap(Trap::VerifyFailed);
-                        }
-                    };
-                    let arg_reg = match read_reg(code, &mut pc) {
-                        Some(idx) => idx,
-                        None => {
-                            self.fuel = fuel;
-                            return VmAction::Trap(Trap::VerifyFailed);
-                        }
-                    };
-                    let arg = regs[arg_reg];
-                    let call = match dispatch::decode_effect_call(effect_opcode, arg) {
-                        Ok(call) => call,
-                        Err(SyscallError::UnknownEffectOpcode(op)) => {
-                            self.fuel = fuel;
-                            return VmAction::Trap(Trap::IllegalOpcode(op));
-                        }
-                        Err(SyscallError::NotAuthorised { .. }) => {
-                            // Not expected from decode; treat as illegal syscall defensively.
-                            self.fuel = fuel;
-                            return VmAction::Trap(Trap::IllegalSyscall);
-                        }
-                    };
-                    match ctx.ensure_effect(call) {
-                        Ok(op) => {
-                            self.fuel = fuel;
-                            return VmAction::Ra(op);
-                        }
-                        Err(SyscallError::NotAuthorised { .. }) => {
-                            self.fuel = fuel;
-                            return VmAction::Trap(Trap::IllegalSyscall);
-                        }
-                        Err(SyscallError::UnknownEffectOpcode(op)) => {
-                            self.fuel = fuel;
-                            return VmAction::Trap(Trap::IllegalOpcode(op));
-                        }
-                    }
-                }
                 ops::instr::ACT_ABORT => {
                     let reason = match read_u16(code, &mut pc) {
                         Some(val) => val,
@@ -785,23 +752,22 @@ mod tests {
     use hibana::substrate::{
         policy::{ContextValue, PolicyAttrs, core as policy_core},
         tap::TapEvent,
-        transport::TransportSnapshot,
     };
 
     const TEST_EVENT_ID: u16 = 0x0201;
 
-    fn make_ctx(slot: Slot, caps: OpSet) -> VmCtx<'static> {
+    fn make_ctx() -> VmCtx<'static> {
         // Static event used for the lifetime requirement inside VmCtx.
         static EVENT: TapEvent = TapEvent::zero();
-        VmCtx::new(slot, &EVENT, caps)
+        VmCtx::new(&EVENT)
     }
 
-    fn transport_snapshot(
+    fn transport_attrs(
         latency_us: Option<u64>,
         queue_depth: Option<u32>,
         congestion_marks: Option<u32>,
         retransmissions: Option<u32>,
-    ) -> TransportSnapshot {
+    ) -> PolicyAttrs {
         let mut attrs = PolicyAttrs::new();
         if let Some(value) = latency_us {
             assert!(attrs.insert(policy_core::LATENCY_US, ContextValue::from_u64(value)));
@@ -810,22 +776,16 @@ mod tests {
             assert!(attrs.insert(policy_core::QUEUE_DEPTH, ContextValue::from_u32(value)));
         }
         if let Some(value) = congestion_marks {
-            assert!(attrs.insert(
-                policy_core::CONGESTION_MARKS,
-                ContextValue::from_u32(value),
-            ));
+            assert!(attrs.insert(policy_core::CONGESTION_MARKS, ContextValue::from_u32(value),));
         }
         if let Some(value) = retransmissions {
-            assert!(attrs.insert(
-                policy_core::RETRANSMISSIONS,
-                ContextValue::from_u32(value),
-            ));
+            assert!(attrs.insert(policy_core::RETRANSMISSIONS, ContextValue::from_u32(value),));
         }
-        TransportSnapshot::from_policy_attrs(&attrs)
+        attrs
     }
 
     #[test]
-    fn act_effect_returns_effect_action() {
+    fn removed_effect_opcode_traps_illegal_opcode() {
         let code = [
             ops::instr::LOAD_IMM,
             0x01,
@@ -833,15 +793,15 @@ mod tests {
             0x00,
             0x00,
             0x00, // r1 = 7
-            ops::instr::ACT_EFFECT,
-            ops::effect::SPLICE_BEGIN,
-            0x01, // effect 0x00 (SpliceBegin) with r1
+            0x30,
+            0x00,
+            0x01,
         ];
         let mut mem = [0u8; 8];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = make_ctx(Slot::Rendezvous, OpSet::all_ops());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
-        assert_eq!(action, VmAction::Ra(RaOp::SpliceBegin { arg: 7 }));
+        assert_eq!(action, VmAction::Trap(Trap::IllegalOpcode(0x30)));
         assert_eq!(vm.fuel, 6);
     }
 
@@ -850,7 +810,7 @@ mod tests {
         let code = [ops::instr::NOP];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 1);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::FuelExhausted));
         assert_eq!(vm.fuel, 0);
@@ -861,7 +821,7 @@ mod tests {
         let code = [0xFF];
         let mut mem = [0u8; 2];
         let mut vm = Vm::new(&code, &mut mem, 4);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::IllegalOpcode(0xFF)));
     }
@@ -880,7 +840,7 @@ mod tests {
         ];
         let mut mem = [0u8; 8];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = make_ctx(Slot::Route, OpSet::all_ops());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Route { arm: 2 });
     }
@@ -899,7 +859,7 @@ mod tests {
         ];
         let mut mem = [0u8; 8];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = make_ctx(Slot::Route, OpSet::all_ops());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Defer { retry_hint: 7 });
     }
@@ -933,9 +893,9 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 16);
-        let mut ctx = make_ctx(Slot::EndpointTx, OpSet::all_ops());
-        let snapshot = transport_snapshot(Some(42), Some(9), Some(7), Some(3));
-        ctx.set_transport_snapshot(snapshot);
+        let mut ctx = make_ctx();
+        let attrs = transport_attrs(Some(42), Some(9), Some(7), Some(3));
+        ctx.set_policy_attrs(attrs);
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(mem[0], 7);
@@ -980,7 +940,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 12);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
+        let mut ctx = VmCtx::new(&event);
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(mem[0], scope.range as u8);
@@ -1024,7 +984,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 12);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
+        let mut ctx = VmCtx::new(&event);
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(mem[0], 0);
@@ -1032,12 +992,12 @@ mod tests {
     }
 
     #[test]
-    fn vm_ctx_transport_snapshot_roundtrip() {
-        let mut ctx = make_ctx(Slot::Rendezvous, OpSet::all_ops());
-        assert_eq!(ctx.transport_snapshot(), TransportSnapshot::default());
-        let snapshot = transport_snapshot(Some(42), Some(7), None, None);
-        ctx.set_transport_snapshot(snapshot);
-        assert_eq!(ctx.transport_snapshot(), snapshot);
+    fn vm_ctx_policy_attrs_roundtrip() {
+        let mut ctx = make_ctx();
+        assert_eq!(ctx.policy_attrs(), &PolicyAttrs::EMPTY);
+        let attrs = transport_attrs(Some(42), Some(7), None, None);
+        ctx.set_policy_attrs(attrs);
+        assert_eq!(ctx.policy_attrs(), &attrs);
     }
 
     #[test]
@@ -1061,23 +1021,19 @@ mod tests {
         ];
         let mut mem = [0u8; 8];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::OutOfBounds));
     }
 
     #[test]
-    fn illegal_syscall_traps() {
-        let code = [
-            ops::instr::ACT_EFFECT,
-            ops::effect::CHECKPOINT,
-            0x00, // Checkpoint from r0 (default 0)
-        ];
+    fn removed_effect_opcode_traps_from_forward_slot() {
+        let code = [0x30, 0x03, 0x00];
         let mut mem = [0u8; 2];
         let mut vm = Vm::new(&code, &mut mem, 4);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
-        assert_eq!(action, VmAction::Trap(Trap::IllegalSyscall));
+        assert_eq!(action, VmAction::Trap(Trap::IllegalOpcode(0x30)));
     }
 
     #[test]
@@ -1089,7 +1045,7 @@ mod tests {
         ];
         let mut mem = [0u8; 1];
         let mut vm = Vm::new(&code, &mut mem, 4);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let abort = vm.execute(&mut ctx);
         assert_eq!(abort, VmAction::Abort { reason: 0x3039 });
     }
@@ -1121,7 +1077,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 16);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(ctx.annot_count(), 2);
@@ -1212,7 +1168,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 32);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(ctx.annot_count(), 6);
@@ -1246,7 +1202,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
+        let mut ctx = VmCtx::new(&event);
         let action = vm.execute(&mut ctx);
         assert_eq!(
             action,
@@ -1277,7 +1233,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
+        let mut ctx = VmCtx::new(&event);
         let action = vm.execute(&mut ctx);
         assert_eq!(
             action,
@@ -1307,7 +1263,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
+        let mut ctx = VmCtx::new(&event);
         ctx.set_policy_input([11, 22, 33, 44]);
         let action = vm.execute(&mut ctx);
         assert_eq!(
@@ -1334,7 +1290,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 8);
-        let mut ctx = VmCtx::new(Slot::EndpointTx, &event, OpSet::all_ops());
+        let mut ctx = VmCtx::new(&event);
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::VerifyFailed));
     }
@@ -1365,7 +1321,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(u32::from_le_bytes(mem), 0xFF); // 0xFF00 >> 8 = 0xFF
@@ -1398,7 +1354,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(u32::from_le_bytes(mem), 2); // 4 >> 1 = 2
@@ -1436,7 +1392,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 12);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(u32::from_le_bytes(mem), 0x0FFF & 0xF0F0); // 0x00F0
@@ -1468,7 +1424,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         assert_eq!(u32::from_le_bytes(mem), 0xAB); // 0xCDAB & 0xFF = 0xAB
@@ -1507,7 +1463,7 @@ mod tests {
 
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&full_code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         // If jump worked, we should have executed 3 instructions: LOAD_IMM, JUMP_EQ_IMM, HALT
@@ -1535,7 +1491,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Proceed);
         // LOAD_IMM, JUMP_EQ_IMM (no jump), HALT = 3 instructions, fuel 7
@@ -1560,7 +1516,7 @@ mod tests {
         ];
         let mut mem = [0u8; 4];
         let mut vm = Vm::new(&code, &mut mem, 10);
-        let mut ctx = make_ctx(Slot::Forward, OpSet::empty());
+        let mut ctx = make_ctx();
         let action = vm.execute(&mut ctx);
         assert_eq!(action, VmAction::Trap(Trap::OutOfBounds));
     }

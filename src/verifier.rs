@@ -67,6 +67,7 @@ pub enum VerifyError {
     MemTooLarge { requested: u16 },
     HashMismatch { expected: u32, computed: u32 },
     ZeroFuel,
+    UnknownOpcode { pc: usize, opcode: u8 },
     TruncatedInstruction { pc: usize },
     InvalidInputIndex { pc: usize, index: u8 },
     InputForbiddenForSlot { pc: usize, slot: Slot },
@@ -163,11 +164,15 @@ fn verify_epf_input_operands(code: &[u8], slot: Option<Slot>) -> Result<(), Veri
             ops::instr::GET_INPUT => 2,
             ops::instr::SHR | ops::instr::AND | ops::instr::AND_IMM => 3,
             ops::instr::JUMP_EQ_IMM => 4,
-            ops::instr::ACT_EFFECT => 2,
             ops::instr::ACT_ABORT => 2,
             ops::instr::ACT_ANNOT => 3,
             ops::instr::TAP_OUT => 4,
-            _ => 0,
+            other => {
+                return Err(VerifyError::UnknownOpcode {
+                    pc: op_pc,
+                    opcode: other,
+                });
+            }
         };
         if pc + operand_len > code.len() {
             return Err(VerifyError::TruncatedInstruction { pc: op_pc });
@@ -213,8 +218,8 @@ mod tests {
 
     #[test]
     fn verify_roundtrip() {
-        let code = [0xFFu8, 0x00, 0x00, 0x00];
-        let mut image = [0u8; Header::SIZE + 4];
+        let code = [ops::instr::NOP, ops::instr::HALT];
+        let mut image = [0u8; Header::SIZE + 2];
         let hash = compute_hash(&code);
         let header = Header {
             code_len: code.len() as u16,
@@ -229,6 +234,28 @@ mod tests {
         let verified = VerifiedImage::new(&image).expect("must verify");
         assert_eq!(verified.header.fuel_max, 16);
         assert_eq!(verified.code, code);
+    }
+
+    #[test]
+    fn reject_unknown_opcode() {
+        let code = [0x30u8, 0x00, 0x00];
+        let mut image = [0u8; Header::SIZE + 3];
+        let header = Header {
+            code_len: code.len() as u16,
+            fuel_max: 8,
+            mem_len: 32,
+            flags: 0,
+            hash: compute_hash(&code),
+        };
+        header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
+        image[Header::SIZE..].copy_from_slice(&code);
+        assert!(matches!(
+            VerifiedImage::new(&image).unwrap_err(),
+            VerifyError::UnknownOpcode {
+                pc: 0,
+                opcode: 0x30
+            }
+        ));
     }
 
     #[test]
