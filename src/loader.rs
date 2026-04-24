@@ -110,7 +110,6 @@ impl ImageLoader {
         let verified = match verified {
             Ok(verified) => verified,
             Err(VerifyError::HashMismatch { expected, computed }) => {
-                self.header = Some(header);
                 return Err(LoaderError::HashMismatch { expected, computed });
             }
             Err(err) => return Err(LoaderError::Verify(err)),
@@ -179,6 +178,29 @@ mod tests {
         loader.write(0, &[0x00, 0x01]).unwrap();
         let err = loader.commit().unwrap_err();
         assert!(matches!(err, LoaderError::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn hash_mismatch_clears_loader_for_retry() {
+        let mut loader = ImageLoader::new();
+        let bad_header = Header {
+            code_len: 2,
+            fuel_max: 4,
+            mem_len: 8,
+            flags: 0,
+            hash: 0x1234_5678,
+        };
+        loader.begin(bad_header).unwrap();
+        loader.write(0, &[0x00, 0x01]).unwrap();
+        let err = loader.commit().unwrap_err();
+        assert!(matches!(err, LoaderError::HashMismatch { .. }));
+
+        let code = [0x00u8, 0x00, 0x00, 0x01];
+        let good_header = build_header(&code);
+        loader.begin(good_header).expect("loader must accept retry");
+        loader.write(0, &code).expect("retry starts at offset zero");
+        let verified = loader.commit().expect("retry commit succeeds");
+        assert_eq!(verified.code, code);
     }
 
     #[test]
