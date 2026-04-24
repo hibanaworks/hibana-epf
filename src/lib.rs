@@ -58,41 +58,6 @@ type PolicyAnnotateControlMsg = hibana::g::Msg<
     PolicyAnnotateKind,
 >;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PolicyAnnotation {
-    pub digest: u32,
-}
-
-impl hibana::substrate::wire::WireEncode for PolicyAnnotation {
-    fn encoded_len(&self) -> Option<usize> {
-        Some(4)
-    }
-
-    fn encode_into(&self, out: &mut [u8]) -> Result<usize, hibana::substrate::wire::CodecError> {
-        if out.len() < 4 {
-            return Err(hibana::substrate::wire::CodecError::Truncated);
-        }
-        out[..4].copy_from_slice(&self.digest.to_be_bytes());
-        Ok(4)
-    }
-}
-
-impl hibana::substrate::wire::WirePayload for PolicyAnnotation {
-    type Decoded<'a> = Self;
-
-    fn decode_payload<'a>(
-        input: hibana::substrate::wire::Payload<'a>,
-    ) -> Result<Self::Decoded<'a>, hibana::substrate::wire::CodecError> {
-        let bytes = input.as_bytes();
-        if bytes.len() < 4 {
-            return Err(hibana::substrate::wire::CodecError::Truncated);
-        }
-        Ok(Self {
-            digest: u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        })
-    }
-}
-
 #[allow(private_bounds)]
 pub fn attach_controller<'r, 'cfg, T, U, C, const MAX_RV: usize>(
     kit: &'r hibana::substrate::SessionKit<'cfg, T, U, C, MAX_RV>,

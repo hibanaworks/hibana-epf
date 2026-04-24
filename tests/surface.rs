@@ -62,6 +62,9 @@ fn lifecycle_surface_uses_attach_helpers_not_raw_program_exports() {
         "Msg<LABEL_POLICY_ACTIVATE, u8>",
         "Msg<LABEL_POLICY_RESTORE, u8>",
         "Msg<LABEL_POLICY_ANNOTATE, PolicyAnnotation>",
+        "pub struct PolicyAnnotation",
+        "PolicyAnnotation {",
+        "WirePayload for PolicyAnnotation",
         "pub fn attach_cluster",
         "ROLE_CLUSTER",
         "Role<ROLE_CONTROLLER>,\n        hibana::g::Role<ROLE_CLUSTER>,",
@@ -113,7 +116,7 @@ fn dependency_surface_uses_pinned_git_dependency() {
     let cargo_config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".cargo/config.toml");
 
     assert!(cargo_toml.contains("git = \"https://github.com/hibanaworks/hibana\""));
-    assert!(cargo_toml.contains("rev = \"ab2f2c90b04d9b80c97c6c69b864452463ee6df5\""));
+    assert!(cargo_toml.contains("rev = \"9b95d66eaed007629a72f01b5f58666f1dd70786\""));
     assert!(!cargo_toml.contains("path = \"../hibana\""));
     assert!(!cargo_config.exists());
 }
