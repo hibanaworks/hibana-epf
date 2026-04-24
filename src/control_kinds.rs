@@ -1,7 +1,7 @@
 use hibana::substrate::{
-    Lane, SessionId,
     cap::advanced::{CAP_HANDLE_LEN, CapError, ControlOp, ControlPath, ControlScopeKind, ScopeId},
     cap::{CapShot, ControlResourceKind, ResourceKind},
+    ids::{Lane, SessionId},
 };
 
 const TAP_POLICY_LOAD: u16 = 0x0300 + 106;

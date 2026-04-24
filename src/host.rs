@@ -2,7 +2,10 @@
 
 use core::{array, cell::Cell, marker::PhantomData, ptr::NonNull};
 
-use hibana::substrate::{Lane, SessionId, tap::TapEvent};
+use hibana::substrate::{
+    ids::{Lane, SessionId},
+    tap::TapEvent,
+};
 
 use super::{
     ENGINE_FAIL_CLOSED, PolicyMode,
@@ -51,12 +54,6 @@ impl<'arena> InstallError<'arena> {
     #[inline]
     pub const fn error(&self) -> HostError {
         self.error
-    }
-
-    /// Recover both the host error and the scratch lease for retry paths.
-    #[inline]
-    pub fn into_parts(self) -> (HostError, ScratchLease<'arena>) {
-        (self.error, self.scratch)
     }
 
     /// Recover the scratch lease when the precise host error is not needed.
@@ -479,7 +476,8 @@ mod tests {
         let mut bytes = [0u8; Header::SIZE + 5];
         header.encode_into((&mut bytes[..Header::SIZE]).try_into().unwrap());
         bytes[Header::SIZE..].copy_from_slice(&code);
-        let verified = VerifiedImage::new(&bytes).expect("generic image verifies");
+        let verified =
+            VerifiedImage::new_for_slot(&bytes, Slot::Route).expect("generic image verifies");
 
         let mut slots = HostSlots::new();
         let mut scratch = [0u8; 16];
@@ -547,7 +545,8 @@ mod tests {
         let err = slots
             .install_verified(Slot::Route, oversized, ScratchLease::new(&mut scratch))
             .unwrap_err();
-        let (error, scratch) = err.into_parts();
+        let error = err.error();
+        let scratch = err.into_scratch();
         assert!(matches!(
             error,
             HostError::ScratchTooSmall {

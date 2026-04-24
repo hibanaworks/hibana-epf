@@ -22,7 +22,7 @@ pub enum LoaderError {
 ///
 /// The loader accepts a [`Header`] upfront (`begin`), followed by a series of
 /// `write` calls that must stream the code in-order. Once all bytes are present,
-/// `commit` validates the hash and returns a [`VerifiedImage`] view.
+/// `commit_for_slot` validates the hash and returns a [`VerifiedImage`] view.
 #[derive(Clone, Debug)]
 pub struct ImageLoader {
     header: Option<Header>,
@@ -82,17 +82,8 @@ impl ImageLoader {
         Ok(())
     }
 
-    /// Finalise the load, validating the hash and returning a verified view.
-    pub fn commit(&mut self) -> Result<VerifiedImage<'_>, LoaderError> {
-        self.commit_inner(None)
-    }
-
     /// Finalise the load with slot-specific verification rules.
     pub fn commit_for_slot(&mut self, slot: Slot) -> Result<VerifiedImage<'_>, LoaderError> {
-        self.commit_inner(Some(slot))
-    }
-
-    fn commit_inner(&mut self, slot: Option<Slot>) -> Result<VerifiedImage<'_>, LoaderError> {
         let header = self.header.take().ok_or(LoaderError::NotLoading)?;
         if self.written != header.code_len as u32 {
             // Treat short write as a length mismatch from the verifier.
@@ -103,10 +94,7 @@ impl ImageLoader {
             }));
         }
         let code = &self.buffer[..header.code_len as usize];
-        let verified = match slot {
-            Some(slot) => VerifiedImage::from_parts_for_slot(header, code, slot),
-            None => VerifiedImage::from_parts(header, code),
-        };
+        let verified = VerifiedImage::from_parts_for_slot(header, code, slot);
         let verified = match verified {
             Ok(verified) => verified,
             Err(VerifyError::HashMismatch { expected, computed }) => {
@@ -148,7 +136,9 @@ mod tests {
         loader.begin(header).unwrap();
         loader.write(0, &code[..2]).unwrap();
         loader.write(2, &code[2..]).unwrap();
-        let verified = loader.commit().expect("commit succeeds");
+        let verified = loader
+            .commit_for_slot(Slot::Route)
+            .expect("commit succeeds");
         assert_eq!(verified.code, code);
         assert_eq!(verified.header.hash, header.hash);
     }
@@ -174,7 +164,7 @@ mod tests {
         };
         loader.begin(header).unwrap();
         loader.write(0, &[0x00, 0x01]).unwrap();
-        let err = loader.commit().unwrap_err();
+        let err = loader.commit_for_slot(Slot::Route).unwrap_err();
         assert!(matches!(err, LoaderError::HashMismatch { .. }));
     }
 
@@ -189,14 +179,16 @@ mod tests {
         };
         loader.begin(bad_header).unwrap();
         loader.write(0, &[0x00, 0x01]).unwrap();
-        let err = loader.commit().unwrap_err();
+        let err = loader.commit_for_slot(Slot::Route).unwrap_err();
         assert!(matches!(err, LoaderError::HashMismatch { .. }));
 
         let code = [0x00u8, 0x00, 0x00, 0x01];
         let good_header = build_header(&code);
         loader.begin(good_header).expect("loader must accept retry");
         loader.write(0, &code).expect("retry starts at offset zero");
-        let verified = loader.commit().expect("retry commit succeeds");
+        let verified = loader
+            .commit_for_slot(Slot::Route)
+            .expect("retry commit succeeds");
         assert_eq!(verified.code, code);
     }
 
@@ -208,7 +200,7 @@ mod tests {
         let mut loader = ImageLoader::new();
         loader.begin(header).unwrap();
         loader.write(0, &code).unwrap();
-        let err = loader.commit().unwrap_err();
+        let err = loader.commit_for_slot(Slot::Route).unwrap_err();
         assert_eq!(err, LoaderError::Verify(VerifyError::ZeroFuel));
     }
 

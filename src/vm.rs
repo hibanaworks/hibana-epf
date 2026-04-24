@@ -48,7 +48,7 @@
 
 use crate::{ScopeTrace, tap_scope};
 use hibana::substrate::{
-    Lane, SessionId,
+    ids::{Lane, SessionId},
     policy::{ContextValue, PolicyAttrs, core as policy_core},
     tap::TapEvent,
 };
@@ -58,7 +58,14 @@ use super::ops;
 pub(crate) const REG_COUNT: usize = 8;
 
 /// Execution slot defines which subsystem triggered the VM.
-pub use hibana::substrate::policy::PolicySlot as Slot;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Forward,
+    EndpointRx,
+    EndpointTx,
+    Rendezvous,
+    Route,
+}
 
 /// Trap reasons emitted by the interpreter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
