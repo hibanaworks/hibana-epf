@@ -47,17 +47,15 @@
 //! bytecode, but the interpreter defends against malformed images.
 
 use crate::{ScopeTrace, tap_scope};
-use hibana::{
-    substrate::{
-        Lane, SessionId,
-        policy::{ContextValue, PolicyAttrs, core as policy_core},
-        tap::TapEvent,
-    },
+use hibana::substrate::{
+    Lane, SessionId,
+    policy::{ContextValue, PolicyAttrs, core as policy_core},
+    tap::TapEvent,
 };
 
 use super::ops;
 
-const REG_COUNT: usize = 8;
+pub(crate) const REG_COUNT: usize = 8;
 
 /// Execution slot defines which subsystem triggered the VM.
 pub use hibana::substrate::policy::PolicySlot as Slot;
@@ -159,12 +157,16 @@ impl<'a> VmCtx<'a> {
 
     #[inline]
     fn transport_latency_us(&self) -> Option<u64> {
-        self.attrs.get(policy_core::LATENCY_US).map(ContextValue::as_u64)
+        self.attrs
+            .get(policy_core::LATENCY_US)
+            .map(ContextValue::as_u64)
     }
 
     #[inline]
     fn transport_queue_depth(&self) -> Option<u32> {
-        self.attrs.get(policy_core::QUEUE_DEPTH).map(ContextValue::as_u32)
+        self.attrs
+            .get(policy_core::QUEUE_DEPTH)
+            .map(ContextValue::as_u32)
     }
 
     #[inline]

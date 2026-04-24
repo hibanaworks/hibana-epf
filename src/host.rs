@@ -129,7 +129,6 @@ struct Machine<'arena> {
     mem_len: usize,
     fuel_max: u16,
     digest: u32,
-    fuel: Cell<u16>,
     scratch: ScratchLease<'arena>,
 }
 
@@ -191,7 +190,6 @@ impl<'arena> Machine<'arena> {
             mem_len,
             fuel_max,
             digest,
-            fuel: Cell::new(fuel_max),
             scratch,
         })
     }
@@ -201,22 +199,15 @@ impl<'arena> Machine<'arena> {
         self.digest
     }
 
-    fn execute(&self, ctx: &mut VmCtx<'_>) -> VmAction {
-        let remaining = self.fuel.get();
-        let initial_fuel = if remaining == 0 {
-            self.fuel_max
-        } else {
-            remaining
-        };
-
+    fn execute(&self, ctx: &mut VmCtx<'_>) -> (VmAction, u16) {
         let mem_len = self.mem_len;
         let code = &self.code[..self.code_len];
         // SAFETY: `scratch` remains exclusively held by the installed machine.
         let mem_slice = unsafe { self.scratch.as_mem_slice(mem_len) };
-        let mut vm = Vm::new(code, mem_slice, initial_fuel);
+        let mut vm = Vm::new(code, mem_slice, self.fuel_max);
         let action = vm.execute(ctx);
-        self.fuel.set(vm.fuel);
-        action
+        let fuel_used = self.fuel_max.saturating_sub(vm.fuel);
+        (action, fuel_used)
     }
 }
 
@@ -349,15 +340,7 @@ impl<'arena> HostSlots<'arena> {
 
         match &self.machines[Self::index(slot)] {
             Some(machine) => {
-                let remaining_before = machine.fuel.get();
-                let initial_fuel = if remaining_before == 0 {
-                    machine.fuel_max
-                } else {
-                    remaining_before
-                };
-                let action = machine.execute(&mut ctx);
-                let remaining_after = machine.fuel.get();
-                let used = initial_fuel.saturating_sub(remaining_after);
+                let (action, used) = machine.execute(&mut ctx);
                 self.last_fuel_used[Self::index(slot)].set(used);
                 action
             }
@@ -435,6 +418,31 @@ mod tests {
         slots.set_policy_mode(Slot::Route, PolicyMode::Shadow);
         let shadow = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
         assert_eq!(shadow, Action::Proceed);
+    }
+
+    #[test]
+    fn fuel_budget_resets_for_each_policy_execution() {
+        static CODE: [u8; 4] = [
+            ops::instr::NOP,
+            ops::instr::NOP,
+            ops::instr::ACT_ROUTE,
+            0x00,
+        ];
+        let mut scratch = [0u8; 64];
+        let machine = setup_machine(&CODE, &mut scratch);
+        let mut slots = HostSlots::new();
+        slots
+            .install_machine(Slot::Route, machine)
+            .expect("install");
+
+        static EVENT: TapEvent = TapEvent::zero();
+        for _ in 0..5 {
+            assert_eq!(
+                run_with(&slots, Slot::Route, &EVENT, None, None, |_| {}),
+                Action::Route { arm: 0 }
+            );
+            assert_eq!(slots.last_fuel_used(Slot::Route), 3);
+        }
     }
 
     #[test]

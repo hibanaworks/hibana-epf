@@ -16,8 +16,8 @@ fn lifecycle_surface_uses_attach_helpers_not_raw_program_exports() {
     let kinds = read("src/control_kinds.rs");
 
     assert!(
-        src.contains("pub fn attach_controller") && src.contains("pub fn attach_cluster"),
-        "hibana-epf surface must expose attach helpers"
+        src.contains("pub fn attach_controller"),
+        "hibana-epf surface must expose the controller attach helper"
     );
     assert!(
         src.contains("pub mod control_kinds;"),
@@ -60,8 +60,10 @@ fn lifecycle_surface_uses_attach_helpers_not_raw_program_exports() {
     for forbidden in [
         "Msg<LABEL_POLICY_LOAD, u32>",
         "Msg<LABEL_POLICY_ACTIVATE, u8>",
-        "Msg<LABEL_POLICY_REVERT, u8>",
+        "Msg<LABEL_POLICY_RESTORE, u8>",
         "Msg<LABEL_POLICY_ANNOTATE, PolicyAnnotation>",
+        "pub fn attach_cluster",
+        "ROLE_CLUSTER",
         "Role<ROLE_CONTROLLER>,\n        hibana::g::Role<ROLE_CLUSTER>,",
     ] {
         assert!(
@@ -72,14 +74,32 @@ fn lifecycle_surface_uses_attach_helpers_not_raw_program_exports() {
 }
 
 #[test]
-fn dependency_surface_uses_exact_git_rev_with_local_overlay_config() {
+fn loader_commit_does_not_materialize_full_image_copy() {
+    let src = read("src/loader.rs");
+
+    for forbidden in [
+        "Header::SIZE + verify_buffer_len()",
+        "let mut image = [0u8;",
+        "copy_from_slice(code)",
+    ] {
+        assert!(
+            !src.contains(forbidden),
+            "loader commit must verify borrowed header/code parts without a full stack image copy: {forbidden}"
+        );
+    }
+    assert!(
+        src.contains("VerifiedImage::from_parts"),
+        "loader commit must use the zero-copy verifier entry"
+    );
+}
+
+#[test]
+fn dependency_surface_uses_local_sibling_path_dependency() {
     let cargo_toml = read("Cargo.toml");
-    let cargo_config = read(".cargo/config.toml");
+    let cargo_config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".cargo/config.toml");
 
-    assert!(cargo_toml.contains("git = \"https://github.com/hibanaworks/hibana\""));
-    assert!(cargo_toml.contains("rev = \""));
-    assert!(!cargo_toml.contains("path = \"../hibana\""));
-
-    assert!(cargo_config.contains("[patch.\"https://github.com/hibanaworks/hibana\"]"));
-    assert!(cargo_config.contains("hibana = { path = \"../hibana\" }"));
+    assert!(cargo_toml.contains("hibana = { path = \"../hibana\""));
+    assert!(!cargo_toml.contains("git = \"https://github.com/hibanaworks/hibana\""));
+    assert!(!cargo_toml.contains("rev = \""));
+    assert!(!cargo_config.exists());
 }

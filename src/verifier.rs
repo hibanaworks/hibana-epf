@@ -1,6 +1,6 @@
 use core::convert::TryInto;
 
-use super::{Slot, ops, slot_contract};
+use super::{Slot, ops, slot_contract, vm::REG_COUNT};
 
 /// VM header as laid out in bytecode (after the four-byte magic).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,21 +32,18 @@ impl Header {
         let mem_len = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
         let flags = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
         let hash = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        if mem_len as usize > Self::max_mem_len() {
-            return Err(VerifyError::MemTooLarge { requested: mem_len });
-        }
-        if fuel_max == 0 {
-            return Err(VerifyError::ZeroFuel);
-        }
-        Ok(Self {
+        let header = Self {
             code_len,
             fuel_max,
             mem_len,
             flags,
             hash,
-        })
+        };
+        header.validate()?;
+        Ok(header)
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_into(&self, buf: &mut [u8; Self::SIZE]) {
         buf[..4].copy_from_slice(&Self::MAGIC);
         buf[4..6].copy_from_slice(&self.code_len.to_le_bytes());
@@ -54,6 +51,18 @@ impl Header {
         buf[8..10].copy_from_slice(&self.mem_len.to_le_bytes());
         buf[10..12].copy_from_slice(&self.flags.to_le_bytes());
         buf[12..16].copy_from_slice(&self.hash.to_le_bytes());
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), VerifyError> {
+        if self.mem_len as usize > Self::max_mem_len() {
+            return Err(VerifyError::MemTooLarge {
+                requested: self.mem_len,
+            });
+        }
+        if self.fuel_max == 0 {
+            return Err(VerifyError::ZeroFuel);
+        }
+        Ok(())
     }
 }
 
@@ -70,6 +79,8 @@ pub enum VerifyError {
     UnknownOpcode { pc: usize, opcode: u8 },
     TruncatedInstruction { pc: usize },
     InvalidInputIndex { pc: usize, index: u8 },
+    InvalidRegister { pc: usize, register: u8 },
+    InvalidJumpTarget { pc: usize, target: u16 },
     InputForbiddenForSlot { pc: usize, slot: Slot },
     MemOpsForbiddenForSlot { pc: usize, slot: Slot },
 }
@@ -99,6 +110,18 @@ impl<'a> VerifiedImage<'a> {
 
     pub fn new_for_slot(bytes: &'a [u8], slot: Slot) -> Result<Self, VerifyError> {
         Self::new_inner(bytes, Some(slot))
+    }
+
+    pub(crate) fn from_parts(header: Header, code: &'a [u8]) -> Result<Self, VerifyError> {
+        Self::from_parts_inner(header, code, None)
+    }
+
+    pub(crate) fn from_parts_for_slot(
+        header: Header,
+        code: &'a [u8],
+        slot: Slot,
+    ) -> Result<Self, VerifyError> {
+        Self::from_parts_inner(header, code, Some(slot))
     }
 
     fn new_inner(bytes: &'a [u8], slot: Option<Slot>) -> Result<Self, VerifyError> {
@@ -131,10 +154,110 @@ impl<'a> VerifiedImage<'a> {
         Ok(Self { header, code })
     }
 
+    fn from_parts_inner(
+        header: Header,
+        code: &'a [u8],
+        slot: Option<Slot>,
+    ) -> Result<Self, VerifyError> {
+        header.validate()?;
+        if header.code_len as usize > Self::MAX_CODE_LEN {
+            return Err(VerifyError::CodeTooLarge {
+                declared: header.code_len,
+            });
+        }
+        if code.len() != header.code_len as usize {
+            return Err(VerifyError::CodeLengthMismatch {
+                declared: header.code_len,
+                actual: code.len(),
+            });
+        }
+        let hash = compute_hash(code);
+        if hash != header.hash {
+            return Err(VerifyError::HashMismatch {
+                expected: header.hash,
+                computed: hash,
+            });
+        }
+        verify_epf_input_operands(code, slot)?;
+        Ok(Self { header, code })
+    }
+
     pub(crate) fn confirm_slot(self, slot: Slot) -> Result<Self, VerifyError> {
         verify_epf_input_operands(self.code, Some(slot))?;
         Ok(self)
     }
+}
+
+fn operand_len(opcode: u8) -> Option<usize> {
+    Some(match opcode {
+        ops::instr::NOP | ops::instr::HALT => 0,
+        ops::instr::LOAD_IMM => 5,
+        ops::instr::JUMP => 2,
+        ops::instr::JUMP_Z => 3,
+        ops::instr::JUMP_GT => 4,
+        ops::instr::LOAD_MEM | ops::instr::STORE_MEM => 2,
+        ops::instr::GET_LATENCY
+        | ops::instr::GET_QUEUE
+        | ops::instr::GET_CONGESTION
+        | ops::instr::GET_RETRY
+        | ops::instr::GET_SCOPE_RANGE
+        | ops::instr::GET_SCOPE_NEST
+        | ops::instr::GET_EVENT_ID
+        | ops::instr::GET_EVENT_ARG0
+        | ops::instr::GET_EVENT_ARG1
+        | ops::instr::ACT_ROUTE
+        | ops::instr::ACT_DEFER => 1,
+        ops::instr::GET_INPUT => 2,
+        ops::instr::SHR | ops::instr::AND | ops::instr::AND_IMM => 3,
+        ops::instr::JUMP_EQ_IMM => 4,
+        ops::instr::ACT_ABORT => 2,
+        ops::instr::ACT_ANNOT => 3,
+        ops::instr::TAP_OUT => 4,
+        _ => return None,
+    })
+}
+
+#[inline]
+fn read_u16_le(lo: u8, hi: u8) -> u16 {
+    (lo as u16) | ((hi as u16) << 8)
+}
+
+fn is_instruction_boundary(code: &[u8], target: usize) -> bool {
+    if target >= code.len() {
+        return false;
+    }
+
+    let mut pc = 0usize;
+    while pc < code.len() {
+        if pc == target {
+            return true;
+        }
+        let Some(len) = operand_len(code[pc]) else {
+            return false;
+        };
+        let next = pc.saturating_add(1).saturating_add(len);
+        if next > code.len() {
+            return false;
+        }
+        pc = next;
+    }
+    false
+}
+
+#[inline]
+fn require_register(pc: usize, register: u8) -> Result<(), VerifyError> {
+    if register as usize >= REG_COUNT {
+        return Err(VerifyError::InvalidRegister { pc, register });
+    }
+    Ok(())
+}
+
+#[inline]
+fn require_jump_target(code: &[u8], pc: usize, target: u16) -> Result<(), VerifyError> {
+    if !is_instruction_boundary(code, target as usize) {
+        return Err(VerifyError::InvalidJumpTarget { pc, target });
+    }
+    Ok(())
 }
 
 fn verify_epf_input_operands(code: &[u8], slot: Option<Slot>) -> Result<(), VerifyError> {
@@ -143,13 +266,33 @@ fn verify_epf_input_operands(code: &[u8], slot: Option<Slot>) -> Result<(), Veri
         let op_pc = pc;
         let opcode = code[pc];
         pc += 1;
-        let operand_len = match opcode {
-            ops::instr::NOP | ops::instr::HALT => 0,
-            ops::instr::LOAD_IMM => 5,
-            ops::instr::JUMP => 2,
-            ops::instr::JUMP_Z => 3,
-            ops::instr::JUMP_GT => 4,
-            ops::instr::LOAD_MEM | ops::instr::STORE_MEM => 2,
+        let operand_len =
+            operand_len(opcode).ok_or(VerifyError::UnknownOpcode { pc: op_pc, opcode })?;
+        if pc + operand_len > code.len() {
+            return Err(VerifyError::TruncatedInstruction { pc: op_pc });
+        }
+        let operands = &code[pc..pc + operand_len];
+
+        match opcode {
+            ops::instr::LOAD_IMM => {
+                require_register(op_pc, operands[0])?;
+            }
+            ops::instr::JUMP => {
+                require_jump_target(code, op_pc, read_u16_le(operands[0], operands[1]))?;
+            }
+            ops::instr::JUMP_Z => {
+                require_register(op_pc, operands[0])?;
+                require_jump_target(code, op_pc, read_u16_le(operands[1], operands[2]))?;
+            }
+            ops::instr::JUMP_GT => {
+                require_register(op_pc, operands[0])?;
+                require_register(op_pc, operands[1])?;
+                require_jump_target(code, op_pc, read_u16_le(operands[2], operands[3]))?;
+            }
+            ops::instr::LOAD_MEM | ops::instr::STORE_MEM => {
+                require_register(op_pc, operands[0])?;
+                require_register(op_pc, operands[1])?;
+            }
             ops::instr::GET_LATENCY
             | ops::instr::GET_QUEUE
             | ops::instr::GET_CONGESTION
@@ -160,23 +303,34 @@ fn verify_epf_input_operands(code: &[u8], slot: Option<Slot>) -> Result<(), Veri
             | ops::instr::GET_EVENT_ARG0
             | ops::instr::GET_EVENT_ARG1
             | ops::instr::ACT_ROUTE
-            | ops::instr::ACT_DEFER => 1,
-            ops::instr::GET_INPUT => 2,
-            ops::instr::SHR | ops::instr::AND | ops::instr::AND_IMM => 3,
-            ops::instr::JUMP_EQ_IMM => 4,
-            ops::instr::ACT_ABORT => 2,
-            ops::instr::ACT_ANNOT => 3,
-            ops::instr::TAP_OUT => 4,
-            other => {
-                return Err(VerifyError::UnknownOpcode {
-                    pc: op_pc,
-                    opcode: other,
-                });
+            | ops::instr::ACT_DEFER => {
+                require_register(op_pc, operands[0])?;
             }
-        };
-        if pc + operand_len > code.len() {
-            return Err(VerifyError::TruncatedInstruction { pc: op_pc });
+            ops::instr::GET_INPUT => {
+                require_register(op_pc, operands[0])?;
+            }
+            ops::instr::SHR | ops::instr::AND | ops::instr::AND_IMM => {
+                require_register(op_pc, operands[0])?;
+                require_register(op_pc, operands[1])?;
+                if opcode == ops::instr::AND {
+                    require_register(op_pc, operands[2])?;
+                }
+            }
+            ops::instr::JUMP_EQ_IMM => {
+                require_register(op_pc, operands[0])?;
+                require_jump_target(code, op_pc, read_u16_le(operands[2], operands[3]))?;
+            }
+            ops::instr::ACT_ANNOT => {
+                require_register(op_pc, operands[2])?;
+            }
+            ops::instr::TAP_OUT => {
+                require_register(op_pc, operands[2])?;
+                require_register(op_pc, operands[3])?;
+            }
+            ops::instr::NOP | ops::instr::HALT | ops::instr::ACT_ABORT => {}
+            _ => unreachable!("operand_len filters unknown opcodes"),
         }
+
         if matches!(opcode, ops::instr::LOAD_MEM | ops::instr::STORE_MEM)
             && let Some(slot) = slot
             && !slot_contract::slot_allows_mem_ops(slot)
@@ -184,7 +338,7 @@ fn verify_epf_input_operands(code: &[u8], slot: Option<Slot>) -> Result<(), Veri
             return Err(VerifyError::MemOpsForbiddenForSlot { pc: op_pc, slot });
         }
         if opcode == ops::instr::GET_INPUT {
-            let index = code[pc + 1];
+            let index = operands[1];
             if index > 3 {
                 return Err(VerifyError::InvalidInputIndex { pc: op_pc, index });
             }
@@ -450,5 +604,43 @@ mod tests {
         image[Header::SIZE..].copy_from_slice(&code);
         let verified = VerifiedImage::new_for_slot(&image, Slot::Route).expect("must verify");
         assert_eq!(verified.code, code);
+    }
+
+    #[test]
+    fn reject_register_operand_out_of_range() {
+        let code = [ops::instr::LOAD_IMM, 0x08, 0x01, 0x00, 0x00, 0x00];
+        let mut image = [0u8; Header::SIZE + 6];
+        let header = Header {
+            code_len: code.len() as u16,
+            fuel_max: 8,
+            mem_len: 32,
+            flags: 0,
+            hash: compute_hash(&code),
+        };
+        header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
+        image[Header::SIZE..].copy_from_slice(&code);
+        assert!(matches!(
+            VerifiedImage::new(&image).unwrap_err(),
+            VerifyError::InvalidRegister { pc: 0, register: 8 }
+        ));
+    }
+
+    #[test]
+    fn reject_jump_target_inside_operand() {
+        let code = [ops::instr::JUMP, 0x02, 0x00, ops::instr::HALT];
+        let mut image = [0u8; Header::SIZE + 4];
+        let header = Header {
+            code_len: code.len() as u16,
+            fuel_max: 8,
+            mem_len: 32,
+            flags: 0,
+            hash: compute_hash(&code),
+        };
+        header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
+        image[Header::SIZE..].copy_from_slice(&code);
+        assert!(matches!(
+            VerifiedImage::new(&image).unwrap_err(),
+            VerifyError::InvalidJumpTarget { pc: 0, target: 2 }
+        ));
     }
 }

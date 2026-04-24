@@ -1,7 +1,10 @@
 use super::{
     Slot,
-    verifier::{Header, VerifiedImage, VerifyError, compute_hash},
+    verifier::{Header, VerifiedImage, VerifyError},
 };
+
+#[cfg(test)]
+use super::verifier::compute_hash;
 
 /// Errors surfaced by the image loader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,27 +103,18 @@ impl ImageLoader {
             }));
         }
         let code = &self.buffer[..header.code_len as usize];
-        let hash = compute_hash(code);
-        if hash != header.hash {
-            self.header = Some(header);
-            return Err(LoaderError::HashMismatch {
-                expected: header.hash,
-                computed: hash,
-            });
-        }
-        // Construct a byte image (header + code) so we can leverage the verifier
-        // for the final safety net. The header is small enough that we can build
-        // a stack buffer.
-        let mut header_bytes = [0u8; Header::SIZE];
-        header.encode_into(&mut header_bytes);
-        let mut image = [0u8; Header::SIZE + verify_buffer_len()];
-        image[..Header::SIZE].copy_from_slice(&header_bytes);
-        image[Header::SIZE..Header::SIZE + code.len()].copy_from_slice(code);
         let verified = match slot {
-            Some(slot) => VerifiedImage::new_for_slot(&image[..Header::SIZE + code.len()], slot),
-            None => VerifiedImage::new(&image[..Header::SIZE + code.len()]),
-        }
-        .map_err(LoaderError::Verify)?;
+            Some(slot) => VerifiedImage::from_parts_for_slot(header, code, slot),
+            None => VerifiedImage::from_parts(header, code),
+        };
+        let verified = match verified {
+            Ok(verified) => verified,
+            Err(VerifyError::HashMismatch { expected, computed }) => {
+                self.header = Some(header);
+                return Err(LoaderError::HashMismatch { expected, computed });
+            }
+            Err(err) => return Err(LoaderError::Verify(err)),
+        };
         Ok(VerifiedImage {
             header: verified.header,
             code: &self.buffer[..header.code_len as usize],
@@ -185,6 +179,18 @@ mod tests {
         loader.write(0, &[0x00, 0x01]).unwrap();
         let err = loader.commit().unwrap_err();
         assert!(matches!(err, LoaderError::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn reject_zero_fuel_on_commit_without_building_image_copy() {
+        let code = [0x00u8, 0x00, 0x00, 0x01];
+        let mut header = build_header(&code);
+        header.fuel_max = 0;
+        let mut loader = ImageLoader::new();
+        loader.begin(header).unwrap();
+        loader.write(0, &code).unwrap();
+        let err = loader.commit().unwrap_err();
+        assert_eq!(err, LoaderError::Verify(VerifyError::ZeroFuel));
     }
 
     #[test]

@@ -3,7 +3,8 @@ use hibana::substrate::{
     tap::TapEvent,
 };
 use hibana_epf::{
-    Action, Header, HostSlots, ScratchLease, Slot, host::HostError, loader::ImageLoader, run_with,
+    Action, ENGINE_FAIL_CLOSED, Header, HostSlots, ScratchLease, Slot, host::HostError,
+    loader::ImageLoader, run_with,
 };
 
 fn header_for(code: &[u8], mem_len: u16) -> Header {
@@ -45,9 +46,9 @@ fn production_run_with_executes_route_program_from_policy_input() {
 
     static EVENT: TapEvent = TapEvent::zero();
     let action = run_with(&slots, Slot::Route, &EVENT, None, None, |ctx| {
-        ctx.set_policy_input([2, 0, 0, 0])
+        ctx.set_policy_input([1, 0, 0, 0])
     });
-    assert_eq!(action, Action::Route { arm: 2 });
+    assert_eq!(action, Action::Route { arm: 1 });
 }
 
 #[test]
@@ -67,15 +68,15 @@ fn production_run_with_executes_route_program_from_policy_attrs() {
 
     static EVENT: TapEvent = TapEvent::zero();
     let action = run_with(&slots, Slot::Route, &EVENT, None, None, |ctx| {
-        ctx.set_policy_attrs(queue_depth_attrs(3))
+        ctx.set_policy_attrs(queue_depth_attrs(1))
     });
-    assert_eq!(action, Action::Route { arm: 3 });
+    assert_eq!(action, Action::Route { arm: 1 });
 }
 
 #[test]
 fn production_install_owns_active_code_and_allows_loader_reuse() {
-    let active_code = [0x10, 0x00, 0x07, 0x00, 0x00, 0x00, 0x33, 0x00];
-    let staged_code = [0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x33, 0x00];
+    let active_code = [0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x33, 0x00];
+    let staged_code = [0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x33, 0x00];
 
     let mut loader = ImageLoader::new();
     loader
@@ -98,7 +99,7 @@ fn production_install_owns_active_code_and_allows_loader_reuse() {
 
     static EVENT: TapEvent = TapEvent::zero();
     let still_active = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
-    assert_eq!(still_active, Action::Route { arm: 7 });
+    assert_eq!(still_active, Action::Route { arm: 1 });
 
     let scratch = slots.uninstall(Slot::Route).expect("uninstall active");
     slots
@@ -106,13 +107,13 @@ fn production_install_owns_active_code_and_allows_loader_reuse() {
         .expect("reinstall staged");
 
     let replaced = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
-    assert_eq!(replaced, Action::Route { arm: 2 });
+    assert_eq!(replaced, Action::Route { arm: 0 });
 }
 
 #[test]
 fn production_failed_install_returns_scratch_for_retry() {
     let oversized_code = [0x10, 0x00, 0x03, 0x00, 0x00, 0x00, 0x33, 0x00];
-    let retry_code = [0x10, 0x00, 0x05, 0x00, 0x00, 0x00, 0x33, 0x00];
+    let retry_code = [0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x33, 0x00];
 
     let mut loader = ImageLoader::new();
     loader
@@ -148,5 +149,27 @@ fn production_failed_install_returns_scratch_for_retry() {
 
     static EVENT: TapEvent = TapEvent::zero();
     let action = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
-    assert_eq!(action, Action::Route { arm: 5 });
+    assert_eq!(action, Action::Route { arm: 1 });
+}
+
+#[test]
+fn production_run_with_rejects_non_binary_route_arm() {
+    let code = [0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x33, 0x00];
+    let mut loader = ImageLoader::new();
+    loader.begin(header_for(&code, 16)).expect("begin");
+    loader.write(0, &code).expect("write");
+    let verified = loader.commit_for_slot(Slot::Route).expect("verify");
+
+    let mut slots = HostSlots::new();
+    let mut scratch = [0u8; 16];
+    slots
+        .install_verified(Slot::Route, verified, ScratchLease::new(&mut scratch))
+        .expect("install");
+
+    static EVENT: TapEvent = TapEvent::zero();
+    let action = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
+    assert!(matches!(
+        action,
+        Action::Abort(info) if info.reason == ENGINE_FAIL_CLOSED && info.trap.is_none()
+    ));
 }

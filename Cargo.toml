@@ -14,4 +14,4 @@ default = []
 std = ["hibana/std"]
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "5158dc0ba669baa78b292585036334e4fcc0f090", default-features = false }
+hibana = { path = "../hibana", default-features = false }

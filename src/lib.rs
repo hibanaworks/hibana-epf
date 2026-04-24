@@ -13,8 +13,8 @@ use crate::control_kinds::{
 };
 use hibana::substrate::{
     Lane, SessionId,
-    policy::{ContextValue, PolicyAttrs, core as policy_core},
     cap::{ControlResourceKind, GenericCapToken},
+    policy::{ContextValue, PolicyAttrs, core as policy_core},
     tap::TapEvent,
 };
 pub use host::{HostSlots, ScratchLease};
@@ -22,7 +22,6 @@ pub use verifier::Header;
 pub use vm::{Slot, Trap, VmCtx};
 
 pub const ROLE_CONTROLLER: u8 = 0;
-pub const ROLE_CLUSTER: u8 = 1;
 
 /// ```compile_fail
 /// use hibana::g;
@@ -135,52 +134,6 @@ where
         hibana::g::seq(activate, hibana::g::seq(revert, annotate)),
     );
     let projected: hibana::g::advanced::RoleProgram<ROLE_CONTROLLER> =
-        hibana::g::advanced::project(&program);
-
-    kit.enter(rv, sid, &projected, hibana::substrate::binding::NoBinding)
-}
-
-#[allow(private_bounds)]
-pub fn attach_cluster<'r, 'cfg, T, U, C, const MAX_RV: usize>(
-    kit: &'r hibana::substrate::SessionKit<'cfg, T, U, C, MAX_RV>,
-    rv: hibana::substrate::RendezvousId,
-    sid: hibana::substrate::SessionId,
-) -> Result<hibana::Endpoint<'r, ROLE_CLUSTER>, hibana::substrate::AttachError>
-where
-    T: hibana::substrate::Transport + 'cfg,
-    U: hibana::substrate::runtime::LabelUniverse + 'cfg,
-    C: hibana::substrate::runtime::Clock + 'cfg,
-    'cfg: 'r,
-{
-    let load = hibana::g::send::<
-        hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CONTROLLER>,
-        PolicyLoadControlMsg,
-        0,
-    >();
-    let activate = hibana::g::send::<
-        hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CONTROLLER>,
-        PolicyActivateControlMsg,
-        0,
-    >();
-    let revert = hibana::g::send::<
-        hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CONTROLLER>,
-        PolicyRevertControlMsg,
-        0,
-    >();
-    let annotate = hibana::g::send::<
-        hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CONTROLLER>,
-        PolicyAnnotateControlMsg,
-        0,
-    >();
-    let program = hibana::g::seq(
-        load,
-        hibana::g::seq(activate, hibana::g::seq(revert, annotate)),
-    );
-    let projected: hibana::g::advanced::RoleProgram<ROLE_CLUSTER> =
         hibana::g::advanced::project(&program);
 
     kit.enter(rv, sid, &projected, hibana::substrate::binding::NoBinding)
@@ -360,8 +313,16 @@ pub fn hash_policy_input(input: [u32; 4]) -> u32 {
 #[inline]
 pub fn hash_transport_attrs(attrs: &PolicyAttrs) -> u32 {
     let mut hash = FNV32_OFFSET;
-    hash = fnv32_mix_opt_u64(hash, attrs.get(policy_core::LATENCY_US).map(ContextValue::as_u64));
-    hash = fnv32_mix_opt_u32(hash, attrs.get(policy_core::QUEUE_DEPTH).map(ContextValue::as_u32));
+    hash = fnv32_mix_opt_u64(
+        hash,
+        attrs.get(policy_core::LATENCY_US).map(ContextValue::as_u64),
+    );
+    hash = fnv32_mix_opt_u32(
+        hash,
+        attrs
+            .get(policy_core::QUEUE_DEPTH)
+            .map(ContextValue::as_u32),
+    );
     hash = fnv32_mix_opt_u64(
         hash,
         attrs
@@ -380,8 +341,14 @@ pub fn hash_transport_attrs(attrs: &PolicyAttrs) -> u32 {
             .get(policy_core::RETRANSMISSIONS)
             .map(ContextValue::as_u32),
     );
-    hash = fnv32_mix_opt_u32(hash, attrs.get(policy_core::PTO_COUNT).map(ContextValue::as_u32));
-    hash = fnv32_mix_opt_u64(hash, attrs.get(policy_core::SRTT_US).map(ContextValue::as_u64));
+    hash = fnv32_mix_opt_u32(
+        hash,
+        attrs.get(policy_core::PTO_COUNT).map(ContextValue::as_u32),
+    );
+    hash = fnv32_mix_opt_u64(
+        hash,
+        attrs.get(policy_core::SRTT_US).map(ContextValue::as_u64),
+    );
     hash = fnv32_mix_opt_u64(
         hash,
         attrs
@@ -514,6 +481,25 @@ impl Action {
 }
 
 #[inline]
+fn action_from_vm(vm_action: VmAction) -> Action {
+    match vm_action {
+        VmAction::Proceed => Action::Proceed,
+        VmAction::Abort { reason } => Action::Abort(AbortInfo { reason, trap: None }),
+        VmAction::Trap(trap) => Action::Abort(AbortInfo {
+            reason: ENGINE_FAIL_CLOSED,
+            trap: Some(trap),
+        }),
+        VmAction::Tap { id, arg0, arg1 } => Action::Tap { id, arg0, arg1 },
+        VmAction::Route { arm } if arm <= 1 => Action::Route { arm },
+        VmAction::Route { .. } => Action::Abort(AbortInfo {
+            reason: ENGINE_FAIL_CLOSED,
+            trap: None,
+        }),
+        VmAction::Defer { retry_hint } => Action::Defer { retry_hint },
+    }
+}
+
+#[inline]
 pub fn run_with<F>(
     host_slots: &HostSlots<'_>,
     slot: Slot,
@@ -526,17 +512,6 @@ where
     F: FnOnce(&mut VmCtx<'_>),
 {
     let vm_action = host_slots.execute_with(slot, event, session, lane, configure);
-    let action = match vm_action {
-        VmAction::Proceed => Action::Proceed,
-        VmAction::Abort { reason } => Action::Abort(AbortInfo { reason, trap: None }),
-        VmAction::Trap(trap) => Action::Abort(AbortInfo {
-            reason: ENGINE_FAIL_CLOSED,
-            trap: Some(trap),
-        }),
-        VmAction::Tap { id, arg0, arg1 } => Action::Tap { id, arg0, arg1 },
-        VmAction::Route { arm } => Action::Route { arm },
-        VmAction::Defer { retry_hint } => Action::Defer { retry_hint },
-    };
-    action.with_mode(host_slots.policy_mode(slot))
+    action_from_vm(vm_action).with_mode(host_slots.policy_mode(slot))
 }
 use vm::VmAction;
