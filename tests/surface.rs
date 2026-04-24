@@ -116,7 +116,7 @@ fn dependency_surface_uses_pinned_git_dependency() {
     let cargo_config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".cargo/config.toml");
 
     assert!(cargo_toml.contains("git = \"https://github.com/hibanaworks/hibana\""));
-    assert!(cargo_toml.contains("rev = \"53fe08fe5169fd5bb2f3012ef83e1ac8a221b081\""));
+    assert!(cargo_toml.contains("rev = \"dbad661f3bcb9be17f23ca7c1764a9649f0487b7\""));
     assert!(!cargo_toml.contains("path = \"../hibana\""));
     assert!(!cargo_config.exists());
 }
