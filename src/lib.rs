@@ -12,14 +12,16 @@ use crate::control_kinds::{
     PolicyActivateKind, PolicyAnnotateKind, PolicyLoadKind, PolicyRevertKind,
 };
 use hibana::substrate::{
-    Lane, SessionId,
     cap::{ControlResourceKind, GenericCapToken},
-    policy::{ContextValue, PolicyAttrs, core as policy_core},
+    ids::{Lane, RendezvousId, SessionId},
+    policy::{ContextId, ContextValue, PolicyAttrs, core as policy_core},
+    program::{RoleProgram, project},
     tap::TapEvent,
 };
 pub use host::{HostSlots, ScratchLease};
 pub use verifier::Header;
-pub use vm::{Slot, Trap, VmCtx};
+use vm::Slot;
+pub use vm::{Trap, VmCtx};
 
 pub const ROLE_CONTROLLER: u8 = 0;
 
@@ -58,11 +60,10 @@ type PolicyAnnotateControlMsg = hibana::g::Msg<
     PolicyAnnotateKind,
 >;
 
-#[allow(private_bounds)]
 pub fn attach_controller<'r, 'cfg, T, U, C, const MAX_RV: usize>(
     kit: &'r hibana::substrate::SessionKit<'cfg, T, U, C, MAX_RV>,
-    rv: hibana::substrate::RendezvousId,
-    sid: hibana::substrate::SessionId,
+    rv: RendezvousId,
+    sid: SessionId,
 ) -> Result<hibana::Endpoint<'r, ROLE_CONTROLLER>, hibana::substrate::AttachError>
 where
     T: hibana::substrate::Transport + 'cfg,
@@ -98,8 +99,7 @@ where
         load,
         hibana::g::seq(activate, hibana::g::seq(revert, annotate)),
     );
-    let projected: hibana::g::advanced::RoleProgram<ROLE_CONTROLLER> =
-        hibana::g::advanced::project(&program);
+    let projected: RoleProgram<ROLE_CONTROLLER> = project(&program);
 
     kit.enter(rv, sid, &projected, hibana::substrate::binding::NoBinding)
 }
@@ -367,7 +367,7 @@ const fn opt_u32_or_zero(value: Option<u32>) -> u32 {
 }
 
 #[inline]
-const fn attr_u32(attrs: &PolicyAttrs, id: hibana::substrate::policy::ContextId) -> Option<u32> {
+const fn attr_u32(attrs: &PolicyAttrs, id: ContextId) -> Option<u32> {
     match attrs.get(id) {
         Some(value) => Some(value.as_u32()),
         None => None,
@@ -375,7 +375,7 @@ const fn attr_u32(attrs: &PolicyAttrs, id: hibana::substrate::policy::ContextId)
 }
 
 #[inline]
-const fn attr_u64(attrs: &PolicyAttrs, id: hibana::substrate::policy::ContextId) -> Option<u64> {
+const fn attr_u64(attrs: &PolicyAttrs, id: ContextId) -> Option<u64> {
     match attrs.get(id) {
         Some(value) => Some(value.as_u64()),
         None => None,

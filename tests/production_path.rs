@@ -3,8 +3,8 @@ use hibana::substrate::{
     tap::TapEvent,
 };
 use hibana_epf::{
-    Action, ENGINE_FAIL_CLOSED, Header, HostSlots, ScratchLease, Slot, host::HostError,
-    loader::ImageLoader, run_with,
+    Action, ENGINE_FAIL_CLOSED, Header, HostSlots, ScratchLease, host::HostError,
+    loader::ImageLoader, run_with, vm::Slot,
 };
 
 fn header_for(code: &[u8], mem_len: u16) -> Header {
@@ -128,7 +128,8 @@ fn production_failed_install_returns_scratch_for_retry() {
     let err = slots
         .install_verified(Slot::Route, oversized, ScratchLease::new(&mut scratch_buf))
         .unwrap_err();
-    let (error, scratch) = err.into_parts();
+    let error = err.error();
+    let scratch = err.into_scratch();
     assert!(matches!(
         error,
         HostError::ScratchTooSmall {

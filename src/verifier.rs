@@ -106,16 +106,8 @@ impl<'a> core::fmt::Debug for VerifiedImage<'a> {
 impl<'a> VerifiedImage<'a> {
     pub const MAX_CODE_LEN: usize = 2048;
 
-    pub fn new(bytes: &'a [u8]) -> Result<Self, VerifyError> {
-        Self::new_inner(bytes, None)
-    }
-
     pub fn new_for_slot(bytes: &'a [u8], slot: Slot) -> Result<Self, VerifyError> {
-        Self::new_inner(bytes, Some(slot))
-    }
-
-    pub(crate) fn from_parts(header: Header, code: &'a [u8]) -> Result<Self, VerifyError> {
-        Self::from_parts_inner(header, code, None)
+        Self::new_inner(bytes, slot)
     }
 
     pub(crate) fn from_parts_for_slot(
@@ -123,10 +115,10 @@ impl<'a> VerifiedImage<'a> {
         code: &'a [u8],
         slot: Slot,
     ) -> Result<Self, VerifyError> {
-        Self::from_parts_inner(header, code, Some(slot))
+        Self::from_parts_inner(header, code, slot)
     }
 
-    fn new_inner(bytes: &'a [u8], slot: Option<Slot>) -> Result<Self, VerifyError> {
+    fn new_inner(bytes: &'a [u8], slot: Slot) -> Result<Self, VerifyError> {
         if bytes.len() < Header::SIZE {
             return Err(VerifyError::TooShort);
         }
@@ -156,11 +148,7 @@ impl<'a> VerifiedImage<'a> {
         Ok(Self { header, code })
     }
 
-    fn from_parts_inner(
-        header: Header,
-        code: &'a [u8],
-        slot: Option<Slot>,
-    ) -> Result<Self, VerifyError> {
+    fn from_parts_inner(header: Header, code: &'a [u8], slot: Slot) -> Result<Self, VerifyError> {
         header.validate()?;
         if header.code_len as usize > Self::MAX_CODE_LEN {
             return Err(VerifyError::CodeTooLarge {
@@ -185,7 +173,7 @@ impl<'a> VerifiedImage<'a> {
     }
 
     pub(crate) fn confirm_slot(self, slot: Slot) -> Result<Self, VerifyError> {
-        verify_epf_input_operands(self.code, Some(slot))?;
+        verify_epf_input_operands(self.code, slot)?;
         Ok(self)
     }
 }
@@ -262,7 +250,7 @@ fn require_jump_target(code: &[u8], pc: usize, target: u16) -> Result<(), Verify
     Ok(())
 }
 
-fn verify_epf_input_operands(code: &[u8], slot: Option<Slot>) -> Result<(), VerifyError> {
+fn verify_epf_input_operands(code: &[u8], slot: Slot) -> Result<(), VerifyError> {
     let mut pc = 0usize;
     while pc < code.len() {
         let op_pc = pc;
@@ -334,7 +322,6 @@ fn verify_epf_input_operands(code: &[u8], slot: Option<Slot>) -> Result<(), Veri
         }
 
         if matches!(opcode, ops::instr::LOAD_MEM | ops::instr::STORE_MEM)
-            && let Some(slot) = slot
             && !slot_contract::slot_allows_mem_ops(slot)
         {
             return Err(VerifyError::MemOpsForbiddenForSlot { pc: op_pc, slot });
@@ -344,9 +331,7 @@ fn verify_epf_input_operands(code: &[u8], slot: Option<Slot>) -> Result<(), Veri
             if index > 3 {
                 return Err(VerifyError::InvalidInputIndex { pc: op_pc, index });
             }
-            if let Some(slot) = slot
-                && !slot_contract::slot_allows_get_input(slot)
-            {
+            if !slot_contract::slot_allows_get_input(slot) {
                 return Err(VerifyError::InputForbiddenForSlot { pc: op_pc, slot });
             }
         }
@@ -386,7 +371,7 @@ mod tests {
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
         image[Header::SIZE..].copy_from_slice(&code);
 
-        let verified = VerifiedImage::new(&image).expect("must verify");
+        let verified = VerifiedImage::new_for_slot(&image, Slot::Route).expect("must verify");
         assert_eq!(verified.header.fuel_max, 16);
         assert_eq!(verified.code, code);
     }
@@ -404,7 +389,7 @@ mod tests {
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
         image[Header::SIZE..].copy_from_slice(&code);
         assert!(matches!(
-            VerifiedImage::new(&image).unwrap_err(),
+            VerifiedImage::new_for_slot(&image, Slot::Route).unwrap_err(),
             VerifyError::UnknownOpcode {
                 pc: 0,
                 opcode: 0x30
@@ -417,7 +402,7 @@ mod tests {
         let mut bytes = [0u8; Header::SIZE];
         bytes[..4].copy_from_slice(b"BAD!");
         assert!(matches!(
-            VerifiedImage::new(&bytes).unwrap_err(),
+            VerifiedImage::new_for_slot(&bytes, Slot::Route).unwrap_err(),
             VerifyError::BadMagic
         ));
     }
@@ -436,7 +421,7 @@ mod tests {
         image[10] = 1;
         image[Header::SIZE..].copy_from_slice(&code);
         assert_eq!(
-            VerifiedImage::new(&image).unwrap_err(),
+            VerifiedImage::new_for_slot(&image, Slot::Route).unwrap_err(),
             VerifyError::UnsupportedFlags { flags: 1 }
         );
     }
@@ -453,7 +438,7 @@ mod tests {
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
         image[Header::SIZE..].copy_from_slice(&[1, 2]);
         assert!(matches!(
-            VerifiedImage::new(&image).unwrap_err(),
+            VerifiedImage::new_for_slot(&image, Slot::Route).unwrap_err(),
             VerifyError::HashMismatch { .. }
         ));
     }
@@ -470,7 +455,7 @@ mod tests {
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
         image[Header::SIZE..].copy_from_slice(&code);
-        let verified = VerifiedImage::new(&image).expect("must verify");
+        let verified = VerifiedImage::new_for_slot(&image, Slot::Route).expect("must verify");
         assert_eq!(verified.code, code);
     }
 
@@ -487,7 +472,7 @@ mod tests {
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
         image[Header::SIZE..].copy_from_slice(&code);
         assert!(matches!(
-            VerifiedImage::new(&image).unwrap_err(),
+            VerifiedImage::new_for_slot(&image, Slot::Route).unwrap_err(),
             VerifyError::InvalidInputIndex { index: 4, .. }
         ));
     }
@@ -505,7 +490,7 @@ mod tests {
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
         image[Header::SIZE..].copy_from_slice(&code);
         assert!(matches!(
-            VerifiedImage::new(&image).unwrap_err(),
+            VerifiedImage::new_for_slot(&image, Slot::Route).unwrap_err(),
             VerifyError::TruncatedInstruction { .. }
         ));
     }
@@ -629,7 +614,7 @@ mod tests {
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
         image[Header::SIZE..].copy_from_slice(&code);
         assert!(matches!(
-            VerifiedImage::new(&image).unwrap_err(),
+            VerifiedImage::new_for_slot(&image, Slot::Route).unwrap_err(),
             VerifyError::InvalidRegister { pc: 0, register: 8 }
         ));
     }
@@ -647,7 +632,7 @@ mod tests {
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
         image[Header::SIZE..].copy_from_slice(&code);
         assert!(matches!(
-            VerifiedImage::new(&image).unwrap_err(),
+            VerifiedImage::new_for_slot(&image, Slot::Route).unwrap_err(),
             VerifyError::InvalidJumpTarget { pc: 0, target: 2 }
         ));
     }
