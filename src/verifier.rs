@@ -8,7 +8,6 @@ pub struct Header {
     pub code_len: u16,
     pub fuel_max: u16,
     pub mem_len: u16,
-    pub flags: u16,
     pub hash: u32,
 }
 
@@ -31,12 +30,14 @@ impl Header {
         let fuel_max = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
         let mem_len = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
         let flags = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
+        if flags != 0 {
+            return Err(VerifyError::UnsupportedFlags { flags });
+        }
         let hash = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
         let header = Self {
             code_len,
             fuel_max,
             mem_len,
-            flags,
             hash,
         };
         header.validate()?;
@@ -49,7 +50,7 @@ impl Header {
         buf[4..6].copy_from_slice(&self.code_len.to_le_bytes());
         buf[6..8].copy_from_slice(&self.fuel_max.to_le_bytes());
         buf[8..10].copy_from_slice(&self.mem_len.to_le_bytes());
-        buf[10..12].copy_from_slice(&self.flags.to_le_bytes());
+        buf[10..12].copy_from_slice(&0u16.to_le_bytes());
         buf[12..16].copy_from_slice(&self.hash.to_le_bytes());
     }
 
@@ -76,6 +77,7 @@ pub enum VerifyError {
     MemTooLarge { requested: u16 },
     HashMismatch { expected: u32, computed: u32 },
     ZeroFuel,
+    UnsupportedFlags { flags: u16 },
     UnknownOpcode { pc: usize, opcode: u8 },
     TruncatedInstruction { pc: usize },
     InvalidInputIndex { pc: usize, index: u8 },
@@ -379,7 +381,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 16,
             mem_len: 32,
-            flags: 0,
             hash,
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -398,7 +399,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -423,13 +423,31 @@ mod tests {
     }
 
     #[test]
+    fn reject_reserved_header_flags() {
+        let code = [ops::instr::NOP, ops::instr::HALT];
+        let mut image = [0u8; Header::SIZE + 2];
+        let header = Header {
+            code_len: code.len() as u16,
+            fuel_max: 8,
+            mem_len: 32,
+            hash: compute_hash(&code),
+        };
+        header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
+        image[10] = 1;
+        image[Header::SIZE..].copy_from_slice(&code);
+        assert_eq!(
+            VerifiedImage::new(&image).unwrap_err(),
+            VerifyError::UnsupportedFlags { flags: 1 }
+        );
+    }
+
+    #[test]
     fn reject_hash_mismatch() {
         let mut image = [0u8; Header::SIZE + 2];
         let header = Header {
             code_len: 2,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: 0xDEAD_BEEF,
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -448,7 +466,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -465,7 +482,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -484,7 +500,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -503,7 +518,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -525,7 +539,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -547,7 +560,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -575,7 +587,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 16,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -597,7 +608,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -614,7 +624,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());
@@ -633,7 +642,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(&code),
         };
         header.encode_into((&mut image[..Header::SIZE]).try_into().unwrap());

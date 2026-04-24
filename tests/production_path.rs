@@ -12,7 +12,6 @@ fn header_for(code: &[u8], mem_len: u16) -> Header {
         code_len: code.len() as u16,
         fuel_max: 8,
         mem_len,
-        flags: 0,
         hash: hibana_epf::verifier::compute_hash(code),
     }
 }
@@ -166,6 +165,17 @@ fn production_run_with_rejects_non_binary_route_arm() {
         .install_verified(Slot::Route, verified, ScratchLease::new(&mut scratch))
         .expect("install");
 
+    static EVENT: TapEvent = TapEvent::zero();
+    let action = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
+    assert!(matches!(
+        action,
+        Action::Abort(info) if info.reason == ENGINE_FAIL_CLOSED && info.trap.is_none()
+    ));
+}
+
+#[test]
+fn production_empty_slot_fails_closed() {
+    let slots = HostSlots::new();
     static EVENT: TapEvent = TapEvent::zero();
     let action = run_with(&slots, Slot::Route, &EVENT, None, None, |_| {});
     assert!(matches!(

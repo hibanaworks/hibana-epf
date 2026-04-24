@@ -5,7 +5,7 @@ use core::{array, cell::Cell, marker::PhantomData, ptr::NonNull};
 use hibana::substrate::{Lane, SessionId, tap::TapEvent};
 
 use super::{
-    PolicyMode,
+    ENGINE_FAIL_CLOSED, PolicyMode,
     verifier::{Header, VerifiedImage, VerifyError},
     vm::{Slot, Vm, VmAction, VmCtx},
 };
@@ -346,7 +346,9 @@ impl<'arena> HostSlots<'arena> {
             }
             None => {
                 self.last_fuel_used[Self::index(slot)].set(0);
-                VmAction::Proceed
+                VmAction::Abort {
+                    reason: ENGINE_FAIL_CLOSED,
+                }
             }
         }
     }
@@ -421,6 +423,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_slot_fails_closed() {
+        let slots = HostSlots::new();
+        static EVENT: TapEvent = TapEvent::zero();
+        assert_eq!(
+            run_with(&slots, Slot::Route, &EVENT, None, None, |_| {}),
+            Action::Abort(AbortInfo {
+                reason: ENGINE_FAIL_CLOSED,
+                trap: None,
+            })
+        );
+        assert_eq!(slots.last_fuel_used(Slot::Route), 0);
+    }
+
+    #[test]
     fn fuel_budget_resets_for_each_policy_execution() {
         static CODE: [u8; 4] = [
             ops::instr::NOP,
@@ -458,7 +474,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 16,
-            flags: 0,
             hash: crate::verifier::compute_hash(&code),
         };
         let mut bytes = [0u8; Header::SIZE + 5];
@@ -506,7 +521,6 @@ mod tests {
             code_len: oversized_code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: crate::verifier::compute_hash(&oversized_code),
         };
         let mut oversized_bytes = [0u8; Header::SIZE + 2];
@@ -520,7 +534,6 @@ mod tests {
             code_len: retry_code.len() as u16,
             fuel_max: 8,
             mem_len: 16,
-            flags: 0,
             hash: crate::verifier::compute_hash(&retry_code),
         };
         let mut retry_bytes = [0u8; Header::SIZE + 2];
@@ -562,7 +575,6 @@ mod tests {
             code_len: CODE.len() as u16,
             fuel_max: 8,
             mem_len: 16,
-            flags: 0,
             hash: crate::verifier::compute_hash(&CODE),
         };
         let mut bytes = [0u8; Header::SIZE + 2];

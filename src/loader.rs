@@ -136,7 +136,6 @@ mod tests {
             code_len: code.len() as u16,
             fuel_max: 8,
             mem_len: 32,
-            flags: 0,
             hash: compute_hash(code),
         }
     }
@@ -171,7 +170,6 @@ mod tests {
             code_len: 2,
             fuel_max: 4,
             mem_len: 8,
-            flags: 0,
             hash: 0x1234_5678,
         };
         loader.begin(header).unwrap();
@@ -187,7 +185,6 @@ mod tests {
             code_len: 2,
             fuel_max: 4,
             mem_len: 8,
-            flags: 0,
             hash: 0x1234_5678,
         };
         loader.begin(bad_header).unwrap();

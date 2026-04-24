@@ -94,12 +94,26 @@ fn loader_commit_does_not_materialize_full_image_copy() {
 }
 
 #[test]
+fn image_header_surface_has_no_unchecked_flags() {
+    let verifier = read("src/verifier.rs");
+
+    assert!(
+        !verifier.contains("pub flags:"),
+        "EPF image flags must not remain a public unchecked compatibility field"
+    );
+    assert!(
+        verifier.contains("UnsupportedFlags"),
+        "EPF verifier must reject non-zero reserved header flags"
+    );
+}
+
+#[test]
 fn dependency_surface_uses_pinned_git_dependency() {
     let cargo_toml = read("Cargo.toml");
     let cargo_config = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".cargo/config.toml");
 
     assert!(cargo_toml.contains("git = \"https://github.com/hibanaworks/hibana\""));
-    assert!(cargo_toml.contains("rev = \"5b0a522a85694718743b19caa1cadb470cf3a22d\""));
+    assert!(cargo_toml.contains("rev = \"4d5e89199be35de2b77e73bd8f550375c63f2e3c\""));
     assert!(!cargo_toml.contains("path = \"../hibana\""));
     assert!(!cargo_config.exists());
 }
