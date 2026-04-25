@@ -49,7 +49,7 @@
 use crate::{ScopeTrace, tap_scope};
 use hibana::substrate::{
     ids::{Lane, SessionId},
-    policy::{ContextValue, PolicyAttrs, core as policy_core},
+    policy::signals::{ContextValue, PolicyAttrs, core as policy_core},
     tap::TapEvent,
 };
 
@@ -759,7 +759,7 @@ mod tests {
     use super::ops;
     use super::*;
     use hibana::substrate::{
-        policy::{ContextValue, PolicyAttrs, core as policy_core},
+        policy::signals::{ContextValue, PolicyAttrs, core as policy_core},
         tap::TapEvent,
     };
 

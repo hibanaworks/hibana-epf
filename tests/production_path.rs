@@ -1,5 +1,5 @@
 use hibana::substrate::{
-    policy::{ContextValue, PolicyAttrs, core as policy_core},
+    policy::signals::{ContextValue, PolicyAttrs, core as policy_core},
     tap::TapEvent,
 };
 use hibana_epf::{

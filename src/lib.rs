@@ -14,7 +14,7 @@ use crate::control_kinds::{
 use hibana::substrate::{
     cap::{ControlResourceKind, GenericCapToken},
     ids::{Lane, RendezvousId, SessionId},
-    policy::{ContextId, ContextValue, PolicyAttrs, core as policy_core},
+    policy::signals::{ContextId, ContextValue, PolicyAttrs, core as policy_core},
     program::{RoleProgram, project},
     tap::TapEvent,
 };
