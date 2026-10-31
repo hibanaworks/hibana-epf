@@ -48,7 +48,9 @@ processes each complete record immediately, flushes its text output and writes
 any binary output before waiting for the next record. The producer can keep the
 pipe open. Reads may split a record across writes; EOF partway through a record
 returns an error. The tool retains one input record rather than the entire
-stream. Filtered events produce no output. `--out` creates a new file and
+stream. These commands run observation images; build policy images with `image`
+and install them in the application that registers the resolver.
+Filtered events produce no output. `--out` creates a new file and
 rejects an existing path, preserving earlier captures.
 
 After adding the built tool to `PATH`, use captured input:
@@ -81,7 +83,9 @@ A policy image can supply a local resolver's decision through
 `epf.resolver::<ID>(fallback)?`. Register that resolver through Hibana's normal
 API. Capacity errors are reported at registration. Without an active policy
 image, the registered fallback runs. Invalid decisions and VM traps reject the
-decision. Hibana still checks which endpoint may choose and when it may act.
+decision. A conditional policy whose input does not match also rejects; it does
+not wait or invoke the fallback. Hibana still checks which endpoint may choose
+and when it may act.
 
 ## What the observations establish
 

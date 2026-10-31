@@ -261,6 +261,13 @@ fn production_image_spec_policy_choose_on_input_is_loadable_resolver_policy() {
     epf.load(&image[..len]).expect("load policy image");
 
     assert_eq!(resolver.decide(), Ok(DecisionArm::Right));
+    let mut different: [u8; 16] = mismatch_event().into();
+    different[11] ^= 1;
+    epf.run(TapEvent::from(different));
+    assert!(
+        resolver.decide().is_err(),
+        "a nonmatching active policy must reject rather than use its fallback"
+    );
 }
 
 fn fallback_left() -> Result<DecisionArm, ResolverError> {
@@ -425,4 +432,58 @@ fn unsupported_image_memory_is_rejected_without_replacing_the_active_filter() {
         ))
     ));
     assert_eq!(epf.run(mismatch_event()), before);
+}
+
+#[test]
+fn rejected_policy_image_does_not_reserve_a_configuration_slot() {
+    let mut image = [0; 128];
+    let len = encode_image(Target::Policy(9), &[0xff; 65], &mut image);
+    let mut storage = EpfStorage::<1, 64>::new();
+    let epf = Epf::new(&mut storage);
+    assert_eq!(
+        epf.load(&image[..len]),
+        Err(hibana_epf::Error::ImageTooLarge {
+            requested: len,
+            capacity: 64,
+        })
+    );
+    let fallback = ResolverRef::<7>::decision_state(&(), |_| Ok(DecisionArm::Right));
+    let resolver = epf
+        .resolver::<7>(fallback)
+        .expect("failed load consumed the only slot");
+    assert_eq!(resolver.decide().unwrap(), DecisionArm::Right);
+}
+
+#[test]
+fn unloading_an_absent_policy_does_not_reserve_a_configuration_slot() {
+    let mut storage = EpfStorage::<1, 64>::new();
+    let epf = Epf::new(&mut storage);
+    assert_eq!(
+        epf.unload(Target::Policy(9)),
+        Err(hibana_epf::Error::NoImage {
+            target: Target::Policy(9)
+        })
+    );
+    let fallback = ResolverRef::<7>::decision_state(&(), |_| Ok(DecisionArm::Right));
+    let resolver = epf
+        .resolver::<7>(fallback)
+        .expect("failed unload consumed the only slot");
+    assert_eq!(resolver.decide().unwrap(), DecisionArm::Right);
+}
+
+#[test]
+fn reverting_an_absent_policy_does_not_reserve_a_configuration_slot() {
+    let mut storage = EpfStorage::<1, 64>::new();
+    let epf = Epf::new(&mut storage);
+    assert_eq!(
+        epf.revert(Target::Policy(9)),
+        Err(hibana_epf::Error::NoPrevious {
+            target: Target::Policy(9)
+        })
+    );
+    let fallback = ResolverRef::<7>::decision_state(&(), |_| Ok(DecisionArm::Right));
+    let resolver = epf
+        .resolver::<7>(fallback)
+        .expect("failed revert consumed the only slot");
+    assert_eq!(resolver.decide().unwrap(), DecisionArm::Right);
 }

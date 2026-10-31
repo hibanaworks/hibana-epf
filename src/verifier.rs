@@ -110,7 +110,7 @@ impl Header {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VerifiedImage<'a> {
     pub(crate) header: Header,
-    _marker: core::marker::PhantomData<&'a [u8]>,
+    pub(crate) bytes: &'a [u8],
 }
 
 impl<'a> VerifiedImage<'a> {
@@ -133,10 +133,7 @@ impl<'a> VerifiedImage<'a> {
             });
         }
         verify_code(code)?;
-        Ok(Self {
-            header,
-            _marker: core::marker::PhantomData,
-        })
+        Ok(Self { header, bytes })
     }
 }
 

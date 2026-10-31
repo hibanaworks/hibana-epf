@@ -31,8 +31,6 @@ const RESOLVER_STORAGE_WORDS: usize =
 const EMPTY_POLICY_ID: u16 = u16::MAX;
 const DEFAULT_OBSERVE_FUEL: u16 = 16;
 
-/// Policy VM `Out.kind`: no branch is justified yet.
-pub const POLICY_OUT_DEFER: u32 = 0;
 /// Policy VM `Out.kind`: choose the arm encoded in `Out.arg0`.
 pub const POLICY_OUT_CHOOSE: u32 = 1;
 /// Policy VM `Out.kind`: reject the policy point fail-closed.
@@ -325,7 +323,7 @@ pub enum ImageSpec {
     },
     /// Policy VM that always chooses one binary arm.
     PolicyChoose { policy_id: u16, arm: u8 },
-    /// Policy VM that chooses one binary arm only when one typed input matches.
+    /// Choose an arm when one input matches; otherwise reject the decision.
     PolicyChooseOnInput {
         policy_id: u16,
         input: u8,
@@ -1032,7 +1030,7 @@ impl<'cfg, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize>
             evidence: EvidenceState::new(),
         }
     }
-    fn policy_slot_mut(
+    fn register_policy(
         &mut self,
         policy_id: u16,
     ) -> Result<&mut PolicySlot<'cfg, IMAGE_BYTES>, Error> {
@@ -1053,6 +1051,17 @@ impl<'cfg, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize>
             return Ok(&mut self.policies[idx]);
         }
         Err(Error::PolicySlotUnavailable { policy_id })
+    }
+
+    fn policy_slot_mut(
+        &mut self,
+        policy_id: u16,
+    ) -> Result<Option<&mut PolicySlot<'cfg, IMAGE_BYTES>>, Error> {
+        Target::decode(1, policy_id)?;
+        Ok(self
+            .policies
+            .iter_mut()
+            .find(|slot| slot.policy_id == policy_id))
     }
 }
 
@@ -1148,14 +1157,8 @@ impl<const IMAGE_BYTES: usize> ImageBank<IMAGE_BYTES> {
         }
     }
 
-    fn load(&mut self, image: &[u8], verified: verifier::VerifiedImage<'_>) -> Result<Load, Error> {
-        if image.len() > IMAGE_BYTES {
-            return Err(Error::ImageTooLarge {
-                requested: image.len(),
-                capacity: IMAGE_BYTES,
-            });
-        }
-
+    fn load(&mut self, verified: verifier::VerifiedImage<'_>) -> Load {
+        let image = verified.bytes;
         let inactive = if self.has_active {
             1usize.saturating_sub(self.active as usize)
         } else {
@@ -1174,12 +1177,12 @@ impl<const IMAGE_BYTES: usize> ImageBank<IMAGE_BYTES> {
         self.has_active = true;
         self.epoch = self.epoch.wrapping_add(1);
 
-        Ok(Load {
+        Load {
             target: verified.header.target,
             epoch: self.epoch,
             digest: verified.header.code_hash,
             code_len: verified.header.code_len,
-        })
+        }
     }
 
     fn unload(&mut self, target: Target) -> Result<(), Error> {
@@ -1254,11 +1257,17 @@ impl<'a, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> Epf<'a, POLICY_SLO
 
     pub fn load(&self, image: &[u8]) -> Result<Load, Error> {
         let verified = verifier::VerifiedImage::new(image)?;
-        self.with_inner(|inner| match verified.header.target {
-            Target::Observe => inner.observe.load(image, verified),
-            Target::Policy(policy_id) => {
-                inner.policy_slot_mut(policy_id)?.bank.load(image, verified)
-            }
+        if image.len() > IMAGE_BYTES {
+            return Err(Error::ImageTooLarge {
+                requested: image.len(),
+                capacity: IMAGE_BYTES,
+            });
+        }
+        self.with_inner(|inner| {
+            Ok(match verified.header.target {
+                Target::Observe => inner.observe.load(verified),
+                Target::Policy(policy_id) => inner.register_policy(policy_id)?.bank.load(verified),
+            })
         })
     }
 
@@ -1282,14 +1291,22 @@ impl<'a, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> Epf<'a, POLICY_SLO
     pub fn unload(&self, target: Target) -> Result<(), Error> {
         self.with_inner(|inner| match target {
             Target::Observe => inner.observe.unload(target),
-            Target::Policy(policy_id) => inner.policy_slot_mut(policy_id)?.bank.unload(target),
+            Target::Policy(policy_id) => inner
+                .policy_slot_mut(policy_id)?
+                .ok_or(Error::NoImage { target })?
+                .bank
+                .unload(target),
         })
     }
 
     pub fn revert(&self, target: Target) -> Result<(), Error> {
         self.with_inner(|inner| match target {
             Target::Observe => inner.observe.revert(target),
-            Target::Policy(policy_id) => inner.policy_slot_mut(policy_id)?.bank.revert(target),
+            Target::Policy(policy_id) => inner
+                .policy_slot_mut(policy_id)?
+                .ok_or(Error::NoPrevious { target })?
+                .bank
+                .revert(target),
         })
     }
 
@@ -1333,7 +1350,7 @@ impl<'a, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> Epf<'a, POLICY_SLO
         fallback: ResolverRef<'a, POLICY_ID>,
     ) -> Result<ResolverRef<'a, POLICY_ID>, Error> {
         self.with_inner(|inner| -> Result<(), Error> {
-            inner.policy_slot_mut(POLICY_ID)?.fallback = Some(StoredResolver::new(fallback));
+            inner.register_policy(POLICY_ID)?.fallback = Some(StoredResolver::new(fallback));
             Ok(())
         })?;
         Ok(ResolverRef::decision_state(
@@ -1383,7 +1400,6 @@ fn policy_resolution(out: Out) -> Result<DecisionArm, ResolverError> {
         return Err(ResolverError::reject());
     }
     match out.kind() {
-        POLICY_OUT_DEFER => Err(ResolverError::reject()),
         POLICY_OUT_CHOOSE => match out.arg0() {
             0 => Ok(DecisionArm::Left),
             1 => Ok(DecisionArm::Right),

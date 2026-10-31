@@ -173,3 +173,32 @@ fn stream_finishes_successfully_at_a_record_boundary() {
     assert_eq!(String::from_utf8_lossy(&result.stdout).lines().count(), 1);
     assert!(result.stderr.is_empty());
 }
+
+#[test]
+fn an_observer_rejects_a_policy_image_instead_of_silently_running_its_default() {
+    let path = std::env::temp_dir().join(format!(
+        "epf-policy-observer-{}-{}.hbt",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let record = [0, 0, 0, 7, 0x02, 0x06, 0xa5, 0, 0, 0, 0, 42, 1, 2, 1, 0];
+    File::create_new(&path).unwrap().write_all(&record).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_hibana-epf"))
+        .args(["diagnose", "policy-choose", "7", "0"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    fs::remove_file(path).unwrap();
+    assert!(
+        !result.status.success(),
+        "a policy image did not configure observation"
+    );
+    assert!(
+        result.stdout.is_empty(),
+        "the supplied image was silently ignored"
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("requires an observation image"));
+}

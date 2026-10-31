@@ -14,7 +14,6 @@ use hibana_epf::{
     CompactOutRecord, Epf, EpfStorage, ImageIngress, ImageSpec, Target, compute_hash,
 };
 
-const POLICY_SLOTS: usize = 4;
 const IMAGE_BYTES: usize = 4096;
 
 fn main() {
@@ -110,17 +109,20 @@ fn run_tap_input(path: &str, options: &ReplayOptions) -> Result<(), String> {
 }
 
 fn run_replay(mut input: impl Read, options: &ReplayOptions) -> Result<(), String> {
-    let mut storage = EpfStorage::<POLICY_SLOTS, IMAGE_BYTES>::new();
+    let mut storage = EpfStorage::<0, IMAGE_BYTES>::new();
     let epf = Epf::new(&mut storage);
-    if let Some(spec) = options.recipe {
-        let image = build_image(spec)?;
-        epf.load(&image)
-            .map_err(|error| format!("load recipe image: {error:?}"))?;
-    }
-    if let Some(path) = options.image_path.as_ref() {
-        let image = read_file_or_stdin(path)?;
-        epf.load(&image)
-            .map_err(|error| format!("load {path}: {error:?}"))?;
+    let image = match (options.recipe, options.image_path.as_deref()) {
+        (Some(spec), None) => Some(build_image(spec)?),
+        (None, Some(path)) => Some(read_file_or_stdin(path)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => return Err("--image and --recipe are mutually exclusive".into()),
+    };
+    if let Some(image) = image {
+        epf.load(&image).map_err(|error| match error {
+            hibana_epf::Error::PolicySlotUnavailable { .. } =>
+                "this command requires an observation image; install policy images with the application's resolver".to_string(),
+            error => format!("load observation image: {error:?}"),
+        })?;
     }
     let mut output = options
         .out_path
