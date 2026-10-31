@@ -10,7 +10,7 @@ Read the runtime's tap and pass each event to EPF:
 
 ```rust
 let mut tap = rendezvous.tap();
-let mut storage = hibana_epf::EpfStorage::<0, 0, 0, 0>::new();
+let mut storage = hibana_epf::EpfStorage::<0, 0>::new();
 let epf = hibana_epf::Epf::new(&mut storage);
 
 for event in tap.by_ref() {

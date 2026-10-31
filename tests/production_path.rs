@@ -76,7 +76,7 @@ fn production_epf_runs_loaded_observe_bytecode_from_tap_event() {
     ];
     let mut image = [0u8; 64];
     let len = encode_image(Target::Observe, &code, &mut image);
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
 
     let loaded = epf.load(&image[..len]).expect("observe image loads");
@@ -94,7 +94,7 @@ fn production_epf_runs_loaded_observe_bytecode_from_tap_event() {
 
 #[test]
 fn an_image_for_a_different_evidence_layout_cannot_replace_the_current_image() {
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let mut image = [0; 64];
     let len = ImageSpec::ObserveEcho.write(&mut image).unwrap();
@@ -109,7 +109,7 @@ fn an_image_for_a_different_evidence_layout_cannot_replace_the_current_image() {
 
 #[test]
 fn production_default_observe_vm_is_available_without_loaded_image() {
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
 
     let out = epf.run(mismatch_event());
@@ -132,7 +132,7 @@ fn production_image_ingress_loads_generic_envelope_without_uart_code() {
     let mut image = [0u8; 64];
     let len = encode_image(Target::Observe, &code, &mut image);
     let mut ingress = ImageIngress::<64>::new();
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
 
     feed_envelope(&mut ingress, &image[..len]);
@@ -160,7 +160,7 @@ fn production_tap_spool_replays_retained_events_after_image_load() {
     ];
     let mut image = [0u8; 64];
     let len = encode_image(Target::Observe, &code, &mut image);
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let mut spool = TapSpool::<2>::new();
 
@@ -209,7 +209,7 @@ fn production_image_spec_observe_echo_builds_loadable_image() {
     let len = ImageSpec::ObserveEcho
         .write(&mut image)
         .expect("build observe image");
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
 
     let load = epf.load(&image[..len]).expect("load observe image");
@@ -227,7 +227,7 @@ fn production_image_spec_observe_session_mismatch_is_named_debug_recipe() {
     let len = ImageSpec::ObserveSessionMismatch
         .write(&mut image)
         .expect("build session mismatch image");
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
 
     epf.load(&image[..len]).expect("load observe image");
@@ -251,7 +251,7 @@ fn production_image_spec_policy_choose_on_input_is_loadable_resolver_policy() {
     }
     .write(&mut image)
     .expect("build policy image");
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let resolver = epf
         .resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left()))
@@ -269,13 +269,13 @@ fn fallback_left() -> Result<DecisionArm, ResolverError> {
 
 #[test]
 fn resolver_configuration_reports_missing_capacity_and_reserved_ids() {
-    let mut empty_storage = EpfStorage::<0, 64, 0, 4>::new();
+    let mut empty_storage = EpfStorage::<0, 64>::new();
     let empty = Epf::new(&mut empty_storage);
     assert!(matches!(
         empty.resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left())),
         Err(hibana_epf::Error::PolicySlotUnavailable { policy_id: 7 })
     ));
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     assert!(
         epf.resolver::<{ u16::MAX }>(ResolverRef::decision_state(&(), |_| fallback_left()))
@@ -289,7 +289,7 @@ fn resolver_configuration_reports_missing_capacity_and_reserved_ids() {
 
 #[test]
 fn a_resolver_callback_can_observe_the_appliance_after_its_storage_borrow_ends() {
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let fallback = ResolverRef::<7>::decision_state(&epf, |epf| {
         let observed = epf.run(mismatch_event());
@@ -303,7 +303,7 @@ fn a_resolver_callback_can_observe_the_appliance_after_its_storage_borrow_ends()
 
 #[test]
 fn production_policy_resolver_uses_fallback_until_policy_image_is_loaded() {
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let resolver = epf
         .resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left()))
@@ -323,7 +323,7 @@ fn production_policy_resolver_runs_loaded_policy_vm_and_ignores_fallback() {
     ];
     let mut image = [0u8; 64];
     let len = encode_image(Target::Policy(7), &code, &mut image);
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let resolver = epf
         .resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left()))
@@ -345,7 +345,7 @@ fn production_policy_resolver_unload_restores_fallback() {
     ];
     let mut image = [0u8; 64];
     let len = encode_image(Target::Policy(7), &code, &mut image);
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let resolver = epf
         .resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left()))
@@ -365,7 +365,7 @@ fn production_policy_vm_trap_fails_closed_without_silent_fallback() {
     ];
     let mut image = [0u8; 64];
     let len = encode_image_with_fuel(Target::Policy(7), &code, 1, &mut image);
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let resolver = epf
         .resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left()))
@@ -381,7 +381,7 @@ fn production_policy_image_rejects_static_policy_sentinel() {
     let code = [0xff];
     let mut image = [0u8; 64];
     let len = encode_image(Target::Policy(u16::MAX), &code, &mut image);
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
 
     assert!(epf.load(&image[..len]).is_err());
@@ -398,7 +398,7 @@ fn production_policy_invalid_arm_output_fails_closed() {
     ];
     let mut image = [0u8; 64];
     let len = encode_image(Target::Policy(7), &code, &mut image);
-    let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+    let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let resolver = epf
         .resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left()))
@@ -407,4 +407,22 @@ fn production_policy_invalid_arm_output_fails_closed() {
     epf.load(&image[..len]).expect("policy image loads");
 
     assert!(resolver.decide().is_err());
+}
+
+#[test]
+fn unsupported_image_memory_is_rejected_without_replacing_the_active_filter() {
+    let mut storage = EpfStorage::<0, 64>::new();
+    let epf = Epf::new(&mut storage);
+    let mut image = [0; 64];
+    let len = ImageSpec::ObserveSessionMismatch.write(&mut image).unwrap();
+    epf.load(&image[..len]).unwrap();
+    let before = epf.run(mismatch_event());
+    image[14] = 1;
+    assert!(matches!(
+        epf.load(&image[..len]),
+        Err(hibana_epf::Error::Verify(
+            hibana_epf::VerifyError::UnsupportedMemory { bytes: 1 }
+        ))
+    ));
+    assert_eq!(epf.run(mismatch_event()), before);
 }

@@ -71,7 +71,7 @@ fn live_endpoint_choices_and_roll_commits_reach_epf_without_losing_observation_f
     .unwrap();
     let mut endpoint = kit.enter(SessionId::new(42), &program).unwrap();
     let mut events = kit.tap();
-    let mut storage = EpfStorage::<0, 64, 0, 8>::new();
+    let mut storage = EpfStorage::<0, 64>::new();
     let epf = Epf::new(&mut storage);
     let mut observed = Vec::new();
     let mut cx = Context::from_waker(Waker::noop());

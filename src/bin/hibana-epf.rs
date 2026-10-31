@@ -16,8 +16,6 @@ use hibana_epf::{
 
 const POLICY_SLOTS: usize = 4;
 const IMAGE_BYTES: usize = 4096;
-const SCRATCH_BYTES: usize = 1024;
-const HISTORY: usize = 64;
 
 fn main() {
     if let Err(error) = run() {
@@ -112,7 +110,7 @@ fn run_tap_input(path: &str, options: &ReplayOptions) -> Result<(), String> {
 }
 
 fn run_replay(mut input: impl Read, options: &ReplayOptions) -> Result<(), String> {
-    let mut storage = EpfStorage::<POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>::new();
+    let mut storage = EpfStorage::<POLICY_SLOTS, IMAGE_BYTES>::new();
     let epf = Epf::new(&mut storage);
     if let Some(spec) = options.recipe {
         let image = build_image(spec)?;

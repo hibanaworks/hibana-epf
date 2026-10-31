@@ -7,7 +7,6 @@ pub(crate) const REG_COUNT: usize = 8;
 pub enum Trap {
     FuelExhausted,
     IllegalOpcode(u8),
-    OutOfBounds,
     VerifyFailed,
 }
 

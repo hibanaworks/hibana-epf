@@ -250,7 +250,6 @@ const fn trap_code(trap: Trap) -> u32 {
     match trap {
         Trap::FuelExhausted => 1,
         Trap::IllegalOpcode(opcode) => 0x100 | opcode as u32,
-        Trap::OutOfBounds => 2,
         Trap::VerifyFailed => 3,
     }
 }
@@ -291,7 +290,6 @@ impl Load {
 pub enum Error {
     Verify(VerifyError),
     ImageTooLarge { requested: usize, capacity: usize },
-    ScratchTooLarge { requested: usize, capacity: usize },
     PolicySlotUnavailable { policy_id: u16 },
     NoImage { target: Target },
     NoPrevious { target: Target },
@@ -302,74 +300,6 @@ impl From<VerifyError> for Error {
     fn from(error: VerifyError) -> Self {
         Self::Verify(error)
     }
-}
-
-/// Compact replay / verification log engine marker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Engine {
-    Epf,
-    Fallback,
-}
-
-/// Image lifecycle rejection reason recorded by replay runners.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoadRejectReason {
-    Verify(VerifyError),
-    ImageTooLarge,
-    ScratchTooLarge,
-    PolicySlotUnavailable,
-    NoImage,
-    NoPrevious,
-}
-
-impl From<Error> for LoadRejectReason {
-    #[inline]
-    fn from(error: Error) -> Self {
-        match error {
-            Error::Verify(error) => Self::Verify(error),
-            Error::ImageTooLarge { .. } => Self::ImageTooLarge,
-            Error::ScratchTooLarge { .. } => Self::ScratchTooLarge,
-            Error::PolicySlotUnavailable { .. } => Self::PolicySlotUnavailable,
-            Error::NoImage { .. } => Self::NoImage,
-            Error::NoPrevious { .. } => Self::NoPrevious,
-        }
-    }
-}
-
-/// Replay runner input and verification log.
-///
-/// These records are never VM input. A runner applies image lifecycle records
-/// to an `Epf`, feeds `Tap` records through `Epf::run`, and verifies `Run`
-/// summaries against observed output/fuel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReplayRecord {
-    Tap(TapEvent),
-    ImageLoaded {
-        target: Target,
-        epoch: u32,
-        digest: u32,
-    },
-    ImageReverted {
-        target: Target,
-        epoch: u32,
-        digest: u32,
-    },
-    ImageUnloaded {
-        target: Target,
-        epoch: u32,
-    },
-    ImageRejected {
-        target: Target,
-        reason: LoadRejectReason,
-    },
-    Run {
-        target: Target,
-        observe_epoch: u32,
-        policy_epoch: Option<u32>,
-        engine: Engine,
-        out_digest: u32,
-        fuel_used: u16,
-    },
 }
 
 /// Ready-made EPF image recipes for the common Pico-class debug path.
@@ -1062,24 +992,13 @@ const fn hash_byte(hash: u32, byte: u8) -> u32 {
 }
 
 /// Fixed storage owned by the caller. Pico class is the standard capacity model.
-pub struct EpfStorage<
-    'cfg,
-    const POLICY_SLOTS: usize,
-    const IMAGE_BYTES: usize,
-    const SCRATCH_BYTES: usize,
-    const HISTORY: usize,
-> {
-    inner: UnsafeCell<StorageInner<'cfg, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>>,
+pub struct EpfStorage<'cfg, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> {
+    inner: UnsafeCell<StorageInner<'cfg, POLICY_SLOTS, IMAGE_BYTES>>,
     _not_sync: PhantomData<*mut ()>,
 }
 
-impl<
-    'cfg,
-    const POLICY_SLOTS: usize,
-    const IMAGE_BYTES: usize,
-    const SCRATCH_BYTES: usize,
-    const HISTORY: usize,
-> EpfStorage<'cfg, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>
+impl<'cfg, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize>
+    EpfStorage<'cfg, POLICY_SLOTS, IMAGE_BYTES>
 {
     pub const fn new() -> Self {
         Self {
@@ -1089,38 +1008,22 @@ impl<
     }
 }
 
-impl<
-    'cfg,
-    const POLICY_SLOTS: usize,
-    const IMAGE_BYTES: usize,
-    const SCRATCH_BYTES: usize,
-    const HISTORY: usize,
-> Default for EpfStorage<'cfg, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>
+impl<'cfg, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> Default
+    for EpfStorage<'cfg, POLICY_SLOTS, IMAGE_BYTES>
 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-struct StorageInner<
-    'cfg,
-    const POLICY_SLOTS: usize,
-    const IMAGE_BYTES: usize,
-    const SCRATCH_BYTES: usize,
-    const HISTORY: usize,
-> {
-    observe: ImageBank<IMAGE_BYTES, SCRATCH_BYTES>,
-    policies: [PolicySlot<'cfg, IMAGE_BYTES, SCRATCH_BYTES>; POLICY_SLOTS],
-    evidence: EvidenceState<HISTORY>,
+struct StorageInner<'cfg, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> {
+    observe: ImageBank<IMAGE_BYTES>,
+    policies: [PolicySlot<'cfg, IMAGE_BYTES>; POLICY_SLOTS],
+    evidence: EvidenceState,
 }
 
-impl<
-    'cfg,
-    const POLICY_SLOTS: usize,
-    const IMAGE_BYTES: usize,
-    const SCRATCH_BYTES: usize,
-    const HISTORY: usize,
-> StorageInner<'cfg, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>
+impl<'cfg, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize>
+    StorageInner<'cfg, POLICY_SLOTS, IMAGE_BYTES>
 {
     const fn new() -> Self {
         Self {
@@ -1132,7 +1035,7 @@ impl<
     fn policy_slot_mut(
         &mut self,
         policy_id: u16,
-    ) -> Result<&mut PolicySlot<'cfg, IMAGE_BYTES, SCRATCH_BYTES>, Error> {
+    ) -> Result<&mut PolicySlot<'cfg, IMAGE_BYTES>, Error> {
         Target::decode(1, policy_id)?;
         let mut empty = None;
         let mut idx = 0usize;
@@ -1153,15 +1056,13 @@ impl<
     }
 }
 
-struct PolicySlot<'cfg, const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> {
+struct PolicySlot<'cfg, const IMAGE_BYTES: usize> {
     policy_id: u16,
-    bank: ImageBank<IMAGE_BYTES, SCRATCH_BYTES>,
+    bank: ImageBank<IMAGE_BYTES>,
     fallback: Option<StoredResolver<'cfg>>,
 }
 
-impl<'cfg, const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize>
-    PolicySlot<'cfg, IMAGE_BYTES, SCRATCH_BYTES>
-{
+impl<'cfg, const IMAGE_BYTES: usize> PolicySlot<'cfg, IMAGE_BYTES> {
     const fn new() -> Self {
         Self {
             policy_id: EMPTY_POLICY_ID,
@@ -1222,13 +1123,10 @@ impl<'cfg> StoredResolver<'cfg> {
     }
 }
 
-struct ImageBank<const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> {
+struct ImageBank<const IMAGE_BYTES: usize> {
     image: [[u8; IMAGE_BYTES]; 2],
-    scratch: [[u8; SCRATCH_BYTES]; 2],
     len: [usize; 2],
-    mem_len: [usize; 2],
     fuel_max: [u16; 2],
-    digest: [u32; 2],
     active: u8,
     previous: u8,
     has_active: bool,
@@ -1236,15 +1134,12 @@ struct ImageBank<const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> {
     epoch: u32,
 }
 
-impl<const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> ImageBank<IMAGE_BYTES, SCRATCH_BYTES> {
+impl<const IMAGE_BYTES: usize> ImageBank<IMAGE_BYTES> {
     const fn new() -> Self {
         Self {
             image: [[0; IMAGE_BYTES]; 2],
-            scratch: [[0; SCRATCH_BYTES]; 2],
             len: [0; 2],
-            mem_len: [0; 2],
             fuel_max: [0; 2],
-            digest: [0; 2],
             active: 0,
             previous: 1,
             has_active: false,
@@ -1260,12 +1155,6 @@ impl<const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> ImageBank<IMAGE_BYTES
                 capacity: IMAGE_BYTES,
             });
         }
-        if verified.header.mem_len as usize > SCRATCH_BYTES {
-            return Err(Error::ScratchTooLarge {
-                requested: verified.header.mem_len as usize,
-                capacity: SCRATCH_BYTES,
-            });
-        }
 
         let inactive = if self.has_active {
             1usize.saturating_sub(self.active as usize)
@@ -1274,11 +1163,8 @@ impl<const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> ImageBank<IMAGE_BYTES
         };
         self.image[inactive][..image.len()].copy_from_slice(image);
         zero(&mut self.image[inactive][image.len()..]);
-        zero(&mut self.scratch[inactive]);
         self.len[inactive] = image.len();
-        self.mem_len[inactive] = verified.header.mem_len as usize;
         self.fuel_max[inactive] = verified.header.fuel_max;
-        self.digest[inactive] = verified.header.code_hash;
 
         if self.has_active {
             self.previous = self.active;
@@ -1327,24 +1213,20 @@ impl<const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> ImageBank<IMAGE_BYTES
 }
 
 #[derive(Clone, Copy)]
-struct EvidenceState<const HISTORY: usize> {
+struct EvidenceState {
     latest: [u32; 4],
     latest_kind: u16,
     latest_reason: u8,
     observe_epoch: u32,
-    history: [[u32; 4]; HISTORY],
-    cursor: usize,
 }
 
-impl<const HISTORY: usize> EvidenceState<HISTORY> {
+impl EvidenceState {
     const fn new() -> Self {
         Self {
             latest: [0; 4],
             latest_kind: 0,
             latest_reason: 0,
             observe_epoch: 0,
-            history: [[0; 4]; HISTORY],
-            cursor: 0,
         }
     }
 
@@ -1353,60 +1235,20 @@ impl<const HISTORY: usize> EvidenceState<HISTORY> {
         self.latest = input;
         self.latest_kind = evidence.kind();
         self.latest_reason = evidence.reason();
-        if HISTORY != 0 {
-            self.history[self.cursor % HISTORY] = input;
-            self.cursor = self.cursor.wrapping_add(1);
-        }
         self.observe_epoch = self.observe_epoch.wrapping_add(1);
     }
 }
 
 /// The single EPF runtime appliance.
-pub struct Epf<
-    'a,
-    const POLICY_SLOTS: usize,
-    const IMAGE_BYTES: usize,
-    const SCRATCH_BYTES: usize,
-    const HISTORY: usize,
-> {
-    inner: *mut UnsafeCell<StorageInner<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>>,
-    _not_send_sync: PhantomData<*mut ()>,
-    _borrow: PhantomData<&'a mut ()>,
+pub struct Epf<'a, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> {
+    inner: &'a UnsafeCell<StorageInner<'a, POLICY_SLOTS, IMAGE_BYTES>>,
 }
 
-impl<
-    'a,
-    const POLICY_SLOTS: usize,
-    const IMAGE_BYTES: usize,
-    const SCRATCH_BYTES: usize,
-    const HISTORY: usize,
-> Epf<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>
-{
+impl<'a, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> Epf<'a, POLICY_SLOTS, IMAGE_BYTES> {
     #[inline]
-    pub fn new(
-        storage: &'a mut EpfStorage<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>,
-    ) -> Self {
+    pub fn new(storage: &'a mut EpfStorage<'a, POLICY_SLOTS, IMAGE_BYTES>) -> Self {
         Self {
-            inner: core::ptr::addr_of_mut!(storage.inner),
-            _not_send_sync: PhantomData,
-            _borrow: PhantomData,
-        }
-    }
-
-    /// Construct an appliance view from raw storage.
-    ///
-    /// # Safety
-    ///
-    /// `storage` must point to live `EpfStorage` and no other `Epf` view may
-    /// call `load`, `unload`, `revert`, or `run` concurrently.
-    #[inline]
-    pub unsafe fn from_raw_storage(
-        storage: *mut EpfStorage<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>,
-    ) -> Self {
-        Self {
-            inner: unsafe { core::ptr::addr_of_mut!((*storage).inner) },
-            _not_send_sync: PhantomData,
-            _borrow: PhantomData,
+            inner: &storage.inner,
         }
     }
 
@@ -1527,14 +1369,12 @@ impl<
 
     fn with_inner<T>(
         &self,
-        apply: impl FnOnce(
-            &mut StorageInner<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>,
-        ) -> T,
+        apply: impl FnOnce(&mut StorageInner<'a, POLICY_SLOTS, IMAGE_BYTES>) -> T,
     ) -> T {
         // SAFETY: Epf uniquely borrows its storage and is neither Send nor Sync.
         // Every caller is private, exposes no storage borrow and invokes no user
         // callback while this borrow lives. Resolver callbacks run afterwards.
-        apply(unsafe { &mut *(*self.inner).get() })
+        apply(unsafe { &mut *self.inner.get() })
     }
 }
 
@@ -1599,7 +1439,7 @@ mod tests {
 
     #[test]
     fn default_observe_vm_reports_tap_event() {
-        let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+        let mut storage = EpfStorage::<1, 64>::new();
         let epf = Epf::new(&mut storage);
 
         let out = epf.run(mismatch_event());
@@ -1653,7 +1493,7 @@ mod tests {
         ];
         let mut bytes = [0u8; 64];
         let len = image(Target::Observe, &code, &mut bytes);
-        let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+        let mut storage = EpfStorage::<1, 64>::new();
         let epf = Epf::new(&mut storage);
 
         let load = epf.load(&bytes[..len]).expect("load");
@@ -1687,7 +1527,7 @@ mod tests {
         ];
         let mut bytes = [0u8; 64];
         let len = image(Target::Observe, &code, &mut bytes);
-        let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+        let mut storage = EpfStorage::<1, 64>::new();
         let epf = Epf::new(&mut storage);
 
         epf.load(&bytes[..len]).expect("load");

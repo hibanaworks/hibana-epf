@@ -94,6 +94,11 @@ impl Header {
                 found: self.schema_hash,
             });
         }
+        if self.mem_len != 0 {
+            return Err(VerifyError::UnsupportedMemory {
+                bytes: self.mem_len,
+            });
+        }
         if self.fuel_max == 0 {
             return Err(VerifyError::ZeroFuel);
         }
@@ -127,7 +132,7 @@ impl<'a> VerifiedImage<'a> {
                 computed,
             });
         }
-        verify_code(code, header.target)?;
+        verify_code(code)?;
         Ok(Self {
             header,
             _marker: core::marker::PhantomData,
@@ -151,10 +156,10 @@ pub enum VerifyError {
     TruncatedInstruction { pc: usize },
     InvalidRegister { pc: usize, register: u8 },
     InvalidInputIndex { pc: usize, index: u8 },
-    DecisionOutputForbidden { pc: usize },
+    UnsupportedMemory { bytes: u16 },
 }
 
-fn verify_code(code: &[u8], target: Target) -> Result<(), VerifyError> {
+fn verify_code(code: &[u8]) -> Result<(), VerifyError> {
     let mut pc = 0usize;
     while pc < code.len() {
         let op_pc = pc;
@@ -208,10 +213,6 @@ fn verify_code(code: &[u8], target: Target) -> Result<(), VerifyError> {
                 require_register(op_pc, arg0)?;
                 require_register(op_pc, arg1)?;
                 require_register(op_pc, arg2)?;
-                if matches!(target, Target::Observe) {
-                    // Observe output is a report, not a policy decision. `kind` 1/2
-                    // are allowed here because they are report kinds, not route arms.
-                }
             }
             ops::HALT => {}
             other => {
