@@ -1,482 +1,1699 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
-pub mod control_kinds;
-pub mod host;
-pub mod loader;
-pub mod ops;
-mod slot_contract;
-pub mod verifier;
-pub mod vm;
+mod ops;
+mod verifier;
+mod vm;
 
-use crate::control_kinds::{
-    PolicyActivateKind, PolicyAnnotateKind, PolicyLoadKind, PolicyRevertKind,
+use core::{
+    cell::UnsafeCell,
+    marker::PhantomData,
+    mem::{MaybeUninit, align_of, size_of},
+    ptr,
 };
-use hibana::substrate::{
-    cap::{ControlResourceKind, GenericCapToken},
-    ids::{Lane, RendezvousId, SessionId},
-    policy::signals::{ContextId, ContextValue, PolicyAttrs, core as policy_core},
-    program::{RoleProgram, project},
-    tap::TapEvent,
+
+use hibana::runtime::{
+    resolver::{DecisionArm, ResolverError, ResolverRef},
+    tap::{
+        Evidence, TRANSPORT_FAULT, TRANSPORT_FAULT_CAPACITY, TRANSPORT_FAULT_DEADLINE,
+        TRANSPORT_MISMATCH, TRANSPORT_MISMATCH_SESSION, TapEvent,
+    },
 };
-pub use host::{HostSlots, ScratchLease};
-pub use verifier::Header;
-use vm::Slot;
-pub use vm::{Trap, VmCtx};
 
-pub const ROLE_CONTROLLER: u8 = 0;
+pub use verifier::{Header, VerifyError, compute_hash};
+pub use vm::Trap;
 
-/// ```compile_fail
-/// use hibana::g;
-/// use hibana_epf::control_kinds::PolicyLoadKind;
-///
-/// let _ = g::send::<
-///     g::Role<0>,
-///     g::Role<1>,
-///     g::Msg<{ <PolicyLoadKind as hibana::substrate::cap::ControlResourceKind>::LABEL }, u32>,
-///     0,
-/// >();
-/// ```
-///
-/// EPF lifecycle controls must use `GenericCapToken<K>` and the control kind as the
-/// third message parameter. The old raw label/payload path is forbidden.
-type PolicyLoadControlMsg = hibana::g::Msg<
-    { <PolicyLoadKind as ControlResourceKind>::LABEL },
-    GenericCapToken<PolicyLoadKind>,
-    PolicyLoadKind,
->;
-type PolicyActivateControlMsg = hibana::g::Msg<
-    { <PolicyActivateKind as ControlResourceKind>::LABEL },
-    GenericCapToken<PolicyActivateKind>,
-    PolicyActivateKind,
->;
-type PolicyRevertControlMsg = hibana::g::Msg<
-    { <PolicyRevertKind as ControlResourceKind>::LABEL },
-    GenericCapToken<PolicyRevertKind>,
-    PolicyRevertKind,
->;
-type PolicyAnnotateControlMsg = hibana::g::Msg<
-    { <PolicyAnnotateKind as ControlResourceKind>::LABEL },
-    GenericCapToken<PolicyAnnotateKind>,
-    PolicyAnnotateKind,
->;
+/// Stable hash of the Hibana Evidence ABI consumed by EPF images.
+pub const EVIDENCE_SCHEMA_HASH: u32 = 0x4845_0002;
 
-pub fn attach_controller<'r, 'cfg, T, U, C, const MAX_RV: usize>(
-    kit: &'r hibana::substrate::SessionKit<'cfg, T, U, C, MAX_RV>,
-    rv: RendezvousId,
-    sid: SessionId,
-) -> Result<hibana::Endpoint<'r, ROLE_CONTROLLER>, hibana::substrate::AttachError>
-where
-    T: hibana::substrate::Transport + 'cfg,
-    U: hibana::substrate::runtime::LabelUniverse + 'cfg,
-    C: hibana::substrate::runtime::Clock + 'cfg,
-    'cfg: 'r,
-{
-    let load = hibana::g::send::<
-        hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CONTROLLER>,
-        PolicyLoadControlMsg,
-        0,
-    >();
-    let activate = hibana::g::send::<
-        hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CONTROLLER>,
-        PolicyActivateControlMsg,
-        0,
-    >();
-    let revert = hibana::g::send::<
-        hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CONTROLLER>,
-        PolicyRevertControlMsg,
-        0,
-    >();
-    let annotate = hibana::g::send::<
-        hibana::g::Role<ROLE_CONTROLLER>,
-        hibana::g::Role<ROLE_CONTROLLER>,
-        PolicyAnnotateControlMsg,
-        0,
-    >();
-    let program = hibana::g::seq(
-        load,
-        hibana::g::seq(activate, hibana::g::seq(revert, annotate)),
-    );
-    let projected: RoleProgram<ROLE_CONTROLLER> = project(&program);
+const RESOLVER_STORAGE_WORDS: usize =
+    size_of::<ResolverRef<'static, 0>>().div_ceil(size_of::<usize>());
 
-    kit.enter(rv, sid, &projected, hibana::substrate::binding::NoBinding)
+const EMPTY_POLICY_ID: u16 = u16::MAX;
+const DEFAULT_OBSERVE_FUEL: u16 = 16;
+
+/// Policy VM `Out.kind`: no branch is justified yet.
+pub const POLICY_OUT_DEFER: u32 = 0;
+/// Policy VM `Out.kind`: choose the arm encoded in `Out.arg0`.
+pub const POLICY_OUT_CHOOSE: u32 = 1;
+/// Policy VM `Out.kind`: reject the policy point fail-closed.
+pub const POLICY_OUT_REJECT: u32 = 2;
+
+/// Canonical EPF VM input derived from Hibana evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvidenceInput {
+    kind: u16,
+    reason: u8,
+    words: [u32; 4],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ScopeTrace {
-    pub range: u16,
-    pub nest: u16,
-}
+impl EvidenceInput {
+    #[inline]
+    pub const fn new(kind: u16, reason: u8, words: [u32; 4]) -> Self {
+        Self {
+            kind,
+            reason,
+            words,
+        }
+    }
 
-#[cfg(test)]
-impl ScopeTrace {
-    const fn pack(self) -> u32 {
-        0x8000_0000 | ((self.range as u32) << 16) | self.nest as u32
+    #[inline]
+    pub const fn from_evidence(evidence: Evidence) -> Self {
+        Self::new(evidence.kind(), evidence.reason(), evidence.input())
+    }
+
+    #[inline]
+    pub const fn from_tap_event(event: TapEvent) -> Self {
+        Self::from_evidence(event.evidence())
+    }
+
+    #[inline]
+    pub const fn kind(self) -> u16 {
+        self.kind
+    }
+
+    #[inline]
+    pub const fn reason(self) -> u8 {
+        self.reason
+    }
+
+    #[inline]
+    pub const fn words(self) -> [u32; 4] {
+        self.words
     }
 }
 
-fn tap_scope(event: &TapEvent) -> Option<ScopeTrace> {
-    if (event.arg2 & 0x8000_0000) == 0 {
-        None
+const DEFAULT_OBSERVE_CODE: [u8; 19] = [
+    ops::LOAD_KIND,
+    0,
+    ops::LOAD_REASON,
+    1,
+    ops::LOAD_INPUT,
+    2,
+    0,
+    ops::LOAD_INPUT,
+    3,
+    1,
+    ops::LOAD_INPUT,
+    4,
+    3,
+    ops::EMIT,
+    0,
+    1,
+    2,
+    3,
+    4,
+];
+
+/// Image address inside the single Pico-class EPF appliance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Observe,
+    Policy(u16),
+}
+
+impl Target {
+    #[inline]
+    pub const fn encode(self) -> (u8, u16) {
+        match self {
+            Self::Observe => (0, 0),
+            Self::Policy(policy_id) => (1, policy_id),
+        }
+    }
+
+    #[inline]
+    pub const fn decode(kind: u8, policy_id: u16) -> Result<Self, VerifyError> {
+        match kind {
+            0 if policy_id == 0 => Ok(Self::Observe),
+            1 if policy_id != EMPTY_POLICY_ID => Ok(Self::Policy(policy_id)),
+            _ => Err(VerifyError::UnsupportedTarget { kind, policy_id }),
+        }
+    }
+}
+
+/// Compact device-side VM output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Out {
+    target: Target,
+    epoch: u32,
+    kind: u32,
+    reason: u32,
+    arg0: u32,
+    arg1: u32,
+    arg2: u32,
+    fuel_used: u16,
+    trap: Option<Trap>,
+}
+
+impl Out {
+    #[inline]
+    pub const fn quiet(target: Target, epoch: u32, fuel_used: u16) -> Self {
+        Self {
+            target,
+            epoch,
+            kind: 0,
+            reason: 0,
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            fuel_used,
+            trap: None,
+        }
+    }
+
+    #[inline]
+    pub const fn emit(
+        context: (Target, u32),
+        [kind, reason, arg0, arg1, arg2]: [u32; 5],
+        fuel_used: u16,
+    ) -> Self {
+        let (target, epoch) = context;
+        Self {
+            target,
+            epoch,
+            kind,
+            reason,
+            arg0,
+            arg1,
+            arg2,
+            fuel_used,
+            trap: None,
+        }
+    }
+
+    #[inline]
+    pub const fn trap(target: Target, epoch: u32, trap: Trap, fuel_used: u16) -> Self {
+        Self {
+            target,
+            epoch,
+            kind: 0xffff,
+            reason: trap_code(trap),
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            fuel_used,
+            trap: Some(trap),
+        }
+    }
+
+    #[inline]
+    pub const fn target(self) -> Target {
+        self.target
+    }
+
+    #[inline]
+    pub const fn epoch(self) -> u32 {
+        self.epoch
+    }
+
+    #[inline]
+    pub const fn kind(self) -> u32 {
+        self.kind
+    }
+
+    #[inline]
+    pub const fn reason(self) -> u32 {
+        self.reason
+    }
+
+    #[inline]
+    pub const fn arg0(self) -> u32 {
+        self.arg0
+    }
+
+    #[inline]
+    pub const fn arg1(self) -> u32 {
+        self.arg1
+    }
+
+    #[inline]
+    pub const fn arg2(self) -> u32 {
+        self.arg2
+    }
+
+    #[inline]
+    pub const fn fuel_used(self) -> u16 {
+        self.fuel_used
+    }
+
+    #[inline]
+    pub const fn trap_reason(self) -> Option<Trap> {
+        self.trap
+    }
+
+    #[inline]
+    pub const fn emitted(self) -> bool {
+        self.kind != 0 || self.trap.is_some()
+    }
+}
+
+const fn trap_code(trap: Trap) -> u32 {
+    match trap {
+        Trap::FuelExhausted => 1,
+        Trap::IllegalOpcode(opcode) => 0x100 | opcode as u32,
+        Trap::OutOfBounds => 2,
+        Trap::VerifyFailed => 3,
+    }
+}
+
+/// Successful load report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Load {
+    target: Target,
+    epoch: u32,
+    digest: u32,
+    code_len: u16,
+}
+
+impl Load {
+    #[inline]
+    pub const fn target(self) -> Target {
+        self.target
+    }
+
+    #[inline]
+    pub const fn epoch(self) -> u32 {
+        self.epoch
+    }
+
+    #[inline]
+    pub const fn digest(self) -> u32 {
+        self.digest
+    }
+
+    #[inline]
+    pub const fn code_len(self) -> u16 {
+        self.code_len
+    }
+}
+
+/// EPF appliance error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    Verify(VerifyError),
+    ImageTooLarge { requested: usize, capacity: usize },
+    ScratchTooLarge { requested: usize, capacity: usize },
+    PolicySlotUnavailable { policy_id: u16 },
+    NoImage { target: Target },
+    NoPrevious { target: Target },
+}
+
+impl From<VerifyError> for Error {
+    #[inline]
+    fn from(error: VerifyError) -> Self {
+        Self::Verify(error)
+    }
+}
+
+/// Compact replay / verification log engine marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engine {
+    Epf,
+    Fallback,
+}
+
+/// Image lifecycle rejection reason recorded by replay runners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadRejectReason {
+    Verify(VerifyError),
+    ImageTooLarge,
+    ScratchTooLarge,
+    PolicySlotUnavailable,
+    NoImage,
+    NoPrevious,
+}
+
+impl From<Error> for LoadRejectReason {
+    #[inline]
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Verify(error) => Self::Verify(error),
+            Error::ImageTooLarge { .. } => Self::ImageTooLarge,
+            Error::ScratchTooLarge { .. } => Self::ScratchTooLarge,
+            Error::PolicySlotUnavailable { .. } => Self::PolicySlotUnavailable,
+            Error::NoImage { .. } => Self::NoImage,
+            Error::NoPrevious { .. } => Self::NoPrevious,
+        }
+    }
+}
+
+/// Replay runner input and verification log.
+///
+/// These records are never VM input. A runner applies image lifecycle records
+/// to an `Epf`, feeds `Tap` records through `Epf::run`, and verifies `Run`
+/// summaries against observed output/fuel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayRecord {
+    Tap(TapEvent),
+    ImageLoaded {
+        target: Target,
+        epoch: u32,
+        digest: u32,
+    },
+    ImageReverted {
+        target: Target,
+        epoch: u32,
+        digest: u32,
+    },
+    ImageUnloaded {
+        target: Target,
+        epoch: u32,
+    },
+    ImageRejected {
+        target: Target,
+        reason: LoadRejectReason,
+    },
+    Run {
+        target: Target,
+        observe_epoch: u32,
+        policy_epoch: Option<u32>,
+        engine: Engine,
+        out_digest: u32,
+        fuel_used: u16,
+    },
+}
+
+/// Ready-made EPF image recipes for the common Pico-class debug path.
+///
+/// This is a value spec, not a runtime object. It exists so users do not need
+/// to hand-write bytecode for the standard observe and policy proofs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageSpec {
+    /// Observe VM that emits kind/reason, the first two inputs and packed context.
+    ObserveEcho,
+    /// Observe VM for transport session mismatch evidence.
+    ObserveSessionMismatch,
+    /// Observe VM for transport deadline fault evidence.
+    ObserveDeadlineFault,
+    /// Observe VM for transport capacity fault evidence.
+    ObserveCapacityFault,
+    /// Observe VM that emits only when one typed input word matches.
+    ObserveMatch {
+        input: u8,
+        value: u32,
+        kind: u32,
+        reason: u32,
+    },
+    /// Policy VM that always chooses one binary arm.
+    PolicyChoose { policy_id: u16, arm: u8 },
+    /// Policy VM that chooses one binary arm only when one typed input matches.
+    PolicyChooseOnInput {
+        policy_id: u16,
+        input: u8,
+        value: u32,
+        arm: u8,
+    },
+}
+
+impl ImageSpec {
+    pub fn write(self, out: &mut [u8]) -> Result<usize, ImageBuildError> {
+        self.write_with_fuel(out, 32)
+    }
+
+    pub fn write_with_fuel(self, out: &mut [u8], fuel_max: u16) -> Result<usize, ImageBuildError> {
+        if fuel_max == 0 {
+            return Err(ImageBuildError::ZeroFuel);
+        }
+        if out.len() < Header::SIZE {
+            return Err(ImageBuildError::OutputTooSmall {
+                requested: Header::SIZE,
+                capacity: out.len(),
+            });
+        }
+        let target = self.target()?;
+        let code_len = {
+            let mut writer = CodeWriter::new(&mut out[Header::SIZE..]);
+            self.write_code(&mut writer)?;
+            writer.len()
+        };
+        if code_len > u16::MAX as usize {
+            return Err(ImageBuildError::CodeTooLong { len: code_len });
+        }
+        let total = Header::SIZE + code_len;
+        let header = Header {
+            abi: Header::ABI,
+            target,
+            schema_hash: EVIDENCE_SCHEMA_HASH,
+            code_len: code_len as u16,
+            fuel_max,
+            mem_len: 0,
+            code_hash: compute_hash(&out[Header::SIZE..total]),
+        };
+        let mut header_bytes = [0u8; Header::SIZE];
+        header.encode_into(&mut header_bytes);
+        out[..Header::SIZE].copy_from_slice(&header_bytes);
+        Ok(total)
+    }
+
+    fn target(self) -> Result<Target, ImageBuildError> {
+        match self {
+            Self::ObserveEcho
+            | Self::ObserveSessionMismatch
+            | Self::ObserveDeadlineFault
+            | Self::ObserveCapacityFault
+            | Self::ObserveMatch { .. } => Ok(Target::Observe),
+            Self::PolicyChoose { policy_id, .. } | Self::PolicyChooseOnInput { policy_id, .. } => {
+                if policy_id == EMPTY_POLICY_ID {
+                    Err(ImageBuildError::InvalidPolicyId { policy_id })
+                } else {
+                    Ok(Target::Policy(policy_id))
+                }
+            }
+        }
+    }
+
+    fn write_code(self, writer: &mut CodeWriter<'_>) -> Result<(), ImageBuildError> {
+        match self {
+            Self::ObserveEcho => writer.bytes(&DEFAULT_OBSERVE_CODE),
+            Self::ObserveSessionMismatch => write_observe_kind_reason(
+                writer,
+                TRANSPORT_MISMATCH,
+                TRANSPORT_MISMATCH_SESSION,
+                1,
+                TRANSPORT_MISMATCH_SESSION as u32,
+            ),
+            Self::ObserveDeadlineFault => write_observe_kind_reason(
+                writer,
+                TRANSPORT_FAULT,
+                TRANSPORT_FAULT_DEADLINE,
+                2,
+                TRANSPORT_FAULT_DEADLINE as u32,
+            ),
+            Self::ObserveCapacityFault => write_observe_kind_reason(
+                writer,
+                TRANSPORT_FAULT,
+                TRANSPORT_FAULT_CAPACITY,
+                2,
+                TRANSPORT_FAULT_CAPACITY as u32,
+            ),
+            Self::ObserveMatch {
+                input,
+                value,
+                kind,
+                reason,
+            } => {
+                validate_input(input)?;
+                write_observe_input_match(writer, input, value, kind, reason)
+            }
+            Self::PolicyChoose { arm, .. } => {
+                validate_arm(arm)?;
+                writer_policy_choose(writer, arm)
+            }
+            Self::PolicyChooseOnInput {
+                input, value, arm, ..
+            } => {
+                validate_input(input)?;
+                validate_arm(arm)?;
+                writer.require_input_eq(input, value)?;
+                writer_policy_choose(writer, arm)
+            }
+        }
+    }
+}
+
+fn write_observe_kind_reason(
+    writer: &mut CodeWriter<'_>,
+    kind_id: u16,
+    reason_id: u8,
+    kind: u32,
+    reason: u32,
+) -> Result<(), ImageBuildError> {
+    writer.require_kind(kind_id)?;
+    writer.require_reason(reason_id)?;
+    writer.load_imm(0, kind)?;
+    writer.load_imm(1, reason)?;
+    writer.load_input(2, 0)?;
+    writer.load_input(3, 1)?;
+    writer.load_input(4, 3)?;
+    writer.emit(0, 1, 2, 3, 4)?;
+    writer.halt()
+}
+
+fn write_observe_input_match(
+    writer: &mut CodeWriter<'_>,
+    input: u8,
+    value: u32,
+    kind: u32,
+    reason: u32,
+) -> Result<(), ImageBuildError> {
+    writer.require_input_eq(input, value)?;
+    writer.load_imm(0, kind)?;
+    writer.load_imm(1, reason)?;
+    writer.load_input(2, 0)?;
+    writer.load_input(3, 1)?;
+    writer.load_input(4, 3)?;
+    writer.emit(0, 1, 2, 3, 4)?;
+    writer.halt()
+}
+
+fn writer_policy_choose(writer: &mut CodeWriter<'_>, arm: u8) -> Result<(), ImageBuildError> {
+    writer.load_imm(0, POLICY_OUT_CHOOSE)?;
+    writer.load_imm(1, 0)?;
+    writer.load_imm(2, arm as u32)?;
+    writer.emit(0, 1, 2, 1, 1)?;
+    writer.halt()
+}
+
+fn validate_input(input: u8) -> Result<(), ImageBuildError> {
+    if input > 3 {
+        Err(ImageBuildError::InvalidInputIndex { input })
     } else {
-        Some(ScopeTrace {
-            range: ((event.arg2 & 0x7FFF_0000) >> 16) as u16,
-            nest: (event.arg2 & 0x0000_FFFF) as u16,
+        Ok(())
+    }
+}
+
+fn validate_arm(arm: u8) -> Result<(), ImageBuildError> {
+    if arm > 1 {
+        Err(ImageBuildError::InvalidArm { arm })
+    } else {
+        Ok(())
+    }
+}
+
+struct CodeWriter<'a> {
+    out: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> CodeWriter<'a> {
+    fn new(out: &'a mut [u8]) -> Self {
+        Self { out, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) -> Result<(), ImageBuildError> {
+        let end = self.len.saturating_add(bytes.len());
+        let Some(dst) = self.out.get_mut(self.len..end) else {
+            return Err(ImageBuildError::OutputTooSmall {
+                requested: Header::SIZE + end,
+                capacity: Header::SIZE + self.out.len(),
+            });
+        };
+        dst.copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+
+    fn byte(&mut self, byte: u8) -> Result<(), ImageBuildError> {
+        self.bytes(&[byte])
+    }
+
+    fn u32(&mut self, value: u32) -> Result<(), ImageBuildError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn load_input(&mut self, reg: u8, input: u8) -> Result<(), ImageBuildError> {
+        self.byte(ops::LOAD_INPUT)?;
+        self.byte(reg)?;
+        self.byte(input)
+    }
+
+    fn load_imm(&mut self, reg: u8, value: u32) -> Result<(), ImageBuildError> {
+        self.byte(ops::LOAD_IMM)?;
+        self.byte(reg)?;
+        self.u32(value)
+    }
+
+    fn require_input_eq(&mut self, input: u8, value: u32) -> Result<(), ImageBuildError> {
+        self.byte(ops::REQUIRE_INPUT_EQ)?;
+        self.byte(input)?;
+        self.u32(value)
+    }
+
+    fn require_kind(&mut self, kind: u16) -> Result<(), ImageBuildError> {
+        self.byte(ops::REQUIRE_KIND)?;
+        self.bytes(&kind.to_le_bytes())
+    }
+
+    fn require_reason(&mut self, reason: u8) -> Result<(), ImageBuildError> {
+        self.byte(ops::REQUIRE_REASON)?;
+        self.byte(reason)
+    }
+
+    fn emit(
+        &mut self,
+        kind: u8,
+        reason: u8,
+        arg0: u8,
+        arg1: u8,
+        arg2: u8,
+    ) -> Result<(), ImageBuildError> {
+        self.byte(ops::EMIT)?;
+        self.byte(kind)?;
+        self.byte(reason)?;
+        self.byte(arg0)?;
+        self.byte(arg1)?;
+        self.byte(arg2)
+    }
+
+    fn halt(&mut self) -> Result<(), ImageBuildError> {
+        self.byte(ops::HALT)
+    }
+}
+
+/// EPF image recipe build failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageBuildError {
+    OutputTooSmall { requested: usize, capacity: usize },
+    CodeTooLong { len: usize },
+    InvalidInputIndex { input: u8 },
+    InvalidArm { arm: u8 },
+    InvalidPolicyId { policy_id: u16 },
+    ZeroFuel,
+}
+
+/// Generic EPF image envelope parser.
+///
+/// This is byte-stream state only. UART, USB, debug-probe memory, SIO, and
+/// choreography payloads remain caller-owned I/O. The envelope is:
+///
+/// ```text
+/// b"HEPF" | image_len:u16-le | image_hash:u32-le | image_bytes
+/// ```
+pub struct ImageIngress<const IMAGE_BYTES: usize> {
+    image: [u8; IMAGE_BYTES],
+    pos: usize,
+    len: usize,
+    expected_hash: u32,
+    running_hash: u32,
+    ready: bool,
+}
+
+impl<const IMAGE_BYTES: usize> ImageIngress<IMAGE_BYTES> {
+    pub const MAGIC: [u8; 4] = *b"HEPF";
+    pub const HEADER_BYTES: usize = 10;
+
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            image: [0; IMAGE_BYTES],
+            pos: 0,
+            len: 0,
+            expected_hash: 0,
+            running_hash: FNV32_OFFSET,
+            ready: false,
+        }
+    }
+
+    pub fn push(&mut self, byte: u8) -> ImageIngressStatus {
+        if self.ready {
+            return ImageIngressStatus::Ready {
+                len: self.len,
+                hash: self.expected_hash,
+            };
+        }
+
+        if self.pos < Self::MAGIC.len() {
+            if byte == Self::MAGIC[self.pos] {
+                self.pos += 1;
+                if self.pos == Self::MAGIC.len() {
+                    self.len = 0;
+                    self.expected_hash = 0;
+                    self.running_hash = FNV32_OFFSET;
+                }
+                return ImageIngressStatus::Pending;
+            }
+            let position = self.pos as u8;
+            self.restart_with(byte);
+            return ImageIngressStatus::Rejected(ImageIngressReject::BadMagic { position, byte });
+        }
+
+        match self.pos {
+            4 => {
+                self.len = byte as usize;
+                self.pos = 5;
+                ImageIngressStatus::Pending
+            }
+            5 => {
+                self.len |= (byte as usize) << 8;
+                if self.len == 0 {
+                    self.restart_with(byte);
+                    return ImageIngressStatus::Rejected(ImageIngressReject::EmptyImage);
+                }
+                if self.len > IMAGE_BYTES {
+                    let len = self.len;
+                    self.restart_with(byte);
+                    return ImageIngressStatus::Rejected(ImageIngressReject::ImageTooLarge {
+                        len,
+                        capacity: IMAGE_BYTES,
+                    });
+                }
+                self.pos = 6;
+                ImageIngressStatus::Pending
+            }
+            6..=9 => {
+                let shift = ((self.pos - 6) * 8) as u32;
+                self.expected_hash |= (byte as u32) << shift;
+                self.pos += 1;
+                ImageIngressStatus::Pending
+            }
+            _ => {
+                let image_index = self.pos - Self::HEADER_BYTES;
+                if image_index >= self.len || image_index >= IMAGE_BYTES {
+                    self.restart_with(byte);
+                    return ImageIngressStatus::Rejected(ImageIngressReject::Overrun);
+                }
+                self.image[image_index] = byte;
+                self.running_hash = hash_byte(self.running_hash, byte);
+                self.pos += 1;
+                if image_index + 1 == self.len {
+                    if self.running_hash == self.expected_hash {
+                        self.ready = true;
+                        self.pos = 0;
+                        ImageIngressStatus::Ready {
+                            len: self.len,
+                            hash: self.expected_hash,
+                        }
+                    } else {
+                        let expected = self.expected_hash;
+                        let computed = self.running_hash;
+                        self.reset();
+                        ImageIngressStatus::Rejected(ImageIngressReject::HashMismatch {
+                            expected,
+                            computed,
+                        })
+                    }
+                } else {
+                    ImageIngressStatus::Pending
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn image(&self) -> Option<&[u8]> {
+        if self.ready {
+            Some(&self.image[..self.len])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub const fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    #[inline]
+    pub const fn len(&self) -> usize {
+        if self.ready { self.len } else { 0 }
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub const fn expected_hash(&self) -> u32 {
+        self.expected_hash
+    }
+
+    #[inline]
+    pub fn clear_ready(&mut self) {
+        self.reset();
+    }
+
+    #[inline]
+    pub const fn position(&self) -> usize {
+        self.pos
+    }
+
+    #[inline]
+    pub const fn staged_len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub const fn running_hash(&self) -> u32 {
+        self.running_hash
+    }
+
+    pub fn reset(&mut self) {
+        self.pos = 0;
+        self.len = 0;
+        self.expected_hash = 0;
+        self.running_hash = FNV32_OFFSET;
+        self.ready = false;
+    }
+
+    fn restart_with(&mut self, byte: u8) {
+        self.reset();
+        if byte == Self::MAGIC[0] {
+            self.pos = 1;
+        }
+    }
+}
+
+impl<const IMAGE_BYTES: usize> Default for ImageIngress<IMAGE_BYTES> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result of feeding one byte into `ImageIngress`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageIngressStatus {
+    Pending,
+    Ready { len: usize, hash: u32 },
+    Rejected(ImageIngressReject),
+}
+
+/// Rejection raised by the generic image envelope parser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageIngressReject {
+    BadMagic { position: u8, byte: u8 },
+    EmptyImage,
+    ImageTooLarge { len: usize, capacity: usize },
+    HashMismatch { expected: u32, computed: u32 },
+    Overrun,
+}
+
+/// Fixed TapEvent retention spool for loaded-bytecode diagnosis.
+///
+/// The spool does not read Hibana state by itself and does not run the VM. A
+/// caller retains events with `push` while the system is misbehaving, then
+/// replays retained events through `Epf::run_spool` after an observe image is
+/// loaded.
+pub struct TapSpool<const HISTORY: usize> {
+    events: [MaybeUninit<TapEvent>; HISTORY],
+    len: usize,
+    read: usize,
+}
+
+impl<const HISTORY: usize> TapSpool<HISTORY> {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            events: [const { MaybeUninit::uninit() }; HISTORY],
+            len: 0,
+            read: 0,
+        }
+    }
+
+    #[inline]
+    pub fn push(&mut self, event: TapEvent) -> Result<(), TapSpoolFull> {
+        if self.len >= HISTORY {
+            return Err(TapSpoolFull);
+        }
+        self.events[self.len].write(event);
+        self.len += 1;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn next_event(&mut self) -> Option<TapEvent> {
+        if self.read >= self.len {
+            return None;
+        }
+        let event = unsafe { self.events[self.read].assume_init_read() };
+        self.read += 1;
+        Some(event)
+    }
+
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub const fn pending(&self) -> usize {
+        self.len.saturating_sub(self.read)
+    }
+
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        HISTORY
+    }
+
+    #[inline]
+    pub const fn is_full(&self) -> bool {
+        self.len == HISTORY
+    }
+
+    #[inline]
+    pub fn rewind(&mut self) {
+        self.read = 0;
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.len = 0;
+        self.read = 0;
+    }
+}
+
+impl<const HISTORY: usize> Default for TapSpool<HISTORY> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Returned when a fixed TapEvent spool is full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TapSpoolFull;
+
+/// Compact binary record for carrying `Out` over UART, USB, SIO, files, or RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactOutRecord {
+    pub site: u8,
+    pub target: Target,
+    pub epoch: u32,
+    pub kind: u32,
+    pub reason: u32,
+    pub arg0: u32,
+    pub arg1: u32,
+    pub arg2: u32,
+    pub fuel_used: u16,
+    pub flags: u16,
+}
+
+impl CompactOutRecord {
+    pub const MAGIC: [u8; 4] = *b"HEPO";
+    pub const SIZE: usize = 36;
+    pub const FLAG_TRAP: u16 = 1;
+
+    #[inline]
+    pub const fn from_out(site: u8, out: Out) -> Self {
+        let flags = if out.trap_reason().is_some() {
+            Self::FLAG_TRAP
+        } else {
+            0
+        };
+        Self {
+            site,
+            target: out.target(),
+            epoch: out.epoch(),
+            kind: out.kind(),
+            reason: out.reason(),
+            arg0: out.arg0(),
+            arg1: out.arg1(),
+            arg2: out.arg2(),
+            fuel_used: out.fuel_used(),
+            flags,
+        }
+    }
+
+    pub fn encode(self, out: &mut [u8; Self::SIZE]) {
+        let (target_kind, policy_id) = self.target.encode();
+        out[0..4].copy_from_slice(&Self::MAGIC);
+        out[4] = self.site;
+        out[5] = target_kind;
+        out[6..8].copy_from_slice(&policy_id.to_le_bytes());
+        out[8..12].copy_from_slice(&self.epoch.to_le_bytes());
+        out[12..16].copy_from_slice(&self.kind.to_le_bytes());
+        out[16..20].copy_from_slice(&self.reason.to_le_bytes());
+        out[20..24].copy_from_slice(&self.arg0.to_le_bytes());
+        out[24..28].copy_from_slice(&self.arg1.to_le_bytes());
+        out[28..32].copy_from_slice(&self.arg2.to_le_bytes());
+        out[32..34].copy_from_slice(&self.fuel_used.to_le_bytes());
+        out[34..36].copy_from_slice(&self.flags.to_le_bytes());
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, CompactOutDecodeError> {
+        if bytes.len() != Self::SIZE {
+            return Err(CompactOutDecodeError::BadLength {
+                expected: Self::SIZE,
+                actual: bytes.len(),
+            });
+        }
+        if bytes[0..4] != Self::MAGIC {
+            return Err(CompactOutDecodeError::BadMagic);
+        }
+        let policy_id = u16::from_le_bytes([bytes[6], bytes[7]]);
+        let target = Target::decode(bytes[5], policy_id)
+            .map_err(CompactOutDecodeError::UnsupportedTarget)?;
+        Ok(Self {
+            site: bytes[4],
+            target,
+            epoch: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            kind: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            reason: u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            arg0: u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+            arg1: u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            arg2: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+            fuel_used: u16::from_le_bytes([bytes[32], bytes[33]]),
+            flags: u16::from_le_bytes([bytes[34], bytes[35]]),
         })
     }
 }
 
-/// Abort outcome emitted by the policy VM (or by the host when mapping traps).
+/// Compact output record decode failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AbortInfo {
-    pub reason: u16,
-    pub trap: Option<Trap>,
-}
-
-/// Engine-level fail-closed reason used when policy execution cannot produce
-/// a safe decision.
-pub const ENGINE_FAIL_CLOSED: u16 = 0xFFFF;
-/// Engine-level liveness exhaustion reason for dynamic route decision loops.
-pub const ENGINE_LIVENESS_EXHAUSTED: u16 = 0xFFFE;
-
-/// Runtime policy mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PolicyMode {
-    Shadow,
-    Enforce,
-}
-
-/// Reduced emergency-plane verdict domain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PolicyVerdict {
-    Proceed,
-    RouteArm(u8),
-    Reject(u16),
-}
-
-#[inline]
-pub const fn policy_mode_tag(mode: PolicyMode) -> u8 {
-    match mode {
-        PolicyMode::Shadow => 0,
-        PolicyMode::Enforce => 1,
-    }
-}
-
-#[inline]
-pub const fn verdict_tag(verdict: PolicyVerdict) -> u8 {
-    match verdict {
-        PolicyVerdict::Proceed => 0,
-        PolicyVerdict::RouteArm(_) => 1,
-        PolicyVerdict::Reject(_) => 2,
-    }
-}
-
-#[inline]
-pub const fn verdict_arm(verdict: PolicyVerdict) -> u8 {
-    match verdict {
-        PolicyVerdict::RouteArm(arm) => arm,
-        _ => 0,
-    }
-}
-
-#[inline]
-pub const fn verdict_reason(verdict: PolicyVerdict) -> u16 {
-    match verdict {
-        PolicyVerdict::Reject(reason) => reason,
-        _ => 0,
-    }
-}
-
-#[inline]
-pub const fn slot_tag(slot: Slot) -> u8 {
-    match slot {
-        Slot::Forward => 0,
-        Slot::EndpointRx => 1,
-        Slot::EndpointTx => 2,
-        Slot::Rendezvous => 3,
-        Slot::Route => 4,
-    }
+pub enum CompactOutDecodeError {
+    BadLength { expected: usize, actual: usize },
+    BadMagic,
+    UnsupportedTarget(VerifyError),
 }
 
 const FNV32_OFFSET: u32 = 0x811C_9DC5;
 const FNV32_PRIME: u32 = 0x0100_0193;
 
 #[inline]
-fn fnv32_mix_u8(mut hash: u32, byte: u8) -> u32 {
-    hash ^= byte as u32;
-    hash.wrapping_mul(FNV32_PRIME)
+const fn hash_byte(hash: u32, byte: u8) -> u32 {
+    (hash ^ byte as u32).wrapping_mul(FNV32_PRIME)
 }
 
-#[inline]
-fn fnv32_mix_u16(hash: u32, value: u16) -> u32 {
-    let bytes = value.to_le_bytes();
-    let hash = fnv32_mix_u8(hash, bytes[0]);
-    fnv32_mix_u8(hash, bytes[1])
+/// Fixed storage owned by the caller. Pico class is the standard capacity model.
+pub struct EpfStorage<
+    'cfg,
+    const POLICY_SLOTS: usize,
+    const IMAGE_BYTES: usize,
+    const SCRATCH_BYTES: usize,
+    const HISTORY: usize,
+> {
+    inner: UnsafeCell<StorageInner<'cfg, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>>,
+    _not_sync: PhantomData<*mut ()>,
 }
 
-#[inline]
-fn fnv32_mix_u32(hash: u32, value: u32) -> u32 {
-    let bytes = value.to_le_bytes();
-    let hash = fnv32_mix_u8(hash, bytes[0]);
-    let hash = fnv32_mix_u8(hash, bytes[1]);
-    let hash = fnv32_mix_u8(hash, bytes[2]);
-    fnv32_mix_u8(hash, bytes[3])
-}
-
-#[inline]
-fn fnv32_mix_u64(hash: u32, value: u64) -> u32 {
-    let bytes = value.to_le_bytes();
-    let mut out = hash;
-    let mut idx = 0usize;
-    while idx < bytes.len() {
-        out = fnv32_mix_u8(out, bytes[idx]);
-        idx += 1;
-    }
-    out
-}
-
-#[inline]
-fn fnv32_mix_opt_u32(hash: u32, value: Option<u32>) -> u32 {
-    match value {
-        Some(v) => fnv32_mix_u32(fnv32_mix_u8(hash, 1), v),
-        None => fnv32_mix_u8(hash, 0),
+impl<
+    'cfg,
+    const POLICY_SLOTS: usize,
+    const IMAGE_BYTES: usize,
+    const SCRATCH_BYTES: usize,
+    const HISTORY: usize,
+> EpfStorage<'cfg, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>
+{
+    pub const fn new() -> Self {
+        Self {
+            inner: UnsafeCell::new(StorageInner::new()),
+            _not_sync: PhantomData,
+        }
     }
 }
 
-#[inline]
-fn fnv32_mix_opt_u64(hash: u32, value: Option<u64>) -> u32 {
-    match value {
-        Some(v) => fnv32_mix_u64(fnv32_mix_u8(hash, 1), v),
-        None => fnv32_mix_u8(hash, 0),
+impl<
+    'cfg,
+    const POLICY_SLOTS: usize,
+    const IMAGE_BYTES: usize,
+    const SCRATCH_BYTES: usize,
+    const HISTORY: usize,
+> Default for EpfStorage<'cfg, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-#[inline]
-pub fn hash_tap_event(event: &TapEvent) -> u32 {
-    let mut hash = FNV32_OFFSET;
-    hash = fnv32_mix_u32(hash, event.ts);
-    hash = fnv32_mix_u16(hash, event.id);
-    hash = fnv32_mix_u16(hash, event.causal_key);
-    hash = fnv32_mix_u32(hash, event.arg0);
-    hash = fnv32_mix_u32(hash, event.arg1);
-    fnv32_mix_u32(hash, event.arg2)
+struct StorageInner<
+    'cfg,
+    const POLICY_SLOTS: usize,
+    const IMAGE_BYTES: usize,
+    const SCRATCH_BYTES: usize,
+    const HISTORY: usize,
+> {
+    observe: ImageBank<IMAGE_BYTES, SCRATCH_BYTES>,
+    policies: [PolicySlot<'cfg, IMAGE_BYTES, SCRATCH_BYTES>; POLICY_SLOTS],
+    evidence: EvidenceState<HISTORY>,
 }
 
-#[inline]
-pub fn hash_policy_input(input: [u32; 4]) -> u32 {
-    let mut hash = FNV32_OFFSET;
-    let mut idx = 0usize;
-    while idx < input.len() {
-        hash = fnv32_mix_u32(hash, input[idx]);
-        idx += 1;
+impl<
+    'cfg,
+    const POLICY_SLOTS: usize,
+    const IMAGE_BYTES: usize,
+    const SCRATCH_BYTES: usize,
+    const HISTORY: usize,
+> StorageInner<'cfg, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>
+{
+    const fn new() -> Self {
+        Self {
+            observe: ImageBank::new(),
+            policies: [const { PolicySlot::new() }; POLICY_SLOTS],
+            evidence: EvidenceState::new(),
+        }
     }
-    hash
-}
-
-#[inline]
-pub fn hash_transport_attrs(attrs: &PolicyAttrs) -> u32 {
-    let mut hash = FNV32_OFFSET;
-    hash = fnv32_mix_opt_u64(
-        hash,
-        attrs.get(policy_core::LATENCY_US).map(ContextValue::as_u64),
-    );
-    hash = fnv32_mix_opt_u32(
-        hash,
-        attrs
-            .get(policy_core::QUEUE_DEPTH)
-            .map(ContextValue::as_u32),
-    );
-    hash = fnv32_mix_opt_u64(
-        hash,
-        attrs
-            .get(policy_core::PACING_INTERVAL_US)
-            .map(ContextValue::as_u64),
-    );
-    hash = fnv32_mix_opt_u32(
-        hash,
-        attrs
-            .get(policy_core::CONGESTION_MARKS)
-            .map(ContextValue::as_u32),
-    );
-    hash = fnv32_mix_opt_u32(
-        hash,
-        attrs
-            .get(policy_core::RETRANSMISSIONS)
-            .map(ContextValue::as_u32),
-    );
-    hash = fnv32_mix_opt_u32(
-        hash,
-        attrs.get(policy_core::PTO_COUNT).map(ContextValue::as_u32),
-    );
-    hash = fnv32_mix_opt_u64(
-        hash,
-        attrs.get(policy_core::SRTT_US).map(ContextValue::as_u64),
-    );
-    hash = fnv32_mix_opt_u64(
-        hash,
-        attrs
-            .get(policy_core::LATEST_ACK_PN)
-            .map(ContextValue::as_u64),
-    );
-    hash = fnv32_mix_opt_u64(
-        hash,
-        attrs
-            .get(policy_core::CONGESTION_WINDOW)
-            .map(ContextValue::as_u64),
-    );
-    hash = fnv32_mix_opt_u64(
-        hash,
-        attrs
-            .get(policy_core::IN_FLIGHT_BYTES)
-            .map(ContextValue::as_u64),
-    );
-    match attrs
-        .get(policy_core::TRANSPORT_ALGORITHM)
-        .map(ContextValue::as_u32)
-    {
-        Some(1) => fnv32_mix_u8(hash, 1),
-        Some(2) => fnv32_mix_u8(hash, 2),
-        Some(raw) if raw >= 0x100 => fnv32_mix_u8(fnv32_mix_u8(hash, 3), (raw - 0x100) as u8),
-        Some(raw) => fnv32_mix_u8(fnv32_mix_u8(hash, 3), raw as u8),
-        None => fnv32_mix_u8(hash, 0),
+    fn policy_slot_mut(
+        &mut self,
+        policy_id: u16,
+    ) -> Result<&mut PolicySlot<'cfg, IMAGE_BYTES, SCRATCH_BYTES>, Error> {
+        Target::decode(1, policy_id)?;
+        let mut empty = None;
+        let mut idx = 0usize;
+        while idx < self.policies.len() {
+            if self.policies[idx].policy_id == policy_id {
+                return Ok(&mut self.policies[idx]);
+            }
+            if self.policies[idx].policy_id == EMPTY_POLICY_ID && empty.is_none() {
+                empty = Some(idx);
+            }
+            idx += 1;
+        }
+        if let Some(idx) = empty {
+            self.policies[idx].policy_id = policy_id;
+            return Ok(&mut self.policies[idx]);
+        }
+        Err(Error::PolicySlotUnavailable { policy_id })
     }
 }
 
-#[inline]
-const fn saturating_u64_to_u32(value: Option<u64>) -> u32 {
-    match value {
-        Some(v) => {
-            if v > u32::MAX as u64 {
-                u32::MAX
+struct PolicySlot<'cfg, const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> {
+    policy_id: u16,
+    bank: ImageBank<IMAGE_BYTES, SCRATCH_BYTES>,
+    fallback: Option<StoredResolver<'cfg>>,
+}
+
+impl<'cfg, const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize>
+    PolicySlot<'cfg, IMAGE_BYTES, SCRATCH_BYTES>
+{
+    const fn new() -> Self {
+        Self {
+            policy_id: EMPTY_POLICY_ID,
+            bank: ImageBank::new(),
+            fallback: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StoredResolver<'cfg> {
+    words: [MaybeUninit<usize>; RESOLVER_STORAGE_WORDS],
+    _marker: PhantomData<&'cfg ()>,
+}
+
+impl<'cfg> StoredResolver<'cfg> {
+    fn new<const POLICY_ID: u16>(resolver: ResolverRef<'cfg, POLICY_ID>) -> Self {
+        assert!(
+            size_of::<ResolverRef<'cfg, POLICY_ID>>()
+                <= size_of::<[MaybeUninit<usize>; RESOLVER_STORAGE_WORDS]>()
+        );
+        assert!(
+            align_of::<ResolverRef<'cfg, POLICY_ID>>()
+                <= align_of::<[MaybeUninit<usize>; RESOLVER_STORAGE_WORDS]>()
+        );
+        let mut stored = Self {
+            words: [MaybeUninit::zeroed(); RESOLVER_STORAGE_WORDS],
+            _marker: PhantomData,
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                ptr::from_ref(&resolver).cast::<u8>(),
+                stored.words.as_mut_ptr().cast::<u8>(),
+                size_of::<ResolverRef<'cfg, POLICY_ID>>(),
+            );
+        }
+        stored
+    }
+
+    fn resolve<const POLICY_ID: u16>(self) -> Result<DecisionArm, ResolverError> {
+        assert!(
+            size_of::<ResolverRef<'cfg, POLICY_ID>>()
+                <= size_of::<[MaybeUninit<usize>; RESOLVER_STORAGE_WORDS]>()
+        );
+        assert!(
+            align_of::<ResolverRef<'cfg, POLICY_ID>>()
+                <= align_of::<[MaybeUninit<usize>; RESOLVER_STORAGE_WORDS]>()
+        );
+        let mut resolver = MaybeUninit::<ResolverRef<'cfg, POLICY_ID>>::uninit();
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.words.as_ptr().cast::<u8>(),
+                resolver.as_mut_ptr().cast::<u8>(),
+                size_of::<ResolverRef<'cfg, POLICY_ID>>(),
+            );
+            resolver.assume_init().decide()
+        }
+    }
+}
+
+struct ImageBank<const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> {
+    image: [[u8; IMAGE_BYTES]; 2],
+    scratch: [[u8; SCRATCH_BYTES]; 2],
+    len: [usize; 2],
+    mem_len: [usize; 2],
+    fuel_max: [u16; 2],
+    digest: [u32; 2],
+    active: u8,
+    previous: u8,
+    has_active: bool,
+    has_previous: bool,
+    epoch: u32,
+}
+
+impl<const IMAGE_BYTES: usize, const SCRATCH_BYTES: usize> ImageBank<IMAGE_BYTES, SCRATCH_BYTES> {
+    const fn new() -> Self {
+        Self {
+            image: [[0; IMAGE_BYTES]; 2],
+            scratch: [[0; SCRATCH_BYTES]; 2],
+            len: [0; 2],
+            mem_len: [0; 2],
+            fuel_max: [0; 2],
+            digest: [0; 2],
+            active: 0,
+            previous: 1,
+            has_active: false,
+            has_previous: false,
+            epoch: 0,
+        }
+    }
+
+    fn load(&mut self, image: &[u8], verified: verifier::VerifiedImage<'_>) -> Result<Load, Error> {
+        if image.len() > IMAGE_BYTES {
+            return Err(Error::ImageTooLarge {
+                requested: image.len(),
+                capacity: IMAGE_BYTES,
+            });
+        }
+        if verified.header.mem_len as usize > SCRATCH_BYTES {
+            return Err(Error::ScratchTooLarge {
+                requested: verified.header.mem_len as usize,
+                capacity: SCRATCH_BYTES,
+            });
+        }
+
+        let inactive = if self.has_active {
+            1usize.saturating_sub(self.active as usize)
+        } else {
+            self.active as usize
+        };
+        self.image[inactive][..image.len()].copy_from_slice(image);
+        zero(&mut self.image[inactive][image.len()..]);
+        zero(&mut self.scratch[inactive]);
+        self.len[inactive] = image.len();
+        self.mem_len[inactive] = verified.header.mem_len as usize;
+        self.fuel_max[inactive] = verified.header.fuel_max;
+        self.digest[inactive] = verified.header.code_hash;
+
+        if self.has_active {
+            self.previous = self.active;
+            self.has_previous = true;
+        }
+        self.active = inactive as u8;
+        self.has_active = true;
+        self.epoch = self.epoch.wrapping_add(1);
+
+        Ok(Load {
+            target: verified.header.target,
+            epoch: self.epoch,
+            digest: verified.header.code_hash,
+            code_len: verified.header.code_len,
+        })
+    }
+
+    fn unload(&mut self, target: Target) -> Result<(), Error> {
+        if !self.has_active {
+            return Err(Error::NoImage { target });
+        }
+        self.has_active = false;
+        self.epoch = self.epoch.wrapping_add(1);
+        Ok(())
+    }
+
+    fn revert(&mut self, target: Target) -> Result<(), Error> {
+        if !self.has_previous {
+            return Err(Error::NoPrevious { target });
+        }
+        core::mem::swap(&mut self.active, &mut self.previous);
+        self.has_active = true;
+        self.epoch = self.epoch.wrapping_add(1);
+        Ok(())
+    }
+
+    fn run(&self, target: Target, input: vm::VmInput) -> Out {
+        if !self.has_active {
+            return Out::quiet(target, self.epoch, 0);
+        }
+        let index = self.active as usize;
+        let image = &self.image[index][..self.len[index]];
+        let code = &image[Header::SIZE..];
+        vm::run(target, self.epoch, code, input, self.fuel_max[index])
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EvidenceState<const HISTORY: usize> {
+    latest: [u32; 4],
+    latest_kind: u16,
+    latest_reason: u8,
+    observe_epoch: u32,
+    history: [[u32; 4]; HISTORY],
+    cursor: usize,
+}
+
+impl<const HISTORY: usize> EvidenceState<HISTORY> {
+    const fn new() -> Self {
+        Self {
+            latest: [0; 4],
+            latest_kind: 0,
+            latest_reason: 0,
+            observe_epoch: 0,
+            history: [[0; 4]; HISTORY],
+            cursor: 0,
+        }
+    }
+
+    fn ingest(&mut self, evidence: EvidenceInput) {
+        let input = evidence.words();
+        self.latest = input;
+        self.latest_kind = evidence.kind();
+        self.latest_reason = evidence.reason();
+        if HISTORY != 0 {
+            self.history[self.cursor % HISTORY] = input;
+            self.cursor = self.cursor.wrapping_add(1);
+        }
+        self.observe_epoch = self.observe_epoch.wrapping_add(1);
+    }
+}
+
+/// The single EPF runtime appliance.
+pub struct Epf<
+    'a,
+    const POLICY_SLOTS: usize,
+    const IMAGE_BYTES: usize,
+    const SCRATCH_BYTES: usize,
+    const HISTORY: usize,
+> {
+    inner: *mut UnsafeCell<StorageInner<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>>,
+    _not_send_sync: PhantomData<*mut ()>,
+    _borrow: PhantomData<&'a mut ()>,
+}
+
+impl<
+    'a,
+    const POLICY_SLOTS: usize,
+    const IMAGE_BYTES: usize,
+    const SCRATCH_BYTES: usize,
+    const HISTORY: usize,
+> Epf<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>
+{
+    #[inline]
+    pub fn new(
+        storage: &'a mut EpfStorage<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>,
+    ) -> Self {
+        Self {
+            inner: core::ptr::addr_of_mut!(storage.inner),
+            _not_send_sync: PhantomData,
+            _borrow: PhantomData,
+        }
+    }
+
+    /// Construct an appliance view from raw storage.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must point to live `EpfStorage` and no other `Epf` view may
+    /// call `load`, `unload`, `revert`, or `run` concurrently.
+    #[inline]
+    pub unsafe fn from_raw_storage(
+        storage: *mut EpfStorage<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>,
+    ) -> Self {
+        Self {
+            inner: unsafe { core::ptr::addr_of_mut!((*storage).inner) },
+            _not_send_sync: PhantomData,
+            _borrow: PhantomData,
+        }
+    }
+
+    pub fn load(&self, image: &[u8]) -> Result<Load, Error> {
+        let verified = verifier::VerifiedImage::new(image)?;
+        self.with_inner(|inner| match verified.header.target {
+            Target::Observe => inner.observe.load(image, verified),
+            Target::Policy(policy_id) => {
+                inner.policy_slot_mut(policy_id)?.bank.load(image, verified)
+            }
+        })
+    }
+
+    /// Load a ready generic image ingress envelope.
+    ///
+    /// Returns `Ok(None)` when the ingress has not completed an image yet. A
+    /// successful load clears the ready image; a failed load leaves it available
+    /// for caller-side diagnostics.
+    pub fn load_ingress<const INGRESS_BYTES: usize>(
+        &self,
+        ingress: &mut ImageIngress<INGRESS_BYTES>,
+    ) -> Result<Option<Load>, Error> {
+        let Some(image) = ingress.image() else {
+            return Ok(None);
+        };
+        let loaded = self.load(image)?;
+        ingress.clear_ready();
+        Ok(Some(loaded))
+    }
+
+    pub fn unload(&self, target: Target) -> Result<(), Error> {
+        self.with_inner(|inner| match target {
+            Target::Observe => inner.observe.unload(target),
+            Target::Policy(policy_id) => inner.policy_slot_mut(policy_id)?.bank.unload(target),
+        })
+    }
+
+    pub fn revert(&self, target: Target) -> Result<(), Error> {
+        self.with_inner(|inner| match target {
+            Target::Observe => inner.observe.revert(target),
+            Target::Policy(policy_id) => inner.policy_slot_mut(policy_id)?.bank.revert(target),
+        })
+    }
+
+    /// Run the observe VM over one Hibana tap event.
+    pub fn run(&self, event: TapEvent) -> Out {
+        self.run_evidence(EvidenceInput::from_tap_event(event))
+    }
+
+    /// Run the observe VM over one canonical EPF evidence input.
+    pub fn run_evidence(&self, evidence: EvidenceInput) -> Out {
+        let input = vm_input(evidence);
+        self.with_inner(|inner| {
+            inner.evidence.ingest(evidence);
+            if inner.observe.has_active {
+                inner.observe.run(Target::Observe, input)
             } else {
-                v as u32
+                vm::run(
+                    Target::Observe,
+                    inner.evidence.observe_epoch,
+                    &DEFAULT_OBSERVE_CODE,
+                    input,
+                    DEFAULT_OBSERVE_FUEL,
+                )
+            }
+        })
+    }
+
+    /// Replay retained TapEvents until the VM emits a compact output.
+    pub fn run_spool<const RETAINED: usize>(&self, spool: &mut TapSpool<RETAINED>) -> Option<Out> {
+        while let Some(event) = spool.next_event() {
+            let out = self.run(event);
+            if out.emitted() {
+                return Some(out);
             }
         }
-        None => 0,
+        None
     }
-}
 
-#[inline]
-const fn opt_u32_or_zero(value: Option<u32>) -> u32 {
-    match value {
-        Some(v) => v,
-        None => 0,
+    pub fn resolver<const POLICY_ID: u16>(
+        &'a self,
+        fallback: ResolverRef<'a, POLICY_ID>,
+    ) -> Result<ResolverRef<'a, POLICY_ID>, Error> {
+        self.with_inner(|inner| -> Result<(), Error> {
+            inner.policy_slot_mut(POLICY_ID)?.fallback = Some(StoredResolver::new(fallback));
+            Ok(())
+        })?;
+        Ok(ResolverRef::decision_state(
+            self,
+            Self::resolve_policy::<POLICY_ID>,
+        ))
     }
-}
 
-#[inline]
-const fn attr_u32(attrs: &PolicyAttrs, id: ContextId) -> Option<u32> {
-    match attrs.get(id) {
-        Some(value) => Some(value.as_u32()),
-        None => None,
-    }
-}
-
-#[inline]
-const fn attr_u64(attrs: &PolicyAttrs, id: ContextId) -> Option<u64> {
-    match attrs.get(id) {
-        Some(value) => Some(value.as_u64()),
-        None => None,
-    }
-}
-
-#[inline]
-pub const fn replay_transport_inputs(attrs: &PolicyAttrs) -> [u32; 4] {
-    [
-        saturating_u64_to_u32(attr_u64(attrs, policy_core::LATENCY_US)),
-        opt_u32_or_zero(attr_u32(attrs, policy_core::QUEUE_DEPTH)),
-        opt_u32_or_zero(attr_u32(attrs, policy_core::CONGESTION_MARKS)),
-        opt_u32_or_zero(attr_u32(attrs, policy_core::RETRANSMISSIONS)),
-    ]
-}
-
-#[inline]
-pub const fn replay_transport_presence(attrs: &PolicyAttrs) -> u8 {
-    let mut mask = 0u8;
-    if attrs.get(policy_core::LATENCY_US).is_some() {
-        mask |= 1 << 0;
-    }
-    if attrs.get(policy_core::QUEUE_DEPTH).is_some() {
-        mask |= 1 << 1;
-    }
-    if attrs.get(policy_core::CONGESTION_MARKS).is_some() {
-        mask |= 1 << 2;
-    }
-    if attrs.get(policy_core::RETRANSMISSIONS).is_some() {
-        mask |= 1 << 3;
-    }
-    mask
-}
-
-/// Unified action surface consumed by slot owners.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
-    Proceed,
-    Abort(AbortInfo),
-    Tap { id: u16, arg0: u32, arg1: u32 },
-    Route { arm: u8 },
-    Defer { retry_hint: u8 },
-}
-
-impl Action {
-    #[inline]
-    pub const fn verdict(self) -> PolicyVerdict {
-        match self {
-            Action::Proceed => PolicyVerdict::Proceed,
-            Action::Route { arm } if arm <= 1 => PolicyVerdict::RouteArm(arm),
-            Action::Route { .. } => PolicyVerdict::Reject(ENGINE_FAIL_CLOSED),
-            Action::Abort(info) => PolicyVerdict::Reject(info.reason),
-            Action::Tap { .. } => PolicyVerdict::Proceed,
-            Action::Defer { .. } => PolicyVerdict::Proceed,
+    fn resolve_policy<const POLICY_ID: u16>(epf: &Self) -> Result<DecisionArm, ResolverError> {
+        let decision = epf.with_inner(|inner| {
+            let input = vm::VmInput {
+                kind: inner.evidence.latest_kind,
+                reason: inner.evidence.latest_reason,
+                words: inner.evidence.latest,
+            };
+            for slot in &inner.policies {
+                if slot.policy_id == POLICY_ID {
+                    return if slot.bank.has_active {
+                        Ok(slot.bank.run(Target::Policy(POLICY_ID), input))
+                    } else {
+                        Err(slot.fallback)
+                    };
+                }
+            }
+            Err(None)
+        });
+        match decision {
+            Ok(out) => policy_resolution(out),
+            Err(Some(fallback)) => fallback.resolve::<POLICY_ID>(),
+            Err(None) => Err(ResolverError::reject()),
         }
     }
 
-    #[inline]
-    pub const fn with_mode(self, mode: PolicyMode) -> Self {
-        match mode {
-            PolicyMode::Enforce => self,
-            PolicyMode::Shadow => match self {
-                Action::Tap { .. } => self,
-                _ => Action::Proceed,
-            },
-        }
+    fn with_inner<T>(
+        &self,
+        apply: impl FnOnce(
+            &mut StorageInner<'a, POLICY_SLOTS, IMAGE_BYTES, SCRATCH_BYTES, HISTORY>,
+        ) -> T,
+    ) -> T {
+        // SAFETY: Epf uniquely borrows its storage and is neither Send nor Sync.
+        // Every caller is private, exposes no storage borrow and invokes no user
+        // callback while this borrow lives. Resolver callbacks run afterwards.
+        apply(unsafe { &mut *(*self.inner).get() })
+    }
+}
+
+fn policy_resolution(out: Out) -> Result<DecisionArm, ResolverError> {
+    if out.trap_reason().is_some() {
+        return Err(ResolverError::reject());
+    }
+    match out.kind() {
+        POLICY_OUT_DEFER => Err(ResolverError::reject()),
+        POLICY_OUT_CHOOSE => match out.arg0() {
+            0 => Ok(DecisionArm::Left),
+            1 => Ok(DecisionArm::Right),
+            _ => Err(ResolverError::reject()),
+        },
+        POLICY_OUT_REJECT => Err(ResolverError::reject()),
+        _ => Err(ResolverError::reject()),
     }
 }
 
 #[inline]
-fn action_from_vm(vm_action: VmAction) -> Action {
-    match vm_action {
-        VmAction::Proceed => Action::Proceed,
-        VmAction::Abort { reason } => Action::Abort(AbortInfo { reason, trap: None }),
-        VmAction::Trap(trap) => Action::Abort(AbortInfo {
-            reason: ENGINE_FAIL_CLOSED,
-            trap: Some(trap),
-        }),
-        VmAction::Tap { id, arg0, arg1 } => Action::Tap { id, arg0, arg1 },
-        VmAction::Route { arm } if arm <= 1 => Action::Route { arm },
-        VmAction::Route { .. } => Action::Abort(AbortInfo {
-            reason: ENGINE_FAIL_CLOSED,
-            trap: None,
-        }),
-        VmAction::Defer { retry_hint } => Action::Defer { retry_hint },
+fn vm_input(evidence: EvidenceInput) -> vm::VmInput {
+    vm::VmInput {
+        kind: evidence.kind(),
+        reason: evidence.reason(),
+        words: evidence.words(),
     }
 }
 
-#[inline]
-pub fn run_with<F>(
-    host_slots: &HostSlots<'_>,
-    slot: Slot,
-    event: &TapEvent,
-    session: Option<SessionId>,
-    lane: Option<Lane>,
-    configure: F,
-) -> Action
-where
-    F: FnOnce(&mut VmCtx<'_>),
-{
-    let vm_action = host_slots.execute_with(slot, event, session, lane, configure);
-    action_from_vm(vm_action).with_mode(host_slots.policy_mode(slot))
+fn zero(bytes: &mut [u8]) {
+    for byte in bytes {
+        *byte = 0;
+    }
 }
-use vm::VmAction;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hibana::runtime::tap::{TRANSPORT_MISMATCH, TRANSPORT_MISMATCH_SESSION};
+
+    fn image(target: Target, code: &[u8], out: &mut [u8]) -> usize {
+        let header = Header {
+            abi: Header::ABI,
+            target,
+            schema_hash: EVIDENCE_SCHEMA_HASH,
+            code_len: code.len() as u16,
+            fuel_max: 32,
+            mem_len: 0,
+            code_hash: compute_hash(code),
+        };
+        let mut encoded = [0u8; Header::SIZE];
+        header.encode_into(&mut encoded);
+        out[..Header::SIZE].copy_from_slice(&encoded);
+        out[Header::SIZE..Header::SIZE + code.len()].copy_from_slice(code);
+        Header::SIZE + code.len()
+    }
+
+    fn mismatch_event() -> TapEvent {
+        TapEvent::from([
+            0, 0, 0, 1, 0x02, 0x05, 0, 1, 0x11, 0x11, 0, 1, 0x22, 0x22, 0, 1,
+        ])
+    }
+
+    #[test]
+    fn default_observe_vm_reports_tap_event() {
+        let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+        let epf = Epf::new(&mut storage);
+
+        let out = epf.run(mismatch_event());
+
+        assert_eq!(out.target(), Target::Observe);
+        assert_eq!(out.kind(), TRANSPORT_MISMATCH as u32);
+        assert_eq!(out.reason(), TRANSPORT_MISMATCH_SESSION as u32);
+        assert_eq!(out.arg0(), 0x1111_0001);
+        assert_eq!(out.arg1(), 0x2222_0001);
+        assert_eq!(out.arg2(), 0x0205_0001);
+        assert_eq!(out.fuel_used(), 6);
+    }
+
+    #[test]
+    fn load_replaces_observe_vm_without_public_slots() {
+        let code = [
+            ops::REQUIRE_INPUT_EQ,
+            3,
+            0x01,
+            0x00,
+            0x05,
+            0x02,
+            ops::LOAD_IMM,
+            0,
+            1,
+            0,
+            0,
+            0,
+            ops::LOAD_IMM,
+            1,
+            1,
+            0,
+            0,
+            0,
+            ops::LOAD_INPUT,
+            2,
+            0,
+            ops::LOAD_INPUT,
+            3,
+            1,
+            ops::LOAD_INPUT,
+            4,
+            2,
+            ops::EMIT,
+            0,
+            1,
+            2,
+            3,
+            4,
+            ops::HALT,
+        ];
+        let mut bytes = [0u8; 64];
+        let len = image(Target::Observe, &code, &mut bytes);
+        let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+        let epf = Epf::new(&mut storage);
+
+        let load = epf.load(&bytes[..len]).expect("load");
+        let out = epf.run(mismatch_event());
+
+        assert_eq!(load.target(), Target::Observe);
+        assert_eq!(out.epoch(), load.epoch());
+        assert_eq!(out.kind(), 1);
+        assert_eq!(out.reason(), 1);
+        assert_eq!(out.arg0(), 0x1111_0001);
+        assert_eq!(out.arg1(), 0x2222_0001);
+        assert_eq!(out.arg2(), 0);
+        assert_eq!(out.fuel_used(), 7);
+    }
+
+    #[test]
+    fn mismatched_filter_returns_quiet_out() {
+        let code = [
+            ops::REQUIRE_INPUT_EQ,
+            3,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            ops::EMIT,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let mut bytes = [0u8; 64];
+        let len = image(Target::Observe, &code, &mut bytes);
+        let mut storage = EpfStorage::<1, 64, 0, 4>::new();
+        let epf = Epf::new(&mut storage);
+
+        epf.load(&bytes[..len]).expect("load");
+        let out = epf.run(mismatch_event());
+
+        assert!(!out.emitted());
+        assert_eq!(out.fuel_used(), 1);
+    }
+}

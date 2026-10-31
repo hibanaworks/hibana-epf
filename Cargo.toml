@@ -11,7 +11,16 @@ readme = "README.md"
 
 [features]
 default = []
-std = ["hibana/std"]
+std = []
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "391eb241cb7c3afac26b9caebff62290438d8359", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "8792e63a067fea2d1acff45a66ba77fb5ec647a0", version = "=0.10.0", default-features = false }
+
+[[bin]]
+name = "hibana-epf"
+path = "src/bin/hibana-epf.rs"
+required-features = ["std"]
+
+[lints.rust]
+long_running_const_eval = "forbid"
+unsafe_op_in_unsafe_fn = "deny"
