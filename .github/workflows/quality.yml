@@ -56,4 +56,6 @@ jobs:
         if: always()
         with:
           name: commit-observation-proof
-          path: target/commit-observation-proof/
+          path: |
+            target/commit-observation-proof/
+            target/capture-sensitivity/

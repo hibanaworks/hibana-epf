@@ -127,6 +127,30 @@ certify that every observed operation was enabled. Missing records, counter
 exhaustion or a truncated stream cannot support a completed audit. Application
 effects require their own correspondence to accepted endpoint requests.
 
+`SCOPE_REENTRY` reports the scope actually reused by a progress commit, including
+the actor, logical view, session and full scope identifier. A roll record also
+names its entry source event; a route-only record names its selected arm. EPF
+can observe and filter these records. The `endpoint_observation` test drives
+inner and outer roll reentry and distinguishes them through the canonical
+record codec and an installed observation image. This adds execution context;
+it does not make filtered diagnostic output a complete history certificate.
+
+Save `tap.checkpoint()` independently when ending a capture. Then
+`Capture::new(records, checkpoint)` checks the full unfiltered prefix from that
+producer. It rejects missing first or final records, gaps, duplicates,
+reordering and exhausted ordinals without allocating or copying the history.
+An empty prefix at checkpoint zero is valid. A checked capture establishes
+record completeness relative to that trusted checkpoint, not a completed
+session, authentic records or dynamic protocol eligibility. Keep each
+producer's capture separate; ordinals are not a distributed clock.
+`proofs/Capture.lean` proves that the length and ordinal checks accept exactly
+the required ordinal prefix, reject a missing suffix and give it one end
+checkpoint. It specifies completeness of ordinals, not authenticity of record
+contents or protocol execution. Rust and Miri tests exercise the capture reader
+and actual Endpoint runs with overwritten or continuously drained tap records.
+Two defect controls omit either the count check or the ordinal check; each must
+fail its corresponding Rust regression test.
+
 `endpoint_history` drives a transport that exposes a unit frame before its
 send future completes. The actual receive commits before the sender's commit
 observation. It also checks both resolved arms and distinguishes the receiver's

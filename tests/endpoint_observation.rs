@@ -18,6 +18,134 @@ use hibana_epf::{Epf, EpfStorage, ImageSpec};
 
 struct LocalOnly;
 
+#[test]
+fn live_reentry_records_retain_the_exact_scope_through_epf_observation() {
+    type Tick = Msg<7, ()>;
+    type Tail = Msg<8, ()>;
+    let global = g::seq(g::send::<7, 7, Tick>().roll(), g::send::<7, 7, Tail>()).roll();
+    let program = project::<7>(&global);
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    let outer = snapshot
+        .iter()
+        .find(|row| {
+            row.id() == tap::PROJECTED_SCOPE
+                && row.causal_key() >> 13 == 1
+                && row.arg0() == 2
+                && row.arg1() & 3 == 2
+        })
+        .unwrap()
+        .causal_key();
+    let mut workspace = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
+    let _protocol = hibana_epf::Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut slab = [0; 8192];
+    let mut storage = SessionKitStorage::uninit();
+    let kit = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+    let mut endpoint = kit.enter(SessionId::new(96), &program).unwrap();
+    let mut records = kit.tap();
+    let mut captured: Vec<_> = records.by_ref().collect();
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let operation = core::pin::pin!(async {
+            endpoint.send::<Tick>(&()).await?;
+            captured.extend(records.by_ref());
+            endpoint.send::<Tick>(&()).await?;
+            captured.extend(records.by_ref());
+            endpoint.send::<Tail>(&()).await?;
+            captured.extend(records.by_ref());
+            endpoint.send::<Tick>(&()).await?;
+            captured.extend(records.by_ref());
+            endpoint.send::<Tail>(&()).await?;
+            captured.extend(records.by_ref());
+            Ok::<_, hibana::EndpointError>(())
+        });
+        assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+    assert!(
+        captured
+            .windows(2)
+            .all(|pair| pair[0].ts() + 1 == pair[1].ts())
+    );
+    let checkpoint = records.checkpoint();
+    let capture = hibana_epf::Capture::new(&captured, checkpoint).unwrap();
+    assert_eq!(capture.records().len(), captured.len());
+    assert!(matches!(
+        hibana_epf::Capture::new(&captured[..captured.len() - 1], checkpoint),
+        Err(hibana_epf::CaptureError::Length { .. }),
+    ));
+    let mut epf_storage = EpfStorage::<0, 64>::new();
+    let epf = Epf::new(&mut epf_storage);
+    let resets: Vec<_> = captured
+        .iter()
+        .filter(|record| record.id() == tap::SCOPE_REENTRY)
+        .collect();
+    assert_eq!(resets.len(), 2);
+    assert_ne!(resets[0].arg1(), resets[1].arg1());
+    assert_eq!(resets[1].arg1(), u32::from(outer) << 16);
+    for record in &resets {
+        let decoded = TapEvent::from(<[u8; 16]>::from(**record));
+        let observed = epf.run(decoded);
+        assert_eq!(observed.kind(), u32::from(tap::SCOPE_REENTRY));
+        assert_eq!(observed.arg0(), 96);
+        assert_eq!(observed.arg1(), record.arg1());
+        assert_eq!(observed.arg2(), (7 << 8) | 7);
+        assert_eq!(decoded.ts(), record.ts());
+    }
+    let mut image = [0; 64];
+    let len = ImageSpec::ObserveMatch {
+        input: 1,
+        value: u32::from(outer) << 16,
+        kind: u32::from(tap::SCOPE_REENTRY),
+        reason: 0,
+    }
+    .write(&mut image)
+    .unwrap();
+    epf.load(&image[..len]).unwrap();
+    for record in captured {
+        let observed = epf.run(record);
+        assert_eq!(observed.emitted(), record.arg1() == u32::from(outer) << 16,);
+    }
+}
+
+#[test]
+fn a_live_capture_accounts_for_overwrite_and_continuously_drained_records() {
+    type Tick = Msg<7, ()>;
+    let global = g::send::<7, 7, Tick>().roll();
+    let program = project::<7>(&global);
+    for drain in [false, true] {
+        let mut slab = [0; 8192];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+        let mut endpoint = kit.enter(SessionId::new(97), &program).unwrap();
+        let mut records = kit.tap();
+        let mut captured = Vec::new();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let operation = core::pin::pin!(async {
+                for _ in 0..129 {
+                    endpoint.send::<Tick>(&()).await?;
+                    if drain {
+                        captured.extend(records.by_ref());
+                    }
+                }
+                Ok::<_, hibana::EndpointError>(())
+            });
+            assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        captured.extend(records.by_ref());
+        let checked = hibana_epf::Capture::new(&captured, records.checkpoint());
+        if drain {
+            let checked = checked.unwrap();
+            assert!(checked.records().len() > 255);
+        } else {
+            assert!(captured[0].ts() > 0);
+            assert!(matches!(
+                checked,
+                Err(hibana_epf::CaptureError::Length { .. })
+            ));
+        }
+    }
+}
+
 impl Transport for LocalOnly {
     type Tx<'a> = ();
     type Rx<'a> = ();

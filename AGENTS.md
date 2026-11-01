@@ -33,6 +33,12 @@ or insufficient storage cannot produce a completed audit. Do not infer a
 successful commit from a staged transport frame. Do not infer that a roll has
 permanently ended because its continuation ran.
 
+Save a producer checkpoint independently from the record stream. Deriving it
+from the supplied record count hides missing suffixes. Check the complete,
+unfiltered prefix separately for each producer; neither EOF nor a checked
+capture proves session completion. A filtered diagnostic stream is not an
+audit capture, and producer ordinals are not a distributed clock.
+
 Derive the executable audit rules from Hibana's established source-occurrence
 semantics and check their correspondence to the exported compiled information.
 Use actual Endpoint traces and mutations of timing, choice, visit, actor and

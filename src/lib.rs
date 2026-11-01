@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
+mod capture;
 mod ops;
 mod protocol;
 mod verifier;
@@ -20,6 +21,7 @@ use hibana::runtime::{
     },
 };
 
+pub use capture::{Capture, CaptureError};
 pub use protocol::{Protocol, ProtocolError};
 pub use verifier::{Header, VerifyError, compute_hash};
 pub use vm::Trap;
