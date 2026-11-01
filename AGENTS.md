@@ -1,8 +1,14 @@
 # EPF verification boundary
 
-EPF observes and checks Hibana execution. It must not become an application's
-second protocol cursor, owner table, permission service or workflow scheduler.
-Audit history never authorizes an Endpoint operation or an application effect.
+EPF observes running Hibana programs and supplies decisions at registered
+resolver points. Preserve both capabilities. Hibana determines which view may
+resolve a route and when; EPF supplies left, right or rejection within that
+contract. Observing an event does not grant permission to modify its operation.
+
+Dynamic protocol auditing checks the observed history. It must not become an
+application's second protocol cursor, owner table, permission service or workflow
+scheduler. Audit history never authorizes an Endpoint operation or an
+application effect.
 
 Consume the immutable protocol actually compiled into the measured executable.
 Do not register a hand-written audit choreography, task-specific allowlist or

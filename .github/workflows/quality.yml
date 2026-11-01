@@ -1,0 +1,27 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust and embedded target
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup target add thumbv6m-none-eabi --toolchain stable
+          rustup toolchain install "$(cat tools/miri-toolchain)" --profile minimal --component miri --component rust-src
+      - name: Check native execution, no_std, and strict-provenance Miri
+        run: sh tools/check.sh

@@ -1,8 +1,10 @@
 # hibana-epf
 
-EPF processes Hibana observations while a program runs. The library uses
-`no_std`, no heap allocation and caller-owned storage. The optional command-line
-tool reads live or recorded observations and emits diagnostics.
+EPF observes running Hibana programs and controls registered route decisions.
+Observation programs process events; policy programs return left, right or
+rejection through Hibana's resolver API. The library uses `no_std`, no heap
+allocation and caller-owned storage. The optional command-line tool processes
+live or recorded observations and emits diagnostics.
 
 ## Observe a running endpoint
 
@@ -84,9 +86,19 @@ hibana-epf image session-mismatch --wrap -o observe.hepf
 hibana-epf recipes
 ```
 
-A policy image can supply a local resolver's decision through
-`epf.resolver::<ID>(fallback)?`. Register that resolver through Hibana's normal
-API. Capacity errors are reported at registration. Without an active policy
+A policy image supplies a local resolver's decision through
+`epf.resolver::<ID>(fallback)?`. Register it on the compiled program:
+
+```rust
+let global = g::route(left, right).resolve::<17>();
+let program = project::<ROLE>(&global);
+kit.set_resolver(&program, epf.resolver::<17>(fallback)?)?;
+```
+
+As execution proceeds, `epf.run(event)` updates the observed input available to
+policy programs. Endpoint operations still run directly in their localsides;
+EPF supplies a decision when Hibana invokes the registered resolver. Capacity
+errors are reported at registration. Without an active policy
 image, the registered fallback runs. Invalid decisions and VM traps reject the
 decision. A conditional policy whose input does not match also rejects; it does
 not wait or invoke the fallback. Hibana still checks which endpoint may choose
@@ -104,6 +116,15 @@ complete history. The current diagnostic VM does not replay that history or
 certify that every observed operation was enabled. Missing records, counter
 exhaustion or a truncated stream cannot support a completed audit. Application
 effects require their own correspondence to accepted endpoint requests.
+
+The current compiled-row observations also omit control structure. A single
+local send and that send inside `roll` have the same rows but disagree about
+whether a second call is permitted. Two local sends in `seq` and in `route`
+also have the same rows but disagree about executing the second after the
+first. `endpoint_observation` exercises both pairs through actual Endpoints.
+An auditor therefore needs the route and roll structure from the same sealed
+program, in addition to the row identities. Replaying row labels alone cannot
+establish dynamic eligibility, even when every observation is retained.
 
 ## Check locally
 

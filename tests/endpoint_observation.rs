@@ -14,7 +14,7 @@ use hibana::{
         tap::{self, TapEvent},
     },
 };
-use hibana_epf::{Epf, EpfStorage};
+use hibana_epf::{Epf, EpfStorage, ImageSpec};
 
 struct LocalOnly;
 
@@ -50,6 +50,207 @@ impl Transport for LocalOnly {
     fn requeue(&self, _: &mut ()) -> Result<(), TransportError> {
         panic!("no transport frame was received")
     }
+}
+
+#[test]
+fn loaded_epf_policies_control_live_endpoint_choices_across_roll_visits() {
+    type Left = Msg<7, ()>;
+    type Right = Msg<8, ()>;
+    let global = g::route(g::send::<0, 0, Left>(), g::send::<0, 0, Right>())
+        .resolve::<17>()
+        .roll();
+    let program = project::<0>(&global);
+    let mut epf_storage = EpfStorage::<1, 64>::new();
+    let epf = Epf::new(&mut epf_storage);
+    let resolver = epf
+        .resolver::<17>(ResolverRef::decision_state(&(), |_| {
+            panic!("an active policy must supply the decision")
+        }))
+        .unwrap();
+    let mut slab = [0; 8192];
+    let mut kit_storage = SessionKitStorage::uninit();
+    let kit = kit_storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+    kit.set_resolver(&program, resolver).unwrap();
+    let mut endpoint = kit.enter(SessionId::new(45), &program).unwrap();
+    let mut events = kit.tap();
+    let mut cx = Context::from_waker(Waker::noop());
+    while events.next().is_some() {}
+
+    for arm in [0, 1, 0] {
+        let mut image = [0; 64];
+        let len = ImageSpec::PolicyChoose { policy_id: 17, arm }
+            .write(&mut image)
+            .unwrap();
+        epf.load(&image[..len]).unwrap();
+        {
+            let mut operation = core::pin::pin!(async {
+                let branch = endpoint.offer().await.unwrap();
+                assert_eq!(branch.label(), if arm == 0 { 7 } else { 8 });
+                match branch.label() {
+                    7 => branch.recv::<Left>().await.unwrap(),
+                    8 => branch.recv::<Right>().await.unwrap(),
+                    label => panic!("unexpected branch {label}"),
+                };
+            });
+            assert!(matches!(operation.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        let batch: Vec<_> = events.by_ref().collect();
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|e| e.id() == tap::ENDPOINT_RECV)
+                .count(),
+            1
+        );
+        assert!(
+            batch.iter().any(|event| {
+                event.id() == tap::RESOLVER_AUDIT && event.causal_key() as u8 == arm
+            })
+        );
+        for event in batch {
+            let observed = epf.run(event);
+            assert!(observed.emitted());
+            assert_eq!(observed.arg0(), event.arg0());
+            assert_eq!(observed.arg1(), event.arg1());
+        }
+    }
+}
+
+#[test]
+fn observed_endpoint_input_can_choose_or_reject_the_next_registered_route() {
+    type Prefix = Msg<6, ()>;
+    type Left = Msg<7, ()>;
+    type Right = Msg<8, ()>;
+    let global = g::seq(
+        g::send::<0, 0, Prefix>(),
+        g::route(g::send::<0, 0, Left>(), g::send::<0, 0, Right>()).resolve::<17>(),
+    );
+    let program = project::<0>(&global);
+
+    for matches_input in [true, false] {
+        let mut epf_storage = EpfStorage::<1, 64>::new();
+        let epf = Epf::new(&mut epf_storage);
+        let resolver = epf
+            .resolver::<17>(ResolverRef::decision_state(&(), |_| {
+                panic!("a nonmatching active policy must reject")
+            }))
+            .unwrap();
+        let mut slab = [0; 8192];
+        let mut kit_storage = SessionKitStorage::uninit();
+        let kit = kit_storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+        kit.set_resolver(&program, resolver).unwrap();
+        let mut endpoint = kit.enter(SessionId::new(46), &program).unwrap();
+        let mut events = kit.tap();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let prefix = core::pin::pin!(endpoint.send::<Prefix>(&()));
+            assert!(matches!(prefix.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        let committed = events
+            .by_ref()
+            .find(|event| event.id() == tap::ENDPOINT_SEND)
+            .expect("the prefix must commit before the resolver runs");
+        assert_eq!(committed.arg0(), 46);
+        epf.run(committed);
+        while events.next().is_some() {}
+        let mut image = [0; 64];
+        let len = ImageSpec::PolicyChooseOnInput {
+            policy_id: 17,
+            input: 0,
+            value: if matches_input { 46 } else { 47 },
+            arm: 1,
+        }
+        .write(&mut image)
+        .unwrap();
+        epf.load(&image[..len]).unwrap();
+
+        {
+            let mut operation = core::pin::pin!(async {
+                match endpoint.offer().await {
+                    Ok(branch) => {
+                        assert!(matches_input);
+                        assert_eq!(branch.label(), 8);
+                        branch.recv::<Right>().await.unwrap();
+                    }
+                    Err(_) => assert!(!matches_input),
+                }
+            });
+            assert!(matches!(operation.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        let batch: Vec<_> = events.by_ref().collect();
+        assert!(batch.iter().any(|event| {
+            event.id() == tap::RESOLVER_AUDIT
+                && event.causal_key() as u8 == if matches_input { 1 } else { 0xff }
+        }));
+        assert_eq!(
+            batch
+                .iter()
+                .filter(|e| e.id() == tap::ENDPOINT_RECV)
+                .count(),
+            usize::from(matches_input)
+        );
+    }
+}
+
+#[test]
+fn flat_projected_rows_cannot_distinguish_a_finite_step_from_a_roll() {
+    type Step = Msg<19, ()>;
+    let finite = g::send::<0, 0, Step>();
+    let repeated = g::send::<0, 0, Step>().roll();
+    let finite = project::<0>(&finite);
+    let repeated = project::<0>(&repeated);
+    let finite_rows: Vec<[u8; 16]> = tap::projected(&finite).map(Into::into).collect();
+    let repeated_rows: Vec<[u8; 16]> = tap::projected(&repeated).map(Into::into).collect();
+    assert_eq!(finite_rows, repeated_rows);
+
+    let mut permitted = [false; 2];
+    for (index, program) in [&finite, &repeated].into_iter().enumerate() {
+        let mut slab = [0; 8192];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+        let mut endpoint = kit.enter(SessionId::new(43), program).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let first = core::pin::pin!(endpoint.send::<Step>(&()));
+            assert!(matches!(first.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        let second = core::pin::pin!(endpoint.send::<Step>(&()));
+        let second = second.poll(&mut cx);
+        assert!(second.is_ready(), "the second call must not wait");
+        permitted[index] = matches!(second, Poll::Ready(Ok(())));
+    }
+    assert_eq!(permitted, [false, true]);
+}
+
+#[test]
+fn flat_projected_rows_cannot_distinguish_sequence_from_choice() {
+    type First = Msg<20, ()>;
+    type Second = Msg<21, ()>;
+    let sequential = g::seq(g::send::<0, 0, First>(), g::send::<0, 0, Second>());
+    let alternative = g::route(g::send::<0, 0, First>(), g::send::<0, 0, Second>());
+    let sequential = project::<0>(&sequential);
+    let alternative = project::<0>(&alternative);
+    let sequential_rows: Vec<[u8; 16]> = tap::projected(&sequential).map(Into::into).collect();
+    let alternative_rows: Vec<[u8; 16]> = tap::projected(&alternative).map(Into::into).collect();
+    assert_eq!(sequential_rows, alternative_rows);
+
+    let mut permitted = [false; 2];
+    for (index, program) in [&sequential, &alternative].into_iter().enumerate() {
+        let mut slab = [0; 8192];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+        let mut endpoint = kit.enter(SessionId::new(44), program).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let first = core::pin::pin!(endpoint.send::<First>(&()));
+            assert!(matches!(first.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        let second = core::pin::pin!(endpoint.send::<Second>(&()));
+        let second = second.poll(&mut cx);
+        assert!(second.is_ready(), "the second call must not wait");
+        permitted[index] = matches!(second, Poll::Ready(Ok(())));
+    }
+    assert_eq!(permitted, [true, false]);
 }
 
 #[test]
