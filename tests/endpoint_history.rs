@@ -176,8 +176,21 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
     assert!(receipt < publication);
     let received = captured[receipt];
     let sent = captured[publication];
+    let source = tap::projected(&p0)
+        .find(|record| record.id() == tap::PROJECTED_SOURCE)
+        .unwrap();
+    assert_eq!(source.ts(), 0);
+    assert_eq!(source.arg0() >> 16, 1); // logical 0 -> 1
+    assert_eq!(source.arg0() as u8, 7);
+    assert_eq!(source.causal_key(), 0); // ordinary user wire message
+    assert_eq!(source.arg1(), 0); // canonical unit schema
     assert_eq!(received.arg0(), sent.arg0());
-    assert_eq!(received.arg1() & 0xffff, sent.arg1() & 0xffff);
+    for (record, actor, view, direction) in [(sent, 0, 0, 1), (received, 1, 1, 2)] {
+        assert_eq!(record.causal_key() >> 8, actor);
+        assert_eq!(record.causal_key() as u8, direction);
+        assert_eq!(record.arg1() >> 24, view);
+        assert_eq!(record.arg1() & 0xffff, source.ts());
+    }
     let mut epf_storage = EpfStorage::<0, 0>::new();
     let epf = Epf::new(&mut epf_storage);
     for record in &captured {

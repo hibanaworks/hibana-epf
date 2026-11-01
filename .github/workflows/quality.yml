@@ -23,5 +23,37 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup target add thumbv6m-none-eabi --toolchain stable
           rustup toolchain install "$(cat tools/miri-toolchain)" --profile minimal --component miri --component rust-src
-      - name: Check native execution, no_std, and strict-provenance Miri
+      - name: Install the selected core's Lean compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          core_manifest="$(cargo +stable metadata --locked --format-version 1 | jq -r '.packages[] | select(.name == "hibana") | .manifest_path')"
+          toolchain="$(cat "$(dirname "$core_manifest")/proofs/lean/lean-toolchain")"
+          case "$(uname -m)" in
+            arm64|aarch64)
+              elan_asset=elan-aarch64-apple-darwin.tar.gz
+              elan_hash=7cae4c03b2f0de4053fb04a91359d5804551e6e37a6ddd1b2e0097dc561ae4a9
+              ;;
+            x86_64)
+              elan_asset=elan-x86_64-apple-darwin.tar.gz
+              elan_hash=10d037a69731c0593723e018130c5f54afde175796b4af8ba1317e561e55598c
+              ;;
+            *) exit 1 ;;
+          esac
+          epf_elan_tmp="$(mktemp -d)"
+          trap 'rm -r -- "$epf_elan_tmp"' EXIT
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/leanprover/elan/releases/download/v4.2.3/$elan_asset" \
+            -o "$epf_elan_tmp/elan.tar.gz"
+          printf '%s  %s\n' "$elan_hash" "$epf_elan_tmp/elan.tar.gz" | shasum -a 256 --check
+          tar -xzf "$epf_elan_tmp/elan.tar.gz" -C "$epf_elan_tmp"
+          "$epf_elan_tmp/elan-init" -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          "$HOME/.elan/bin/elan" toolchain install "$toolchain"
+      - name: Check execution, no_std, Miri, and source observation proofs
         run: sh tools/check.sh
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: commit-observation-proof
+          path: target/commit-observation-proof/

@@ -11,3 +11,4 @@ cargo +stable build --locked --lib --no-default-features --target thumbv6m-none-
 export MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-strict-provenance"
 cargo +"$(cat tools/miri-toolchain)" miri test --locked \
     --lib --test production_path --test endpoint_observation --test endpoint_history --test protocol -- --test-threads=1
+bash tools/check_proofs.sh

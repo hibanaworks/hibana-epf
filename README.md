@@ -134,6 +134,17 @@ learned selection from the sender's resolver decision. These are legal history
 fixtures for the auditor; a send-publication-before-receive rule would reject
 them. They do not implement or certify the history replay described above.
 
+`proofs/CommitObservations.lean` erases acceptance points from Hibana's existing
+source-occurrence semantics. It proves that the ordinary-message fixture has
+valid source executions in either completion order, and that a receipt still
+requires acceptance. Omitting that acceptance leaves the same endpoint-only
+projection. The other claim is a general append law for this projection.
+These seven claims specify the observation boundary; they do not establish
+general Rust-to-source trace refinement. The local gate imports the model from
+the exact core selected in Cargo metadata, checks its revision and source
+hashes, and audits the Lean axioms. Install that core's `proofs/lean/lean-toolchain`
+with elan before running the gate. CI installs the same compiler.
+
 Local operation rows alone omit control structure. A single
 local send and that send inside `roll` have the same rows but disagree about
 whether a second call is permitted. Two local sends in `seq` and in `route`
