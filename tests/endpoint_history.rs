@@ -145,6 +145,17 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
     let mut sending = core::pin::pin!(sender.send::<Message>(&()));
     assert!(sending.as_mut().poll(&mut cx).is_pending());
     captured.extend(records.by_ref());
+    let first_poll = *captured
+        .iter()
+        .find(|record| record.id() == tap::SEND_POLL)
+        .expect("a checked send is observed before exposing its frame");
+    assert_eq!(first_poll.causal_key(), 0); // actor 0, logical view 0
+    assert_eq!(first_poll.arg0(), 93);
+    assert_eq!(first_poll.arg1(), 0xffff_0000); // no reset, source event 0
+    assert_eq!(
+        first_poll.evidence().input(),
+        [93, 0xffff_0000, first_poll.ts(), 0]
+    );
     assert!(
         !captured
             .iter()
@@ -174,6 +185,15 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
         .position(|record| record.id() == tap::ENDPOINT_SEND)
         .unwrap();
     assert!(receipt < publication);
+    let polls: Vec<_> = captured
+        .iter()
+        .filter(|record| record.id() == tap::SEND_POLL)
+        .collect();
+    assert_eq!(polls.len(), 2);
+    assert!(first_poll.ts() < captured[receipt].ts());
+    assert!(captured[receipt].ts() < polls[1].ts());
+    assert!(polls[1].ts() < captured[publication].ts());
+    assert_eq!(polls[0].arg1(), polls[1].arg1());
     let received = captured[receipt];
     let sent = captured[publication];
     let source = tap::projected(&p0)
@@ -191,7 +211,7 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
         assert_eq!(record.arg1() >> 24, view);
         assert_eq!(record.arg1() & 0xffff, source.ts());
     }
-    let mut epf_storage = EpfStorage::<0, 0>::new();
+    let mut epf_storage = EpfStorage::<0, 128>::new();
     let epf = Epf::new(&mut epf_storage);
     for record in &captured {
         let decoded = TapEvent::from(<[u8; 16]>::from(*record));
@@ -201,11 +221,157 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
         assert_eq!(out.arg1(), record.arg1());
         assert_eq!(decoded.ts(), record.ts());
     }
+    let mut image = [0; 128];
+    let len = hibana_epf::ImageSpec::ObserveMatch {
+        input: 1,
+        value: 0xffff_0000,
+        kind: u32::from(tap::SEND_POLL),
+        reason: 0,
+    }
+    .write(&mut image)
+    .unwrap();
+    epf.load(&image[..len]).unwrap();
+    for record in &captured {
+        let out = epf.run(*record);
+        assert_eq!(out.emitted(), record.id() == tap::SEND_POLL);
+        if out.emitted() {
+            assert_eq!(out.arg0(), 93);
+            assert_eq!(out.arg1(), 0xffff_0000);
+            assert_eq!(out.arg2(), 0); // actor 0, logical view 0
+        }
+    }
+    hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
     assert!(
         captured
             .windows(2)
             .all(|records| records[0].ts() + 1 == records[1].ts())
     );
+}
+
+#[test]
+fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame() {
+    type Gate = Msg<6, ()>;
+    type Message = Msg<7, ()>;
+    let global = g::seq(g::send::<0, 0, Gate>(), g::send::<0, 1, Message>());
+    let p0 = project::<0>(&global);
+    let p1 = project::<1>(&global);
+    for early in [true, false] {
+        let mut slab = [0; 8192];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                DelayedPublication {
+                    inbox: Cell::new(Ok(None)),
+                    reader: Cell::new(None),
+                },
+            )
+            .unwrap();
+        let mut sender = kit.enter(SessionId::new(98), &p0).unwrap();
+        let mut receiver = kit.enter(SessionId::new(98), &p1).unwrap();
+        let mut records = kit.tap();
+        let mut captured: Vec<_> = records.by_ref().collect();
+        let mut cx = Context::from_waker(Waker::noop());
+        if early {
+            let operation = core::pin::pin!(sender.send::<Message>(&()));
+            let Poll::Ready(Err(error)) = operation.poll(&mut cx) else {
+                panic!("an early send must fail before transport admission")
+            };
+            assert!(format!("{error:?}").contains("OutOfOrder"));
+            let operation = core::pin::pin!(receiver.recv::<Message>());
+            assert!(!matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+            captured.extend(records.by_ref());
+            assert!(!captured.iter().any(|record| matches!(
+                record.id(),
+                tap::ENDPOINT_SEND | tap::ENDPOINT_RECV | tap::TRANSPORT_FRAME | tap::SEND_POLL
+            )));
+        } else {
+            {
+                let operation = core::pin::pin!(sender.send::<Gate>(&()));
+                assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+            }
+            let mut sending = core::pin::pin!(sender.send::<Message>(&()));
+            assert!(sending.as_mut().poll(&mut cx).is_pending());
+            captured.extend(records.by_ref());
+            let gate = captured
+                .iter()
+                .find(|record| record.id() == tap::ENDPOINT_SEND)
+                .unwrap();
+            let poll = captured
+                .iter()
+                .find(|record| record.id() == tap::SEND_POLL)
+                .unwrap();
+            assert!(gate.ts() < poll.ts());
+            assert_eq!(gate.arg1() & 0xffff, 0);
+            assert_eq!(poll.arg1(), 0xffff_0001);
+            assert!(!captured.iter().any(|record| {
+                record.id() == tap::ENDPOINT_SEND && record.arg1() & 0xffff == 1
+            }));
+            {
+                let receiving = core::pin::pin!(receiver.recv::<Message>());
+                assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+            }
+            assert!(matches!(
+                sending.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            captured.extend(records.by_ref());
+            let commits: Vec<_> = captured
+                .iter()
+                .filter(|record| matches!(record.id(), tap::ENDPOINT_SEND | tap::ENDPOINT_RECV))
+                .map(|record| (record.arg1() & 0xffff, record.causal_key() as u8))
+                .collect();
+            assert_eq!(commits, [(0, 1), (1, 2), (1, 1)]);
+        }
+        hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
+    }
+}
+
+#[test]
+fn an_observed_send_poll_can_end_in_a_transport_error_without_a_commit() {
+    type Message = Msg<7, ()>;
+    let global = g::send::<0, 1, Message>();
+    let program = project::<0>(&global);
+    for error in [
+        TransportError::Offline,
+        TransportError::Deadline,
+        TransportError::Capacity,
+        TransportError::Failed,
+    ] {
+        let mut slab = [0; 8192];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                DelayedPublication {
+                    inbox: Cell::new(Err(error)),
+                    reader: Cell::new(None),
+                },
+            )
+            .unwrap();
+        let mut sender = kit.enter(SessionId::new(99), &program).unwrap();
+        let mut records = kit.tap();
+        let mut captured: Vec<_> = records.by_ref().collect();
+        let mut cx = Context::from_waker(Waker::noop());
+        let operation = core::pin::pin!(sender.send::<Message>(&()));
+        assert!(matches!(operation.poll(&mut cx), Poll::Ready(Err(_))));
+        captured.extend(records.by_ref());
+        let polls: Vec<_> = captured
+            .iter()
+            .filter(|record| record.id() == tap::SEND_POLL)
+            .collect();
+        assert_eq!(polls.len(), 1, "{error:?}");
+        assert_eq!(polls[0].causal_key(), 0);
+        assert_eq!(polls[0].arg0(), 99);
+        assert_eq!(polls[0].arg1(), 0xffff_0000);
+        assert!(!captured.iter().any(|record| matches!(
+            record.id(),
+            tap::ENDPOINT_SEND | tap::ENDPOINT_RECV | tap::TRANSPORT_FRAME | tap::SCOPE_REENTRY
+        )));
+        hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
+    }
 }
 
 #[test]
@@ -246,6 +412,16 @@ fn learning_a_resolved_choice_is_distinct_from_invoking_its_resolver() {
         });
         assert!(sending.as_mut().poll(&mut cx).is_pending());
         captured.extend(records.by_ref());
+        let attempt = captured
+            .iter()
+            .find(|record| record.id() == tap::SEND_POLL)
+            .unwrap();
+        assert_eq!(attempt.causal_key(), 0);
+        assert_eq!(attempt.arg0(), 94);
+        assert_eq!(
+            attempt.arg1() & 0xffff,
+            u32::from(selected == DecisionArm::Right)
+        );
         {
             let receiving = core::pin::pin!(async {
                 let branch = receiver.offer().await?;

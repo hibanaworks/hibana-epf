@@ -73,6 +73,11 @@ Observation images receive the ordinal in input word 2. Committed Endpoint
 records identify the executing actor, logical role, lane and full source-event
 number using Hibana's field layout. The image schema binds these interpretations;
 an image for an older layout is rejected before replacing the active program.
+`SEND_POLL` is emitted after source admission and encoding, immediately before
+each actual transport send poll. It names the actor, logical view, session,
+source event and prepared repetition reset. It is available even when the poll
+returns `Pending`. Repeated polls can describe the same outstanding operation;
+they do not count accepted frames, completed sends or new roll visits.
 Route selections identify the actor applying or learning the selection;
 resolver decisions identify the actor invoking the resolver. Match the route
 site to the compiled choice row to obtain the logical controller. An incoming
@@ -153,8 +158,14 @@ fail its corresponding Rust regression test.
 
 `endpoint_history` drives a transport that exposes a unit frame before its
 send future completes. The actual receive commits before the sender's commit
-observation. It also checks both resolved arms and distinguishes the receiver's
-learned selection from the sender's resolver decision. These are legal history
+observation, between two send-poll records for the same operation. An installed
+observation filter retains their full checked-operation identity. An ordered
+fixture also checks that its local predecessor commits before the first poll;
+an out-of-order send emits neither a send-poll record nor a frame. The tests
+exercise all four transport errors after an observed poll and require no frame
+or Endpoint commit. Observing a checked poll therefore cannot substitute for
+evidence of acceptance. The tests also check both resolved arms and distinguish
+the receiver's learned selection from the sender's resolver decision. These are legal history
 fixtures for the auditor; a send-publication-before-receive rule would reject
 them. They do not implement or certify the history replay described above.
 
@@ -163,7 +174,13 @@ source-occurrence semantics. It proves that the ordinary-message fixture has
 valid source executions in either completion order, and that a receipt still
 requires acceptance. Omitting that acceptance leaves the same endpoint-only
 projection. The other claim is a general append law for this projection.
-These seven claims specify the observation boundary; they do not establish
+The ordered-send regression adds a local predecessor. A legal word sends after
+that predecessor, while an early-send word violates its first readiness check.
+If publication is delayed until after the predecessor, both words have exactly
+the same complete endpoint-commit projection. A replay that invents acceptance
+at publication cannot detect this early-send violation. Checking admission needs
+evidence from before the frame can become available to a receiver.
+These ten claims specify the observation boundary; they do not establish
 general Rust-to-source trace refinement. The local gate imports the model from
 the exact core selected in Cargo metadata, checks its revision and source
 hashes, and audits the Lean axioms. Install that core's `proofs/lean/lean-toolchain`

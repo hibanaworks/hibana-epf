@@ -26,6 +26,9 @@ Dynamic checking must distinguish the session run, physical actor, source
 operation occurrence, route selection and nested roll visits. Transport
 acceptance, sender publication and receiver commit are separate boundaries;
 sender publication can follow receipt and later transfers.
+`SEND_POLL` records admission before an actual transport poll, including polls
+that return Pending or an error. Repeated polls can belong to one operation.
+Do not convert these records into frame acceptances, commits or roll visits.
 
 Require evidence that uniquely connects those boundaries. A missing prefix,
 ring overwrite, missing final record, ambiguous occurrence, exhausted counter

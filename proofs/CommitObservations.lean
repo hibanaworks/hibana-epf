@@ -76,6 +76,51 @@ theorem omitting_acceptance_has_the_same_endpoint_projection :
     endpointCommits receiveFirst =
       endpointCommits [.committed ⟨0, .receive⟩, .committed ⟨0, .send⟩] := rfl
 
+private def gate : Message := ⟨⟨0, 0⟩, ⟨0, 0⟩, 6, .wire 0⟩
+private def orderedSource : Source := .seq (.send gate) (.send message)
+private def orderedBindings : List (Nat × Binding) :=
+  [(0, ⟨gate, 0, 0⟩), (1, ⟨message, 0, 1⟩)]
+private def orderedNormalization : Normalization := ⟨[], [⟨[], orderedBindings⟩]⟩
+private def orderedPlan : SourceOccurrenceCut orderedSource := {
+  original := orderedNormalization
+  originalAccepted := by decide
+  expanded := orderedSource
+  unfolding := .seq (.send gate) (.send message)
+  normalized := orderedNormalization
+  accepted := by decide
+  sameIssuance := rfl
+  path := ⟨[], orderedBindings⟩
+  selected := by decide
+  guarded := by decide
+  observed := fun _ => false
+}
+private def authorizedSend : List SourcePoint := [
+  .committed ⟨0, .local⟩, .accepted 1,
+  .committed ⟨1, .receive⟩, .committed ⟨1, .send⟩]
+private def earlySend : List SourcePoint := [
+  .accepted 1, .committed ⟨0, .local⟩,
+  .committed ⟨1, .receive⟩, .committed ⟨1, .send⟩]
+
+theorem a_send_after_its_source_predecessor_has_a_complete_execution :
+    SourceOccurrenceExecution (occurrenceCut orderedPlan [])
+      (occurrenceCut orderedPlan authorizedSend) authorizedSend := by
+  have first := a_checked_occurrence_call_appends_exactly_its_source_point
+    orderedPlan [] (.committed ⟨0, .local⟩) (by decide)
+  have second := a_checked_occurrence_call_appends_exactly_its_source_point
+    orderedPlan [.committed ⟨0, .local⟩] (.accepted 1) (by decide)
+  have third := a_checked_occurrence_call_appends_exactly_its_source_point
+    orderedPlan [.committed ⟨0, .local⟩, .accepted 1] (.committed ⟨1, .receive⟩) (by decide)
+  have fourth := a_checked_occurrence_call_appends_exactly_its_source_point
+    orderedPlan [.committed ⟨0, .local⟩, .accepted 1, .committed ⟨1, .receive⟩]
+    (.committed ⟨1, .send⟩) (by decide)
+  exact .tail (.tail (.tail (.tail .nil first) second) third) fourth
+
+theorem sending_before_that_predecessor_fails_the_source_check :
+    (occurrenceCut orderedPlan []).ready (.accepted 1) = false := by decide
+
+theorem delayed_publication_can_hide_an_early_send_in_the_commit_projection :
+    endpointCommits authorizedSend = endpointCommits earlySend := rfl
+
 #print axioms endpoint_projection_preserves_append
 #print axioms acceptance_enables_both_completion_sides
 #print axioms a_receipt_needs_acceptance
@@ -83,5 +128,8 @@ theorem omitting_acceptance_has_the_same_endpoint_projection :
 #print axioms publication_before_receiver_has_a_source_execution
 #print axioms a_legal_endpoint_projection_can_start_with_receipt
 #print axioms omitting_acceptance_has_the_same_endpoint_projection
+#print axioms a_send_after_its_source_predecessor_has_a_complete_execution
+#print axioms sending_before_that_predecessor_fails_the_source_check
+#print axioms delayed_publication_can_hide_an_early_send_in_the_commit_projection
 
 end Hibana.Epf

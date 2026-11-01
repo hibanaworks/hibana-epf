@@ -30,9 +30,9 @@ bash "$core/.github/scripts/lib/lean_audit_tool.sh" build-serial \
   "$core/proofs/lean" --native Hibana.SourceOccurrenceTrace
 LEAN_PATH="$core/proofs/lean/.lake/build/lib/lean" \
   lean proofs/CommitObservations.lean 2>&1 | tee "$out/lean.log"
-bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/lean.log" 7
+bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/lean.log" 10
 lean proofs/Capture.lean 2>&1 | tee "$out/capture-lean.log"
 bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/capture-lean.log" 4
 shasum -a 256 --check "$out/source.sha256" > "$out/source-check.log"
 (cd "$core" && shasum -a 256 --check "$out/core-source.sha256") > "$out/core-source-check.log"
-echo "Observation proofs: seven source boundary claims and four complete-prefix claims"
+echo "Observation proofs: ten source boundary claims and four complete-prefix claims"
