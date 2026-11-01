@@ -73,10 +73,12 @@ Observation images receive the ordinal in input word 2. Committed Endpoint
 records identify the executing actor, logical role, lane and full source-event
 number using Hibana's field layout. The image schema binds these interpretations;
 an image for an older layout is rejected before replacing the active program.
-Route selections and resolver decisions also identify their executing actor.
-Match their route site to the compiled choice row to obtain the logical
-controller. A delegated controller can be operated by a different actor;
-rejected decisions retain that actor even without a later Endpoint commit.
+Route selections identify the actor applying or learning the selection;
+resolver decisions identify the actor invoking the resolver. Match the route
+site to the compiled choice row to obtain the logical controller. An incoming
+frame can teach a passive receiver the arm without giving it control of the
+choice. A delegated controller can be operated by a different actor. Rejected
+resolver decisions retain that actor even without a later Endpoint commit.
 The input format is versioned by the EPF image's evidence schema. Raw tap
 records have no format header, so retain their runtime revision and build
 receipt when saving a capture.
@@ -124,6 +126,13 @@ complete history. The current diagnostic VM does not replay that history or
 certify that every observed operation was enabled. Missing records, counter
 exhaustion or a truncated stream cannot support a completed audit. Application
 effects require their own correspondence to accepted endpoint requests.
+
+`endpoint_history` drives a transport that exposes a unit frame before its
+send future completes. The actual receive commits before the sender's commit
+observation. It also checks both resolved arms and distinguishes the receiver's
+learned selection from the sender's resolver decision. These are legal history
+fixtures for the auditor; a send-publication-before-receive rule would reject
+them. They do not implement or certify the history replay described above.
 
 Local operation rows alone omit control structure. A single
 local send and that send inside `roll` have the same rows but disagree about

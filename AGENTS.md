@@ -5,6 +5,11 @@ resolver points. Preserve both capabilities. Hibana determines which view may
 resolve a route and when; EPF supplies left, right or rejection within that
 contract. Observing an event does not grant permission to modify its operation.
 
+A route-selection record can describe a passive receiver learning the arm.
+Its actor is not necessarily the logical controller. Resolver audit records
+describe actual resolver invocations; check the selection mechanism and the
+compiled choice authority before interpreting either record as a decision.
+
 Dynamic protocol auditing checks the observed history. It must not become an
 application's second protocol cursor, owner table, permission service or workflow
 scheduler. Audit history never authorizes an Endpoint operation or an
