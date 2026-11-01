@@ -135,6 +135,15 @@ Replaying row labels alone cannot establish dynamic eligibility, even when
 every observation is retained. The source snapshot and history replay still
 need to be connected before EPF can certify an execution.
 
+`Protocol::new(snapshot, workspace)` checks that input before history replay.
+It borrows the original snapshot and releases its temporary workspace after
+checking section counts, scope intervals, choice and actor references, initial
+issuance and local-operation coverage. `Protocol::workspace_len(snapshot)`
+derives the workspace size from the declared markers and actor decisions.
+The reader handles nested `par`/`route`/`roll` and multiple delegated resources.
+It checks the actor bindings supplied by the compiler; it does not prove their
+derivation from the Rust global or check a dynamic execution history.
+
 ## Check locally
 
 ```sh

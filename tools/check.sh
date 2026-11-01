@@ -10,4 +10,4 @@ cargo +stable build --locked --lib --no-default-features
 cargo +stable build --locked --lib --no-default-features --target thumbv6m-none-eabi
 export MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-strict-provenance"
 cargo +"$(cat tools/miri-toolchain)" miri test --locked \
-    --lib --test production_path --test endpoint_observation -- --test-threads=1
+    --lib --test production_path --test endpoint_observation --test protocol -- --test-threads=1
