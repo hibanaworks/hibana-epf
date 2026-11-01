@@ -57,13 +57,13 @@ fn loaded_epf_policies_control_live_endpoint_choices_across_roll_visits() {
     type Left = Msg<7, ()>;
     type Right = Msg<8, ()>;
     let global = g::route(g::send::<0, 0, Left>(), g::send::<0, 0, Right>())
-        .resolve::<17>()
+        .resolve::<{ u16::MAX }>()
         .roll();
     let program = project::<0>(&global);
     let mut epf_storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut epf_storage);
     let resolver = epf
-        .resolver::<17>(ResolverRef::decision_state(&(), |_| {
+        .resolver::<{ u16::MAX }>(ResolverRef::decision_state(&(), |_| {
             panic!("an active policy must supply the decision")
         }))
         .unwrap();
@@ -78,9 +78,12 @@ fn loaded_epf_policies_control_live_endpoint_choices_across_roll_visits() {
 
     for arm in [0, 1, 0] {
         let mut image = [0; 64];
-        let len = ImageSpec::PolicyChoose { policy_id: 17, arm }
-            .write(&mut image)
-            .unwrap();
+        let len = ImageSpec::PolicyChoose {
+            policy_id: u16::MAX,
+            arm,
+        }
+        .write(&mut image)
+        .unwrap();
         epf.load(&image[..len]).unwrap();
         {
             let mut operation = core::pin::pin!(async {

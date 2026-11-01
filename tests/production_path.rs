@@ -311,7 +311,7 @@ fn fallback_left() -> Result<DecisionArm, ResolverError> {
 }
 
 #[test]
-fn resolver_configuration_reports_missing_capacity_and_reserved_ids() {
+fn resolver_configuration_reports_exhausted_capacity_without_reserving_a_policy_id() {
     let mut empty_storage = EpfStorage::<0, 64>::new();
     let empty = Epf::new(&mut empty_storage);
     assert!(matches!(
@@ -320,14 +320,19 @@ fn resolver_configuration_reports_missing_capacity_and_reserved_ids() {
     ));
     let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
+    let resolver = epf
+        .resolver::<{ u16::MAX }>(ResolverRef::decision_state(&(), |_| fallback_left()))
+        .expect("Hibana permits every u16 resolver identifier");
+    assert_eq!(resolver.decide(), Ok(DecisionArm::Left));
     assert!(
         epf.resolver::<{ u16::MAX }>(ResolverRef::decision_state(&(), |_| fallback_left()))
-            .is_err()
+            .is_ok(),
+        "registering the same identifier must reuse its slot"
     );
-    assert!(
-        epf.resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left()))
-            .is_ok()
-    );
+    assert!(matches!(
+        epf.resolver::<7>(ResolverRef::decision_state(&(), |_| fallback_left())),
+        Err(hibana_epf::Error::PolicySlotUnavailable { policy_id: 7 })
+    ));
 }
 
 #[test]
@@ -420,14 +425,61 @@ fn production_policy_vm_trap_fails_closed_without_silent_fallback() {
 }
 
 #[test]
-fn production_policy_image_rejects_static_policy_sentinel() {
-    let code = [0xff];
+fn production_policy_image_preserves_the_largest_resolver_identifier() {
     let mut image = [0u8; 64];
-    let len = encode_image(Target::Policy(u16::MAX), &code, &mut image);
-    let mut storage = EpfStorage::<1, 64>::new();
+    let len = ImageSpec::PolicyChoose {
+        policy_id: u16::MAX,
+        arm: 1,
+    }
+    .write(&mut image)
+    .unwrap();
+    let mut storage = EpfStorage::<2, 64>::new();
     let epf = Epf::new(&mut storage);
 
-    assert!(epf.load(&image[..len]).is_err());
+    let resolver = epf
+        .resolver::<{ u16::MAX }>(ResolverRef::decision_state(&(), |_| fallback_left()))
+        .unwrap();
+    let zero = epf
+        .resolver::<0>(ResolverRef::decision_state(&(), |_| Ok(DecisionArm::Right)))
+        .unwrap();
+    let mut other_image = [0u8; 64];
+    let other_len = ImageSpec::PolicyChoose {
+        policy_id: 0,
+        arm: 0,
+    }
+    .write(&mut other_image)
+    .unwrap();
+    epf.load(&other_image[..other_len]).unwrap();
+    let loaded = epf.load(&image[..len]).unwrap();
+    assert_eq!(loaded.target(), Target::Policy(u16::MAX));
+    assert_eq!(resolver.decide(), Ok(DecisionArm::Right));
+    assert_eq!(zero.decide(), Ok(DecisionArm::Left));
+
+    let len = ImageSpec::PolicyChoose {
+        policy_id: u16::MAX,
+        arm: 0,
+    }
+    .write(&mut image)
+    .unwrap();
+    epf.load(&image[..len]).unwrap();
+    assert_eq!(resolver.decide(), Ok(DecisionArm::Left));
+    epf.revert(Target::Policy(u16::MAX)).unwrap();
+    assert_eq!(resolver.decide(), Ok(DecisionArm::Right));
+    epf.unload(Target::Policy(u16::MAX)).unwrap();
+    assert_eq!(resolver.decide(), Ok(DecisionArm::Left));
+    assert_eq!(zero.decide(), Ok(DecisionArm::Left));
+}
+
+#[test]
+fn target_encoding_preserves_every_u16_resolver_identifier() {
+    for policy_id in 0..=u16::MAX {
+        let target = Target::Policy(policy_id);
+        let (kind, encoded) = target.encode();
+        assert_eq!(Target::decode(kind, encoded), Ok(target));
+    }
+    assert_eq!(Target::decode(0, 0), Ok(Target::Observe));
+    assert!(Target::decode(0, 1).is_err());
+    assert!(Target::decode(2, 0).is_err());
 }
 
 #[test]

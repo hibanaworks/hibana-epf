@@ -98,7 +98,8 @@ kit.set_resolver(&program, epf.resolver::<17>(fallback)?)?;
 As execution proceeds, `epf.run(event)` updates the observed input available to
 policy programs. Endpoint operations still run directly in their localsides;
 EPF supplies a decision when Hibana invokes the registered resolver. Capacity
-errors are reported at registration. Without an active policy
+errors are reported at registration. Policy IDs use Hibana's full `u16` range.
+Without an active policy
 image, the registered fallback runs. Invalid decisions and VM traps reject the
 decision. A conditional policy whose input does not match also rejects; it does
 not wait or invoke the fallback. Hibana still checks which endpoint may choose

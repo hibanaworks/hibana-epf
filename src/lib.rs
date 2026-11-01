@@ -28,7 +28,6 @@ pub const EVIDENCE_SCHEMA_HASH: u32 = 0x4845_0003;
 const RESOLVER_STORAGE_WORDS: usize =
     size_of::<ResolverRef<'static, 0>>().div_ceil(size_of::<usize>());
 
-const EMPTY_POLICY_ID: u16 = u16::MAX;
 const DEFAULT_OBSERVE_FUEL: u16 = 16;
 
 /// Policy VM `Out.kind`: choose the arm encoded in `Out.arg0`.
@@ -122,7 +121,7 @@ impl Target {
     pub const fn decode(kind: u8, policy_id: u16) -> Result<Self, VerifyError> {
         match kind {
             0 if policy_id == 0 => Ok(Self::Observe),
-            1 if policy_id != EMPTY_POLICY_ID => Ok(Self::Policy(policy_id)),
+            1 => Ok(Self::Policy(policy_id)),
             _ => Err(VerifyError::UnsupportedTarget { kind, policy_id }),
         }
     }
@@ -347,7 +346,7 @@ impl ImageSpec {
                 capacity: out.len(),
             });
         }
-        let target = self.target()?;
+        let target = self.target();
         let code_len = {
             let mut writer = CodeWriter::new(&mut out[Header::SIZE..]);
             self.write_code(&mut writer)?;
@@ -372,19 +371,15 @@ impl ImageSpec {
         Ok(total)
     }
 
-    fn target(self) -> Result<Target, ImageBuildError> {
+    fn target(self) -> Target {
         match self {
             Self::ObserveEcho
             | Self::ObserveSessionMismatch
             | Self::ObserveDeadlineFault
             | Self::ObserveCapacityFault
-            | Self::ObserveMatch { .. } => Ok(Target::Observe),
+            | Self::ObserveMatch { .. } => Target::Observe,
             Self::PolicyChoose { policy_id, .. } | Self::PolicyChooseOnInput { policy_id, .. } => {
-                if policy_id == EMPTY_POLICY_ID {
-                    Err(ImageBuildError::InvalidPolicyId { policy_id })
-                } else {
-                    Ok(Target::Policy(policy_id))
-                }
+                Target::Policy(policy_id)
             }
         }
     }
@@ -588,7 +583,6 @@ pub enum ImageBuildError {
     CodeTooLong { len: usize },
     InvalidInputIndex { input: u8 },
     InvalidArm { arm: u8 },
-    InvalidPolicyId { policy_id: u16 },
     ZeroFuel,
 }
 
@@ -1034,39 +1028,33 @@ impl<'cfg, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize>
         &mut self,
         policy_id: u16,
     ) -> Result<&mut PolicySlot<'cfg, IMAGE_BYTES>, Error> {
-        Target::decode(1, policy_id)?;
         let mut empty = None;
         let mut idx = 0usize;
         while idx < self.policies.len() {
-            if self.policies[idx].policy_id == policy_id {
+            if self.policies[idx].policy_id == Some(policy_id) {
                 return Ok(&mut self.policies[idx]);
             }
-            if self.policies[idx].policy_id == EMPTY_POLICY_ID && empty.is_none() {
+            if self.policies[idx].policy_id.is_none() && empty.is_none() {
                 empty = Some(idx);
             }
             idx += 1;
         }
         if let Some(idx) = empty {
-            self.policies[idx].policy_id = policy_id;
+            self.policies[idx].policy_id = Some(policy_id);
             return Ok(&mut self.policies[idx]);
         }
         Err(Error::PolicySlotUnavailable { policy_id })
     }
 
-    fn policy_slot_mut(
-        &mut self,
-        policy_id: u16,
-    ) -> Result<Option<&mut PolicySlot<'cfg, IMAGE_BYTES>>, Error> {
-        Target::decode(1, policy_id)?;
-        Ok(self
-            .policies
+    fn policy_slot_mut(&mut self, policy_id: u16) -> Option<&mut PolicySlot<'cfg, IMAGE_BYTES>> {
+        self.policies
             .iter_mut()
-            .find(|slot| slot.policy_id == policy_id))
+            .find(|slot| slot.policy_id == Some(policy_id))
     }
 }
 
 struct PolicySlot<'cfg, const IMAGE_BYTES: usize> {
-    policy_id: u16,
+    policy_id: Option<u16>,
     bank: ImageBank<IMAGE_BYTES>,
     fallback: Option<StoredResolver<'cfg>>,
 }
@@ -1074,7 +1062,7 @@ struct PolicySlot<'cfg, const IMAGE_BYTES: usize> {
 impl<'cfg, const IMAGE_BYTES: usize> PolicySlot<'cfg, IMAGE_BYTES> {
     const fn new() -> Self {
         Self {
-            policy_id: EMPTY_POLICY_ID,
+            policy_id: None,
             bank: ImageBank::new(),
             fallback: None,
         }
@@ -1292,7 +1280,7 @@ impl<'a, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> Epf<'a, POLICY_SLO
         self.with_inner(|inner| match target {
             Target::Observe => inner.observe.unload(target),
             Target::Policy(policy_id) => inner
-                .policy_slot_mut(policy_id)?
+                .policy_slot_mut(policy_id)
                 .ok_or(Error::NoImage { target })?
                 .bank
                 .unload(target),
@@ -1303,7 +1291,7 @@ impl<'a, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> Epf<'a, POLICY_SLO
         self.with_inner(|inner| match target {
             Target::Observe => inner.observe.revert(target),
             Target::Policy(policy_id) => inner
-                .policy_slot_mut(policy_id)?
+                .policy_slot_mut(policy_id)
                 .ok_or(Error::NoPrevious { target })?
                 .bank
                 .revert(target),
@@ -1367,7 +1355,7 @@ impl<'a, const POLICY_SLOTS: usize, const IMAGE_BYTES: usize> Epf<'a, POLICY_SLO
                 words: inner.evidence.latest,
             };
             for slot in &inner.policies {
-                if slot.policy_id == POLICY_ID {
+                if slot.policy_id == Some(POLICY_ID) {
                     return if slot.bank.has_active {
                         Ok(slot.bank.run(Target::Policy(POLICY_ID), input))
                     } else {
