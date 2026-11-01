@@ -127,7 +127,7 @@ fn an_image_for_a_different_evidence_layout_cannot_replace_the_current_image() {
     let mut image = [0; 64];
     let len = ImageSpec::ObserveEcho.write(&mut image).unwrap();
     let loaded = epf.load(&image[..len]).unwrap();
-    for schema in [0x4845_0001u32, 0x4845_0002] {
+    for schema in [0x4845_0001u32, 0x4845_0002, 0x4845_0003] {
         image[16..20].copy_from_slice(&schema.to_le_bytes());
         assert!(matches!(
             epf.load(&image[..len]),

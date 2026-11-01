@@ -358,10 +358,10 @@ fn compiled_snapshot_carries_nested_control_and_conditional_delegation_data() {
 fn live_endpoint_choices_and_roll_commits_reach_epf_without_losing_observation_fields() {
     type Left = Msg<7, ()>;
     type Right = Msg<8, ()>;
-    let global = g::route(g::send::<0, 0, Left>(), g::send::<0, 0, Right>())
+    let global = g::route(g::send::<7, 7, Left>(), g::send::<7, 7, Right>())
         .resolve::<17>()
         .roll();
-    let program = project::<0>(&global);
+    let program = project::<7>(&global);
     let choice = Cell::new(DecisionArm::Left);
     let mut slab = [0; 8192];
     let mut kit_storage = SessionKitStorage::uninit();
@@ -403,6 +403,9 @@ fn live_endpoint_choices_and_roll_commits_reach_epf_without_losing_observation_f
                     }
         }));
         for event in batch {
+            if matches!(event.id(), tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION) {
+                assert_eq!(event.causal_key() >> 8, 7);
+            }
             let record: [u8; 16] = event.into();
             let decoded = TapEvent::from(record);
             let out = epf.run(decoded);

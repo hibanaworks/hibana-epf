@@ -73,6 +73,13 @@ Observation images receive the ordinal in input word 2. Committed Endpoint
 records identify the executing actor, logical role, lane and full source-event
 number using Hibana's field layout. The image schema binds these interpretations;
 an image for an older layout is rejected before replacing the active program.
+Route selections and resolver decisions also identify their executing actor.
+Match their route site to the compiled choice row to obtain the logical
+controller. A delegated controller can be operated by a different actor;
+rejected decisions retain that actor even without a later Endpoint commit.
+The input format is versioned by the EPF image's evidence schema. Raw tap
+records have no format header, so retain their runtime revision and build
+receipt when saving a capture.
 
 ## Device transport and decisions
 
