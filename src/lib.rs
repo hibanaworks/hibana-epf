@@ -23,7 +23,7 @@ pub use verifier::{Header, VerifyError, compute_hash};
 pub use vm::Trap;
 
 /// Stable hash of the Hibana Evidence ABI consumed by EPF images.
-pub const EVIDENCE_SCHEMA_HASH: u32 = 0x4845_0002;
+pub const EVIDENCE_SCHEMA_HASH: u32 = 0x4845_0003;
 
 const RESOLVER_STORAGE_WORDS: usize =
     size_of::<ResolverRef<'static, 0>>().div_ceil(size_of::<usize>());
@@ -1521,7 +1521,7 @@ mod tests {
         assert_eq!(out.reason(), 1);
         assert_eq!(out.arg0(), 0x1111_0001);
         assert_eq!(out.arg1(), 0x2222_0001);
-        assert_eq!(out.arg2(), 0);
+        assert_eq!(out.arg2(), 1);
         assert_eq!(out.fuel_used(), 7);
     }
 

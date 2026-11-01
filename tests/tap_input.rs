@@ -30,6 +30,16 @@ fn recorded_frame_reaches_the_vm_with_its_ordinal_lane_and_full_wire_label() {
         .arg(&path)
         .output()
         .unwrap();
+    let ordinal_match = Command::new(executable)
+        .args(["diagnose", "match", "2", "7", "74", "10"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let ordinal_miss = Command::new(executable)
+        .args(["diagnose", "match", "2", "8", "74", "10"])
+        .arg(&path)
+        .output()
+        .unwrap();
     fs::write(&path, &record[..15]).unwrap();
     let truncated = Command::new(executable)
         .arg("explain-tap")
@@ -44,13 +54,21 @@ fn recorded_frame_reaches_the_vm_with_its_ordinal_lane_and_full_wire_label() {
     let text = String::from_utf8(explanation.stdout).unwrap();
     assert!(text.contains("ts=7 id=0x0206 causal=0xa500"), "{text}");
     assert!(
-        text.contains("input=[0x0000002a,0x01020100,0x00000000,0x0206a500]"),
+        text.contains("input=[0x0000002a,0x01020100,0x00000007,0x0206a500]"),
         "{text}"
     );
     assert!(diagnosis.status.success(), "{diagnosis:?}");
     let text = String::from_utf8(diagnosis.stdout).unwrap();
     assert!(text.contains("kind=73 reason=9"), "{text}");
     assert!(text.contains("arg1=0x01020100 arg2=0x0206a500"), "{text}");
+    assert!(ordinal_match.status.success(), "{ordinal_match:?}");
+    assert!(
+        String::from_utf8(ordinal_match.stdout)
+            .unwrap()
+            .contains("kind=74 reason=10")
+    );
+    assert!(ordinal_miss.status.success(), "{ordinal_miss:?}");
+    assert!(ordinal_miss.stdout.is_empty(), "{ordinal_miss:?}");
 }
 
 #[test]

@@ -93,18 +93,54 @@ fn production_epf_runs_loaded_observe_bytecode_from_tap_event() {
 }
 
 #[test]
+fn loaded_observe_preserves_commit_fields_and_the_ring_ordinal() {
+    let event = TapEvent::from([
+        0x10, 0x20, 0x30, 0x40, 0x02, 0x02, 0x81, 1, 0x03, 0x10, 0x20, 0x30, 6, 0x7f, 0x12, 0x34,
+    ]);
+    let code = [
+        0x11, 0, 1, 0, 0, 0, // kind
+        0x11, 1, 0, 0, 0, 0, // reason
+        0x10, 2, 0, // session
+        0x10, 3, 1, // view, lane and full source-event identity
+        0x10, 4, 2, // ring ordinal
+        0x20, 0, 1, 2, 3, 4, 0xff,
+    ];
+    let mut image = [0; 64];
+    let len = encode_image(Target::Observe, &code, &mut image);
+    let mut storage = EpfStorage::<0, 64>::new();
+    let epf = Epf::new(&mut storage);
+    epf.load(&image[..len]).unwrap();
+    let out = epf.run(event);
+    assert_eq!(out.arg0(), 0x0310_2030);
+    assert_eq!(out.arg1(), 0x067f_1234);
+    assert_eq!(out.arg2(), 0x1020_3040);
+    assert_eq!(
+        hibana_epf::EvidenceInput::from_tap_event(event).words()[3],
+        0x8101
+    );
+}
+
+#[test]
 fn an_image_for_a_different_evidence_layout_cannot_replace_the_current_image() {
     let mut storage = EpfStorage::<1, 64>::new();
     let epf = Epf::new(&mut storage);
     let mut image = [0; 64];
     let len = ImageSpec::ObserveEcho.write(&mut image).unwrap();
     let loaded = epf.load(&image[..len]).unwrap();
-    image[16..20].copy_from_slice(&0x4845_0001u32.to_le_bytes());
-    assert!(epf.load(&image[..len]).is_err());
-    let observed = epf.run(mismatch_event());
-    assert_eq!(observed.epoch(), loaded.epoch());
-    assert_eq!(observed.kind(), u32::from(TRANSPORT_MISMATCH));
-    assert_eq!(observed.arg0(), 0x28fa_7a4d);
+    for schema in [0x4845_0001u32, 0x4845_0002] {
+        image[16..20].copy_from_slice(&schema.to_le_bytes());
+        assert!(matches!(
+            epf.load(&image[..len]),
+            Err(hibana_epf::Error::Verify(hibana_epf::VerifyError::SchemaMismatch {
+                expected: EVIDENCE_SCHEMA_HASH,
+                found,
+            })) if found == schema
+        ));
+        let observed = epf.run(mismatch_event());
+        assert_eq!(observed.epoch(), loaded.epoch());
+        assert_eq!(observed.kind(), u32::from(TRANSPORT_MISMATCH));
+        assert_eq!(observed.arg0(), 0x28fa_7a4d);
+    }
 }
 
 #[test]

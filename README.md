@@ -67,6 +67,11 @@ ordinal, causal key and full 16-bit wire label. The ordinal is a record counter,
 not elapsed time. `--out` contains compact diagnostics; keep the original tap
 records for later audit because filtering can remove observations.
 
+Observation images receive the ordinal in input word 2. Committed Endpoint
+records identify the executing actor, logical role, lane and full source-event
+number using Hibana's field layout. The image schema binds these interpretations;
+an image for an older layout is rejected before replacing the active program.
+
 ## Device transport and decisions
 
 `ImageIngress` accepts a length- and hash-checked image envelope assembled by
