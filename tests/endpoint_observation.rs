@@ -199,8 +199,19 @@ fn flat_projected_rows_cannot_distinguish_a_finite_step_from_a_roll() {
     let repeated = g::send::<0, 0, Step>().roll();
     let finite = project::<0>(&finite);
     let repeated = project::<0>(&repeated);
-    let finite_rows: Vec<[u8; 16]> = tap::projected(&finite).map(Into::into).collect();
-    let repeated_rows: Vec<[u8; 16]> = tap::projected(&repeated).map(Into::into).collect();
+    let finite_snapshot: Vec<_> = tap::projected(&finite).collect();
+    let repeated_snapshot: Vec<_> = tap::projected(&repeated).collect();
+    assert!(finite_snapshot != repeated_snapshot);
+    let finite_rows: Vec<[u8; 16]> = finite_snapshot
+        .into_iter()
+        .filter(|row| row.id() == tap::PROJECTED_LOCAL)
+        .map(Into::into)
+        .collect();
+    let repeated_rows: Vec<[u8; 16]> = repeated_snapshot
+        .into_iter()
+        .filter(|row| row.id() == tap::PROJECTED_LOCAL)
+        .map(Into::into)
+        .collect();
     assert_eq!(finite_rows, repeated_rows);
 
     let mut permitted = [false; 2];
@@ -230,8 +241,19 @@ fn flat_projected_rows_cannot_distinguish_sequence_from_choice() {
     let alternative = g::route(g::send::<0, 0, First>(), g::send::<0, 0, Second>());
     let sequential = project::<0>(&sequential);
     let alternative = project::<0>(&alternative);
-    let sequential_rows: Vec<[u8; 16]> = tap::projected(&sequential).map(Into::into).collect();
-    let alternative_rows: Vec<[u8; 16]> = tap::projected(&alternative).map(Into::into).collect();
+    let sequential_snapshot: Vec<_> = tap::projected(&sequential).collect();
+    let alternative_snapshot: Vec<_> = tap::projected(&alternative).collect();
+    assert!(sequential_snapshot != alternative_snapshot);
+    let sequential_rows: Vec<[u8; 16]> = sequential_snapshot
+        .into_iter()
+        .filter(|row| row.id() == tap::PROJECTED_LOCAL)
+        .map(Into::into)
+        .collect();
+    let alternative_rows: Vec<[u8; 16]> = alternative_snapshot
+        .into_iter()
+        .filter(|row| row.id() == tap::PROJECTED_LOCAL)
+        .map(Into::into)
+        .collect();
     assert_eq!(sequential_rows, alternative_rows);
 
     let mut permitted = [false; 2];
@@ -251,6 +273,76 @@ fn flat_projected_rows_cannot_distinguish_sequence_from_choice() {
         permitted[index] = matches!(second, Poll::Ready(Ok(())));
     }
     assert_eq!(permitted, [true, false]);
+}
+
+#[test]
+fn compiled_snapshot_carries_nested_control_and_conditional_delegation_data() {
+    type Loan = Msg<1, hibana::Endpoint<'static, 9>>;
+    let global = g::seq(
+        g::route(g::send::<0, 1, Loan>(), g::send::<0, 2, Loan>()).resolve::<17>(),
+        g::par(
+            g::send::<9, 3, Msg<2, ()>>().roll(),
+            g::send::<0, 4, Msg<3, ()>>(),
+        ),
+    );
+    let program = project::<0>(&global);
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    let header = snapshot[0];
+    assert_eq!(header.id(), tap::PROJECTED_PROGRAM);
+    assert_eq!(header.ts(), 1 | 1 << 16);
+    assert_eq!(header.arg0(), 4 << 16 | 9);
+    assert_eq!(header.arg1(), 1 << 16 | 1);
+    let role = snapshot[1];
+    assert_eq!(role.id(), tap::PROJECTED_ROLE);
+    assert_eq!(role.arg0(), 1);
+    assert_eq!(role.arg1(), 9);
+    assert_eq!(
+        snapshot.len(),
+        2 + 4 + 9 + 1 + 4 + 1 + 1 + role.ts() as usize
+    );
+    let source: Vec<_> = snapshot
+        .iter()
+        .filter(|row| row.id() == tap::PROJECTED_SOURCE)
+        .collect();
+    assert_eq!(source.len(), 4);
+    assert_eq!(source[0].causal_key() >> 8, 1);
+    assert_eq!(source[0].arg1(), 9);
+    assert_eq!(source[2].arg0() >> 16, 9 << 8 | 3);
+    let markers: Vec<_> = snapshot
+        .iter()
+        .filter(|row| row.id() == tap::PROJECTED_SCOPE)
+        .collect();
+    assert_eq!(markers.len(), 9);
+    for kind in 0..3 {
+        assert!(markers.iter().any(|row| row.causal_key() >> 13 == kind));
+    }
+    let choice = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_CHOICE)
+        .unwrap();
+    assert_eq!((choice.arg0(), choice.arg1()), (0, 18));
+    let bindings: Vec<_> = snapshot
+        .iter()
+        .filter(|row| row.id() == tap::PROJECTED_BINDING)
+        .collect();
+    assert_eq!(bindings.len(), 4);
+    assert_eq!((bindings[2].arg0(), bindings[2].arg1()), (256, 3));
+    let decision = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_ACTOR_DECISION)
+        .unwrap();
+    assert_eq!(decision.ts(), 256);
+    assert_eq!(choice.causal_key(), decision.causal_key());
+    assert_eq!((decision.arg0(), decision.arg1()), (1, 2));
+    let initial = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_INITIAL_ACTOR)
+        .unwrap();
+    assert_eq!((initial.arg0(), initial.arg1()), (9, 0));
+    for row in snapshot {
+        let encoded: [u8; 16] = row.into();
+        assert!(TapEvent::from(encoded) == row);
+    }
 }
 
 #[test]

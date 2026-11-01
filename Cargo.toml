@@ -2,7 +2,7 @@
 name = "hibana-epf"
 version = "0.1.0"
 edition = "2024"
-description = "EPF verifier and bytecode appliance for hibana"
+description = "Dynamic observation and resolver policies for Hibana"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hibanaworks/hibana-epf"
 homepage = "https://github.com/hibanaworks/hibana-epf"
@@ -14,7 +14,7 @@ default = []
 std = []
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "0356494bab5874bfb755623c470b4c9a6a244cf6", version = "=0.10.0", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "a9dfecc59dd11dfa0a012f7c4dc12d3564f0cacf", version = "=0.10.0", default-features = false }
 
 [[bin]]
 name = "hibana-epf"

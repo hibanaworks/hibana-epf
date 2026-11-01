@@ -117,14 +117,22 @@ certify that every observed operation was enabled. Missing records, counter
 exhaustion or a truncated stream cannot support a completed audit. Application
 effects require their own correspondence to accepted endpoint requests.
 
-The current compiled-row observations also omit control structure. A single
+Local operation rows alone omit control structure. A single
 local send and that send inside `roll` have the same rows but disagree about
 whether a second call is permitted. Two local sends in `seq` and in `route`
 also have the same rows but disagree about executing the second after the
-first. `endpoint_observation` exercises both pairs through actual Endpoints.
-An auditor therefore needs the route and roll structure from the same sealed
-program, in addition to the row identities. Replaying row labels alone cannot
-establish dynamic eligibility, even when every observation is retained.
+first. `endpoint_observation` exercises both pairs through actual Endpoints
+and requires their complete compiled snapshots to differ.
+
+`hibana::runtime::tap::projected(&program)` reads the same sealed program as
+execution. Its snapshot includes global source operations, ordered
+route/par/roll markers, choice authorities and delegation bindings before the
+local rows. The two headers supply format version and section counts. These
+records provide the protocol input needed to audit a history. They do not
+report that history's branch selections, roll visits or completed operations.
+Replaying row labels alone cannot establish dynamic eligibility, even when
+every observation is retained. The source snapshot and history replay still
+need to be connected before EPF can certify an execution.
 
 ## Check locally
 
