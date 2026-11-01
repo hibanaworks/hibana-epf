@@ -279,18 +279,23 @@ fn flat_projected_rows_cannot_distinguish_sequence_from_choice() {
 fn compiled_snapshot_carries_nested_control_and_conditional_delegation_data() {
     type Loan = Msg<1, hibana::Endpoint<'static, 9>>;
     let global = g::seq(
-        g::route(g::send::<0, 1, Loan>(), g::send::<0, 2, Loan>()).resolve::<17>(),
-        g::par(
-            g::send::<9, 3, Msg<2, ()>>().roll(),
-            g::send::<0, 4, Msg<3, ()>>(),
+        g::send::<0, 1, Loan>(),
+        g::seq(
+            g::route(g::send::<1, 2, Msg<4, ()>>(), g::send::<1, 2, Loan>()).resolve::<17>(),
+            g::par(
+                g::send::<9, 3, Msg<2, ()>>().roll(),
+                g::send::<0, 4, Msg<3, ()>>(),
+            ),
         ),
     );
     let program = project::<0>(&global);
-    let snapshot: Vec<_> = tap::projected(&program).collect();
+    let compiled = tap::projected(&program);
+    let snapshot: Vec<_> = compiled.clone().collect();
+    assert_eq!(compiled.len(), snapshot.len());
     let header = snapshot[0];
     assert_eq!(header.id(), tap::PROJECTED_PROGRAM);
     assert_eq!(header.ts(), 1 | 1 << 16);
-    assert_eq!(header.arg0(), 4 << 16 | 9);
+    assert_eq!(header.arg0(), 5 << 16 | 9);
     assert_eq!(header.arg1(), 1 << 16 | 1);
     let role = snapshot[1];
     assert_eq!(role.id(), tap::PROJECTED_ROLE);
@@ -298,16 +303,16 @@ fn compiled_snapshot_carries_nested_control_and_conditional_delegation_data() {
     assert_eq!(role.arg1(), 9);
     assert_eq!(
         snapshot.len(),
-        2 + 4 + 9 + 1 + 4 + 1 + 1 + role.ts() as usize
+        2 + 5 + 9 + 1 + 5 + 1 + 1 + role.ts() as usize
     );
     let source: Vec<_> = snapshot
         .iter()
         .filter(|row| row.id() == tap::PROJECTED_SOURCE)
         .collect();
-    assert_eq!(source.len(), 4);
+    assert_eq!(source.len(), 5);
     assert_eq!(source[0].causal_key() >> 8, 1);
     assert_eq!(source[0].arg1(), 9);
-    assert_eq!(source[2].arg0() >> 16, 9 << 8 | 3);
+    assert_eq!(source[3].arg0() >> 16, 9 << 8 | 3);
     let markers: Vec<_> = snapshot
         .iter()
         .filter(|row| row.id() == tap::PROJECTED_SCOPE)
@@ -320,13 +325,13 @@ fn compiled_snapshot_carries_nested_control_and_conditional_delegation_data() {
         .iter()
         .find(|row| row.id() == tap::PROJECTED_CHOICE)
         .unwrap();
-    assert_eq!((choice.arg0(), choice.arg1()), (0, 18));
+    assert_eq!((choice.arg0(), choice.arg1()), (1, 18));
     let bindings: Vec<_> = snapshot
         .iter()
         .filter(|row| row.id() == tap::PROJECTED_BINDING)
         .collect();
-    assert_eq!(bindings.len(), 4);
-    assert_eq!((bindings[2].arg0(), bindings[2].arg1()), (256, 3));
+    assert_eq!(bindings.len(), 5);
+    assert_eq!((bindings[3].arg0(), bindings[3].arg1()), (256, 3));
     let decision = snapshot
         .iter()
         .find(|row| row.id() == tap::PROJECTED_ACTOR_DECISION)
@@ -339,7 +344,8 @@ fn compiled_snapshot_carries_nested_control_and_conditional_delegation_data() {
         .find(|row| row.id() == tap::PROJECTED_INITIAL_ACTOR)
         .unwrap();
     assert_eq!((initial.arg0(), initial.arg1()), (9, 0));
-    for row in snapshot {
+    for (index, row) in snapshot.into_iter().enumerate() {
+        assert!(compiled.clone().nth(index).unwrap() == row);
         let encoded: [u8; 16] = row.into();
         assert!(TapEvent::from(encoded) == row);
     }
