@@ -13,7 +13,7 @@ default = []
 std = []
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "40298f0f66c67c51fea2a1d444caf10c241e5fe2", version = "=0.10.0", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "194eac8eb8a3a6aece5cd48b76df8946e9357b31", version = "=0.10.0", default-features = false }
 
 [[bin]]
 name = "hibana-epf"

@@ -19,6 +19,91 @@ use hibana_epf::{Epf, EpfStorage, ImageSpec};
 struct LocalOnly;
 
 #[test]
+fn automatic_audit_uses_a_complete_burst_capture_instead_of_the_diagnostic_window() {
+    use hibana_epf::{
+        Acceptance, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId, RouteChoice,
+        Unfold,
+    };
+    let rows = Cell::new(Vec::new());
+    let recorder = |event| {
+        let mut captured = rows.take();
+        captured.push(event);
+        rows.set(captured);
+    };
+    let global = g::send::<7, 7, Msg<1, ()>>().roll();
+    let program = project::<7>(&global);
+    let mut slab = [0; 8192];
+    let mut storage = SessionKitStorage::uninit();
+    let rv = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+    rv.observe(&recorder);
+    let mut endpoint = rv.enter(SessionId::new(1), &program).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let operation = core::pin::pin!(async {
+        for _ in 0..32 {
+            endpoint.send::<Msg<1, ()>>(&()).await?;
+        }
+        Ok::<_, hibana::EndpointError>(())
+    });
+    assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+    let checkpoint = rv.tap().checkpoint();
+    let captured = rows.take();
+    let captures = [Capture::new(&captured, checkpoint).unwrap()];
+    let window: Vec<_> = rv.tap().collect();
+    assert!(Capture::new(&window, checkpoint).is_err());
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let capacity = 2 * captured.len() + 1;
+    let mut unfolding = vec![Unfold::Source; capacity];
+    let mut choices = vec![
+        RouteChoice {
+            span: [0, 0],
+            right: false
+        };
+        protocol.audit_choice_capacity(capacity).unwrap()
+    ];
+    let mut order = vec![
+        RecordId {
+            producer: 0,
+            ordinal: 0
+        };
+        captured.len()
+    ];
+    let mut occurrences = vec![None; captured.len()];
+    let mut acceptances = vec![
+        Acceptance {
+            first_poll: RecordId {
+                producer: 0,
+                ordinal: 0
+            },
+            before: 0
+        };
+        captured.len()
+    ];
+    workspace.resize(
+        protocol.audit_workspace_len(&captures, capacity).unwrap(),
+        0,
+    );
+    let audit = protocol
+        .audit(
+            &captures,
+            AuditStorage {
+                unfolding: &mut unfolding,
+                choices: &mut choices,
+                execution: ExecutionStorage {
+                    session: 1,
+                    order: &mut order,
+                    occurrences: &mut occurrences,
+                    acceptances: &mut acceptances,
+                },
+            },
+            &mut workspace,
+        )
+        .unwrap();
+    assert_eq!(audit.path().unfolding().event_count(), 32);
+}
+
+#[test]
 fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
     type Left = Msg<7, ()>;
     type Right = Msg<8, ()>;
