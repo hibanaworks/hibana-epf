@@ -176,7 +176,8 @@ impl<'p> Protocol<'p> {
                 }
                 let mut retained = 0;
                 loop {
-                    let selected = route_choices(source, choices, retained, scratch);
+                    let selected =
+                        route_choices(source, choices, retained, captures, session, scratch);
                     if let Ok(path) = source.select(&choices[..selected], actors) {
                         match path.interpret(
                             captures,
@@ -195,10 +196,19 @@ impl<'p> Protocol<'p> {
                             Err(error) => return Err(AuditError::Evidence(error)),
                         }
                     }
-                    let Some(index) = (0..selected).rev().find(|&i| !choices[i].right) else {
+                    let Some(index) = (0..selected).rev().find(|&i| {
+                        choices[i].right
+                            == route_preference(
+                                source,
+                                &choices[..i],
+                                choices[i].span,
+                                captures,
+                                session,
+                            )
+                    }) else {
                         break;
                     };
-                    choices[index].right = true;
+                    choices[index].right = !choices[index].right;
                     retained = index + 1;
                 }
             }
@@ -250,6 +260,8 @@ fn route_choices(
     source: Unfolded<'_, '_>,
     choices: &mut [RouteChoice],
     retained: usize,
+    captures: &[Capture<'_>],
+    session: u32,
     stack: &mut [usize],
 ) -> usize {
     let mut depth = 2;
@@ -262,7 +274,11 @@ fn route_choices(
         match kind {
             NodeKind::Message => {}
             NodeKind::Choice(_) => {
-                let right = count < retained && choices[count].right;
+                let right = if count < retained {
+                    choices[count].right
+                } else {
+                    route_preference(source, &choices[..count], span, captures, session)
+                };
                 choices[count] = RouteChoice { span, right };
                 count += 1;
                 stack[depth..depth + 2].copy_from_slice(&if right {
@@ -279,4 +295,100 @@ fn route_choices(
         }
     }
     count
+}
+
+// Search the observed arm first. This is a preference, not a reconstructed
+// distributed visit number: the opposite arm remains in the exhaustive search
+// and every completed candidate still passes check_execution. Use one
+// producer's actor stream rather than treating producer ordinals as a clock.
+fn route_preference(
+    source: Unfolded<'_, '_>,
+    earlier: &[RouteChoice],
+    span: [usize; 2],
+    captures: &[Capture<'_>],
+    session: u32,
+) -> bool {
+    let Some((NodeKind::Choice(key), _)) = source.parts(span) else {
+        return false;
+    };
+    let visit = earlier.iter().filter(|choice|
+        matches!(source.parts(choice.span), Some((NodeKind::Choice(prior), _)) if prior == key)
+    ).count();
+    let matches = |record: &&tap::TapEvent| {
+        record.id() == tap::ROUTE_ARM_SELECTION
+            && record.arg0() == session
+            && record.arg1() >> 16 == u32::from(key)
+    };
+    for capture in captures {
+        let Some(first) = capture.records().iter().find(matches) else {
+            continue;
+        };
+        let actor = first.causal_key() >> 8;
+        return capture
+            .records()
+            .iter()
+            .filter(matches)
+            .filter(|record| record.causal_key() >> 8 == actor)
+            .nth(visit)
+            .is_some_and(|record| record.arg1() as u16 == 1);
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use hibana::{g, runtime::program::project};
+    use std::vec;
+
+    #[test]
+    fn an_observed_arm_changes_search_order_without_removing_the_opposite_arm() {
+        let global = g::route(
+            g::send::<7, 7, g::Msg<1, ()>>(),
+            g::send::<7, 7, g::Msg<2, ()>>(),
+        );
+        let snapshot = tap::projected(&project::<7>(&global)).collect::<std::vec::Vec<_>>();
+        let key = snapshot
+            .iter()
+            .find(|r| r.id() == tap::PROJECTED_CHOICE)
+            .unwrap()
+            .causal_key();
+        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let steps = [Unfold::Source];
+        let mut proof = [0; 5];
+        let source = protocol.unfolding(&steps, &mut proof).unwrap();
+        let mut bytes = [0; 16];
+        bytes[4..6].copy_from_slice(&tap::ROUTE_ARM_SELECTION.to_be_bytes());
+        bytes[6..8].copy_from_slice(&0x0707u16.to_be_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_be_bytes());
+        bytes[12..].copy_from_slice(&(u32::from(key) << 16 | 1).to_be_bytes());
+        let records = [bytes.into()];
+        let captures = [Capture::new(&records, Some(1)).unwrap()];
+        let mut choices = [RouteChoice {
+            span: [0, 0],
+            right: false,
+        }; 2];
+        let mut stack = [0; 4];
+        assert_eq!(
+            route_choices(source, &mut choices, 0, &captures, 1, &mut stack),
+            1
+        );
+        assert!(choices[0].right);
+        assert_eq!(
+            choices[0].right,
+            route_preference(source, &[], choices[0].span, &captures, 1)
+        );
+        choices[0].right = !choices[0].right;
+        assert_eq!(
+            route_choices(source, &mut choices, 1, &captures, 1, &mut stack),
+            1
+        );
+        assert!(!choices[0].right);
+        assert_ne!(
+            choices[0].right,
+            route_preference(source, &[], choices[0].span, &captures, 1)
+        );
+    }
 }
