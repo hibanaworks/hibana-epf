@@ -388,6 +388,19 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
     let snapshot: Vec<_> = tap::projected(&p0).collect();
     let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let steps = [
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Once(1),
+        hibana_epf::Unfold::More([2, 1]),
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Sequence([3, 4]),
+        hibana_epf::Unfold::Sequence([0, 5]),
+    ];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut actors = vec![0; unfolded.path_workspace_len().unwrap()];
+    let path = unfolded.select(&[], &mut actors).unwrap();
     for permutation in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
         let inputs = permutation.map(|index| captures[index]);
         let witnessed: Vec<_> = order
@@ -414,6 +427,78 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
             .unwrap()
             .collect();
         assert_eq!(deliveries.len(), 4);
+        let mut sends = 0;
+        let mut receipts = 0;
+        let occurrences: Vec<_> = witnessed
+            .iter()
+            .map(|id| {
+                let record = inputs[id.producer].records()[id.ordinal];
+                if record.id() == tap::SCOPE_REENTRY {
+                    return Some(2);
+                }
+                if !matches!(
+                    record.id(),
+                    tap::SEND_POLL
+                        | tap::ENDPOINT_SEND
+                        | tap::ENDPOINT_RECV
+                        | tap::ENDPOINT_SESSION
+                ) {
+                    return None;
+                }
+                match record.arg1() as u16 {
+                    0 => Some(0),
+                    2 => Some(3),
+                    1 if record.id() == tap::ENDPOINT_RECV => {
+                        receipts += 1;
+                        Some(receipts)
+                    }
+                    1 => {
+                        let event = 1 + sends;
+                        if record.id() == tap::ENDPOINT_SEND {
+                            sends += 1;
+                        }
+                        Some(event)
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .collect();
+        let mut acceptances: Vec<_> = deliveries
+            .iter()
+            .map(|delivery| {
+                let before = witnessed
+                    .iter()
+                    .position(|&id| id == delivery.first_poll)
+                    .unwrap()
+                    + 1;
+                hibana_epf::Acceptance {
+                    first_poll: delivery.first_poll,
+                    before,
+                }
+            })
+            .collect();
+        acceptances.sort_by_key(|acceptance| acceptance.before);
+        let witness = hibana_epf::ExecutionWitness {
+            session: 110,
+            order: &witnessed,
+            occurrences: &occurrences,
+            acceptances: &acceptances,
+        };
+        workspace.resize(path.execution_workspace_len(&inputs, &witness).unwrap(), 0);
+        path.check_execution(&inputs, &witness, &mut workspace)
+            .unwrap();
+        let aliased: Vec<_> = occurrences
+            .iter()
+            .map(|event| if *event == Some(2) { Some(1) } else { *event })
+            .collect();
+        let alias_witness = hibana_epf::ExecutionWitness {
+            occurrences: &aliased,
+            ..witness
+        };
+        assert!(
+            path.check_execution(&inputs, &alias_witness, &mut workspace)
+                .is_err()
+        );
         for delivery in deliveries {
             let sending =
                 inputs[delivery.first_poll.producer].records()[delivery.first_poll.ordinal];
@@ -686,6 +771,146 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
         if !early {
             assert_eq!(calls[0].polls().count(), 2);
             assert!(calls[0].publication().is_some());
+            let first_poll = calls[0].first_poll().ts() as usize;
+            drop(calls);
+            let steps = [
+                hibana_epf::Unfold::Message,
+                hibana_epf::Unfold::Message,
+                hibana_epf::Unfold::Sequence([0, 1]),
+            ];
+            let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+            let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+            let mut actors = vec![0; unfolded.path_workspace_len().unwrap()];
+            let path = unfolded.select(&[], &mut actors).unwrap();
+            let order: Vec<_> = (0..captured.len())
+                .map(|ordinal| RecordId {
+                    producer: 0,
+                    ordinal,
+                })
+                .collect();
+            let occurrences: Vec<_> = captured
+                .iter()
+                .map(|record| {
+                    matches!(
+                        record.id(),
+                        tap::SEND_POLL | tap::ENDPOINT_SEND | tap::ENDPOINT_RECV
+                    )
+                    .then_some(usize::from(record.arg1() as u16))
+                })
+                .collect();
+            let acceptances = [hibana_epf::Acceptance {
+                first_poll: order[first_poll],
+                before: first_poll + 1,
+            }];
+            let witness = hibana_epf::ExecutionWitness {
+                session: 98,
+                order: &order,
+                occurrences: &occurrences,
+                acceptances: &acceptances,
+            };
+            workspace.resize(
+                path.execution_workspace_len(&[capture], &witness).unwrap(),
+                0,
+            );
+            path.check_execution(&[capture], &witness, &mut workspace)
+                .unwrap();
+            assert!(matches!(
+                path.check_execution(&[capture], &witness, &mut workspace[..1]),
+                Err(hibana_epf::ExecutionError::Workspace { .. })
+            ));
+            let short = hibana_epf::ExecutionWitness {
+                occurrences: &occurrences[..occurrences.len() - 1],
+                ..witness
+            };
+            assert!(matches!(
+                path.check_execution(&[capture], &short, &mut workspace),
+                Err(hibana_epf::ExecutionError::Length { .. })
+            ));
+            for acceptance in [
+                hibana_epf::Acceptance {
+                    first_poll: order[first_poll],
+                    before: first_poll,
+                },
+                hibana_epf::Acceptance {
+                    first_poll: RecordId {
+                        producer: usize::MAX,
+                        ordinal: 0,
+                    },
+                    before: first_poll + 1,
+                },
+            ] {
+                let bad = [acceptance];
+                let invalid = hibana_epf::ExecutionWitness {
+                    acceptances: &bad,
+                    ..witness
+                };
+                assert!(matches!(
+                    path.check_execution(&[capture], &invalid, &mut workspace),
+                    Err(hibana_epf::ExecutionError::Acceptance { index: 0 })
+                ));
+            }
+            let absent = hibana_epf::ExecutionWitness {
+                acceptances: &[],
+                ..witness
+            };
+            assert!(matches!(
+                path.check_execution(&[capture], &absent, &mut workspace),
+                Err(hibana_epf::ExecutionError::Source {
+                    error: hibana_epf::WordError::Predecessor {
+                        prior: hibana_epf::SourcePoint::Accepted(1),
+                        ..
+                    },
+                    ..
+                })
+            ));
+
+            // Preserve every successful Endpoint operation, but move only the
+            // first transport poll before its local source predecessor.
+            let gate = captured
+                .iter()
+                .position(|record| record.id() == tap::ENDPOINT_SEND && record.arg1() as u16 == 0)
+                .unwrap();
+            let mut changed = captured.clone();
+            let poll = changed.remove(first_poll);
+            changed.insert(gate, poll);
+            for (ordinal, record) in changed.iter_mut().enumerate() {
+                let mut bytes: [u8; 16] = (*record).into();
+                bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+                *record = bytes.into();
+            }
+            let invalid = Capture::new(&changed, records.checkpoint()).unwrap();
+            protocol
+                .check_routes(&[invalid], &order, &mut workspace)
+                .unwrap();
+            let changed_occurrences: Vec<_> = changed
+                .iter()
+                .map(|record| {
+                    matches!(
+                        record.id(),
+                        tap::SEND_POLL | tap::ENDPOINT_SEND | tap::ENDPOINT_RECV
+                    )
+                    .then_some(usize::from(record.arg1() as u16))
+                })
+                .collect();
+            // Even proposing acceptance after Gate cannot conceal an early
+            // admission. SEND_POLL is checked separately without committing it.
+            let accepted_later = [hibana_epf::Acceptance {
+                first_poll: order[gate],
+                before: gate + 2,
+            }];
+            let invalid_witness = hibana_epf::ExecutionWitness {
+                session: 98,
+                order: &order,
+                occurrences: &changed_occurrences,
+                acceptances: &accepted_later,
+            };
+            assert_eq!(
+                path.check_execution(&[invalid], &invalid_witness, &mut workspace),
+                Err(hibana_epf::ExecutionError::Admission {
+                    record: order[gate],
+                    prior: hibana_epf::SourcePoint::Local(0),
+                })
+            );
         }
     }
 }
@@ -993,6 +1218,98 @@ fn a_pending_continuation_can_publish_after_the_other_view_reenters_its_roll() {
     protocol
         .check_routes(&[capture], &order, &mut workspace)
         .unwrap();
+    let retained = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
+        .unwrap()
+        .causal_key();
+    let steps = [
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Once(0),
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Sequence([2, 3]),
+        hibana_epf::Unfold::Alongside {
+            retained,
+            earlier: 1,
+            next: 1,
+            tail: 4,
+            focus: [0, 1],
+        },
+    ];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut actors = vec![0; unfolded.path_workspace_len().unwrap()];
+    let path = unfolded.select(&[], &mut actors).unwrap();
+    let mut sent = 0;
+    let mut received = 0;
+    let occurrences: Vec<_> = captured
+        .iter()
+        .map(|record| {
+            if record.id() == tap::SCOPE_REENTRY {
+                return Some(1);
+            }
+            if !matches!(
+                record.id(),
+                tap::SEND_POLL | tap::ENDPOINT_SEND | tap::ENDPOINT_RECV
+            ) {
+                return None;
+            }
+            if record.arg1() as u16 == 1 {
+                return Some(2);
+            }
+            if record.id() == tap::ENDPOINT_RECV {
+                let event = received;
+                received += 1;
+                Some(event)
+            } else {
+                let event = sent;
+                if record.id() == tap::ENDPOINT_SEND {
+                    sent += 1;
+                }
+                Some(event)
+            }
+        })
+        .collect();
+    let mut acceptances: Vec<_> = captured
+        .iter()
+        .enumerate()
+        .filter_map(|(position, record)| {
+            let event = occurrences[position]?;
+            if record.id() != tap::SEND_POLL
+                || captured[..position].iter().enumerate().any(|(at, prior)| {
+                    prior.id() == tap::SEND_POLL && occurrences[at] == Some(event)
+                })
+            {
+                return None;
+            }
+            let before = captured
+                .iter()
+                .enumerate()
+                .position(|(at, record)| {
+                    matches!(record.id(), tap::ENDPOINT_SEND | tap::ENDPOINT_RECV)
+                        && occurrences[at] == Some(event)
+                })
+                .unwrap();
+            Some(hibana_epf::Acceptance {
+                first_poll: order[position],
+                before,
+            })
+        })
+        .collect();
+    acceptances.sort_by_key(|acceptance| acceptance.before);
+    let witness = hibana_epf::ExecutionWitness {
+        session: 103,
+        order: &order,
+        occurrences: &occurrences,
+        acceptances: &acceptances,
+    };
+    workspace.resize(
+        path.execution_workspace_len(&[capture], &witness).unwrap(),
+        0,
+    );
+    path.check_execution(&[capture], &witness, &mut workspace)
+        .unwrap();
     let mut lending = core::pin::pin!(owner.send::<Loan>(resource));
     assert!(lending.as_mut().poll(&mut cx).is_pending());
     let receiving = core::pin::pin!(worker.recv::<Loan>());
@@ -1096,6 +1413,10 @@ fn pending_siblings_can_share_the_reset_published_by_the_first_completed_send() 
                     && record.ts() < polls[1].ts()
             })
             .unwrap();
+        let first_polls: Vec<_> = calls
+            .iter()
+            .map(|call| call.first_poll().ts() as usize)
+            .collect();
         drop(calls);
         let order: Vec<_> = (0..captured.len())
             .map(|ordinal| RecordId {
@@ -1106,6 +1427,66 @@ fn pending_siblings_can_share_the_reset_published_by_the_first_completed_send() 
         workspace.resize(protocol.custody_workspace_len(&[capture]), 0);
         protocol
             .check_routes(&[capture], &order, &mut workspace)
+            .unwrap();
+        let steps = [
+            hibana_epf::Unfold::Message,
+            hibana_epf::Unfold::Message,
+            hibana_epf::Unfold::Parallel([0, 1]),
+            hibana_epf::Unfold::Once(2),
+            hibana_epf::Unfold::More([3, 2]),
+            hibana_epf::Unfold::Message,
+            hibana_epf::Unfold::Sequence([4, 5]),
+        ];
+        let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+        let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+        let mut actors = vec![0; unfolded.path_workspace_len().unwrap()];
+        let path = unfolded.select(&[], &mut actors).unwrap();
+        let mut sends = [0; 2];
+        let mut receives = [0; 2];
+        let occurrences: Vec<_> = captured
+            .iter()
+            .map(|record| {
+                let original = usize::from(record.arg1() as u16);
+                if record.id() == tap::SCOPE_REENTRY {
+                    return Some(2 + original);
+                }
+                if !matches!(
+                    record.id(),
+                    tap::SEND_POLL | tap::ENDPOINT_SEND | tap::ENDPOINT_RECV
+                ) {
+                    return None;
+                }
+                if record.id() == tap::ENDPOINT_RECV {
+                    let event = 2 * receives[original] + original;
+                    receives[original] += 1;
+                    Some(event)
+                } else {
+                    let event = 2 * sends[original] + original;
+                    if record.id() == tap::ENDPOINT_SEND {
+                        sends[original] += 1;
+                    }
+                    Some(event)
+                }
+            })
+            .collect();
+        let acceptances: Vec<_> = first_polls
+            .iter()
+            .map(|&ordinal| hibana_epf::Acceptance {
+                first_poll: order[ordinal],
+                before: ordinal + 1,
+            })
+            .collect();
+        let witness = hibana_epf::ExecutionWitness {
+            session: 104,
+            order: &order,
+            occurrences: &occurrences,
+            acceptances: &acceptances,
+        };
+        workspace.resize(
+            path.execution_workspace_len(&[capture], &witness).unwrap(),
+            0,
+        );
+        path.check_execution(&[capture], &witness, &mut workspace)
             .unwrap();
         for mutation in 0..5 {
             let mut changed = captured.clone();
@@ -1398,6 +1779,46 @@ fn an_observed_send_poll_can_end_in_a_transport_error_without_a_commit() {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].polls().count(), 1);
         assert_eq!(calls[0].publication(), None);
+        drop(calls);
+        let steps = [hibana_epf::Unfold::Message];
+        let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+        let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+        let mut actors = vec![0; unfolded.path_workspace_len().unwrap()];
+        let path = unfolded.select(&[], &mut actors).unwrap();
+        let order: Vec<_> = (0..captured.len())
+            .map(|ordinal| RecordId {
+                producer: 0,
+                ordinal,
+            })
+            .collect();
+        let occurrences: Vec<_> = captured
+            .iter()
+            .map(|record| (record.id() == tap::SEND_POLL).then_some(0))
+            .collect();
+        let witness = hibana_epf::ExecutionWitness {
+            session: 99,
+            order: &order,
+            occurrences: &occurrences,
+            acceptances: &[],
+        };
+        workspace.resize(
+            path.execution_workspace_len(&[capture], &witness).unwrap() + 2,
+            0,
+        );
+        path.check_execution(&[capture], &witness, &mut workspace)
+            .unwrap();
+        let fabricated = [hibana_epf::Acceptance {
+            first_poll: order[polls[0].ts() as usize],
+            before: order.len(),
+        }];
+        let invalid = hibana_epf::ExecutionWitness {
+            acceptances: &fabricated,
+            ..witness
+        };
+        assert_eq!(
+            path.check_execution(&[capture], &invalid, &mut workspace),
+            Err(hibana_epf::ExecutionError::Acceptance { index: 0 })
+        );
     }
 }
 

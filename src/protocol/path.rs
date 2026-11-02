@@ -52,6 +52,7 @@ pub enum PathError {
 pub struct SourcePath<'p, 'u, 'w> {
     source: Unfolded<'p, 'u>,
     actors: &'w [usize],
+    choices: &'w [RouteChoice],
 }
 
 impl<'p, 'u> Unfolded<'p, 'u> {
@@ -76,7 +77,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
     /// or Endpoint is created by this retrospective computation.
     pub fn select<'w>(
         &self,
-        choices: &[RouteChoice],
+        choices: &'w [RouteChoice],
         workspace: &'w mut [usize],
     ) -> Result<SourcePath<'p, 'u, 'w>, PathError> {
         let required = self.path_workspace_len()?;
@@ -239,6 +240,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         let path = SourcePath {
             source: *self,
             actors,
+            choices,
         };
         path.check_entries()?;
         Ok(path)
@@ -246,6 +248,19 @@ impl<'p, 'u> Unfolded<'p, 'u> {
 }
 
 impl SourcePath<'_, '_, '_> {
+    pub(super) fn choice_at(&self, event: usize, scope: u16) -> Option<bool> {
+        self.choices.iter().find_map(|choice| {
+            let (kind, _) = self.source.parts(choice.span)?;
+            let NodeKind::Choice(proof) = kind else {
+                return None;
+            };
+            (choice.span[0] <= event
+                && event < choice.span[1]
+                && self.source.choice_scope(proof) == scope)
+                .then_some(choice.right)
+        })
+    }
+
     fn check_entries(&self) -> Result<(), PathError> {
         let source = self.source;
         let protocol = source.protocol();

@@ -125,12 +125,13 @@ EPF reports actual endpoint, resolver, transport and lane observations. A staged
 transport frame is distinct from a committed receive. Matching a label and lane
 to a compiled operation establishes static membership only.
 
-Full dynamic protocol auditing is unfinished. It requires unambiguous links to
-the run, actor, source occurrence, route choices and nested roll visits, plus a
-complete history. The current diagnostic VM does not replay that history or
-certify that every observed operation was enabled. Missing records, counter
-exhaustion or a truncated stream cannot support a completed audit. Application
-effects require their own correspondence to accepted endpoint requests.
+Dynamic protocol auditing is under development. The source checker below
+connects complete captures to a proposed finite execution of the compiled
+protocol. The diagnostic VM observes and filters records; it does not perform
+that source check. Automatic witness construction, general Rust/Lean
+correspondence and qualification of the combined consumer remain unfinished.
+Missing records, counter exhaustion or a truncated stream cannot support an
+audit. Application effects require their own correspondence to accepted requests.
 
 `SCOPE_REENTRY` reports the scope actually reused by a progress commit, including
 the actor, logical view, session and full scope identifier. A roll record also
@@ -167,7 +168,7 @@ or Endpoint commit. Observing a checked poll therefore cannot substitute for
 evidence of acceptance. The tests also check both resolved arms and distinguish
 the receiver's learned selection from the sender's resolver decision. These are legal history
 fixtures for the auditor; a send-publication-before-receive rule would reject
-them. They do not implement or certify the history replay described above.
+them. Selected fixtures also pass through the source-execution checker below.
 
 `proofs/CommitObservations.lean` erases acceptance points from Hibana's existing
 source-occurrence semantics. It proves that the ordinary-message fixture has
@@ -200,8 +201,8 @@ local rows. The two headers supply format version and section counts. These
 records provide the protocol input needed to audit a history. They do not
 report that history's branch selections, roll visits or completed operations.
 Replaying row labels alone cannot establish dynamic eligibility, even when
-every observation is retained. The source snapshot and history replay still
-need to be connected before EPF can certify an execution.
+every observation is retained. The source-execution checker uses the complete
+snapshot rather than treating local rows as an audit choreography.
 
 `Protocol::new(snapshot, workspace)` checks that input before history replay.
 It borrows the original snapshot and releases its temporary workspace after
@@ -240,7 +241,7 @@ Different producers still require separate captures, and each SessionId must
 identify one run. The supplied protocol must match the executable's saved
 build evidence. This correspondence does not authenticate records, establish
 physical acceptance, determine current ownership or certify source eligibility.
-Route/roll replay and correspondence across changing producer ownership remain unfinished.
+Source eligibility requires the selected unfolding and execution check below.
 
 `Protocol::check_custody(captures, order, workspace)` replays actual resource
 transfers in a supplied causal ordering. The order must contain every record
@@ -263,13 +264,10 @@ publication and transfers across three separate runtimes. Mutations preserve
 static membership while changing the holder, choice or resolver result and
 must fail the corresponding dynamic check.
 
-These methods are parts of the history checker under development. They do not
-yet establish that a reset's body was complete, that a retained child was
-aligned with its parent, or that every necessary source predecessor had run.
-They must not be used as a completed protocol-conformance audit. The remaining
-source-execution check must cover those obligations before these stages can be
-combined into the final audit entry point. A witnessed order establishes
-compatibility with that order, not a unique distributed execution time.
+These methods alone check history agreement, not source eligibility or retained
+body completion. The source-execution checker combines them with a checked
+finite source interpretation. A witnessed order establishes compatibility with
+that order, not a unique distributed execution time.
 
 `Protocol::unfolding` checks a finite source-unfolding witness against the
 compiled source. Its postorder steps preserve sequence, parallel composition,
@@ -296,11 +294,39 @@ An incoming continuation already accepted by its sender does not acquire a
 new outgoing prerequisite. Reusing a proof DAG in two visits does not share
 their dynamic entry history.
 
-These source checks do not yet connect that word to captured observations.
-In particular, a supplied acceptance point is not evidence that a transport
-accepted a frame, and a `SEND_POLL` cannot be substituted for acceptance.
-The capture-to-word correspondence and its formal validation remain unfinished.
-The existing Lean claims below do not prove these new Rust source checkers.
+`SourcePath::check_execution(captures, witness, workspace)` connects the complete
+captures to that selected path for one named session. The witness supplies an
+expanded occurrence for every operation and control observation of that run,
+and proposed acceptance boundaries. It reuses the checked call/FIFO links:
+repeated polls, publication and receipt must name the same dynamic occurrence,
+and different calls cannot reuse it. Choices must belong to the corresponding
+selected route visit, and each observed reset must lead to its attributed
+reentry. The source word is reconstructed from actual Endpoint commits and
+supported acceptances, rather than supplied as an unchecked operation list.
+
+Each acceptance must fall after its call's first poll and before its checked
+publication or receipt. A call with neither completion cannot support an
+acceptance. Every poll separately checks source admission at its own boundary,
+including retries; it never appends acceptance or commits source progress.
+Thus moving a first poll before its required local predecessor is rejected even
+when every successful commit is unchanged and acceptance is proposed later.
+Unfinished or failed calls remain admission queries. Workspace is caller-owned
+and derived from actual capture and witness sizes, with checked arithmetic.
+
+Actual Endpoint tests cover separate-runtime loans and unequal publication
+order, changing arms through nested rolls, shared parallel resets in both
+completion orders and a pending old continuation during elastic reentry.
+They also reject invented acceptance after each transport error, reused dynamic
+occurrences, invalid boundaries and short or malformed correspondence input.
+Defect controls omit the per-poll query or completion-evidence requirement;
+each must fail its named regression.
+
+Success is a source interpretation compatible with the witnessed causal order
+and acceptance intervals under the transport contract. It does not establish
+authenticity, a recovered physical acceptance time, completion of a session or
+agreement with application effects. Other runs need their own witness.
+The witness builder and general formal correspondence of these new Rust source
+checks remain unfinished; the existing Lean claims below do not prove them.
 
 `Protocol::deliveries(captures, workspace)` connects successful receives across
 producer captures to send calls. Within each session/source stream it uses the

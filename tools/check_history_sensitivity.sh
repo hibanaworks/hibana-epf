@@ -10,7 +10,7 @@ cargo +stable test --locked --lib --features std protocol::history::tests \
 cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -68,6 +68,14 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
       perl -0pi -e 's/InsertPart::Earlier\(event\)/if earlier == next { InsertPart::Resumed(event) } else { InsertPart::Earlier(event) }/g == 1 or die "missing constructor-child identity\n"' \
         "$source/src/protocol/unfolding.rs"
       ;;
+    PollAdmission)
+      perl -0pi -e 's/if let Some\(prior\) = self\.missing\(points\(&word\[\.\.used\]\), point\)/if let Some(prior) = None::<SourcePoint>/g == 1 or die "missing per-poll admission query\n"' \
+        "$source/src/protocol/execution.rs"
+      ;;
+    AcceptanceEvidence)
+      perl -0pi -e 's/if !completed \{/if false \&\& !completed {/g == 1 or die "missing completion evidence check\n"' \
+        "$source/src/protocol/execution.rs"
+      ;;
   esac
   git -C "$source" diff --binary > "$out/$mutation-mutation.patch"
   status=0
@@ -95,12 +103,16 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         only_a_committed_resumed_body_delays_the_outgoing_continuation -- --exact ;;
       InvocationContext) cargo +stable test --locked --test source_word \
         reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations -- --exact ;;
+      PollAdmission) cargo +stable test --locked --test endpoint_history \
+        source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame -- --exact ;;
+      AcceptanceEvidence) cargo +stable test --locked --test endpoint_history \
+        an_observed_send_poll_can_end_in_a_transport_error_without_a_commit -- --exact ;;
     esac
   ) > "$out/$mutation.log" 2>&1 || status=$?
   test "$status" = 101
   case "$mutation" in
     Length|Ordinals) grep -Fq 'test result: FAILED. 3 passed; 1 failed;' "$out/$mutation.log" ;;
-    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
+    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
   esac
   case "$mutation" in
     Length) name=deleting_any_record_including_the_last_is_incomplete ;;
@@ -113,10 +125,12 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     SourceOrder) name=later_publication_cannot_hide_an_acceptance_before_its_source_predecessor ;;
     ResumptionAdmission) name=only_a_committed_resumed_body_delays_the_outgoing_continuation ;;
     InvocationContext) name=reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations ;;
+    PollAdmission) name=source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame ;;
+    AcceptanceEvidence) name=an_observed_send_poll_can_end_in_a_transport_error_without_a_commit ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"
   find "$source/target" -type f -perm -100 -exec shasum -a 256 -- {} + > "$out/$mutation-binaries.sha256"
   printf 'mutation=%s\nexit=%s\n' "$mutation" "$status" > "$out/$mutation-result.txt"
   rm -r -- "$source"
 done
-echo "History sensitivity: thirteen prefix, call, delivery and source-execution defects fail their regressions"
+echo "History sensitivity: fifteen prefix, call, delivery and source-execution defects fail their regressions"

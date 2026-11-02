@@ -42,6 +42,14 @@ impl Protocol<'_> {
     ) -> Result<(), RouteHistoryError> {
         self.check_custody(captures, order, workspace)
             .map_err(RouteHistoryError::Custody)?;
+        self.check_route_records(captures, order)
+    }
+
+    pub(super) fn check_route_records(
+        &self,
+        captures: &[Capture<'_>],
+        order: &[RecordId],
+    ) -> Result<(), RouteHistoryError> {
         let layout = Layout::checked(*self);
         let observed = |id: RecordId| captures[id.producer].records()[id.ordinal];
         for (position, &id) in order.iter().enumerate() {

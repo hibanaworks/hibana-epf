@@ -4,6 +4,7 @@ use hibana::runtime::tap::{self, TapEvent};
 
 mod custody;
 mod delivery;
+mod execution;
 mod history;
 mod path;
 mod routes;
@@ -11,6 +12,7 @@ mod unfolding;
 mod word;
 pub use custody::CustodyError;
 pub use delivery::{Delivery, DeliveryError, RecordId};
+pub use execution::{Acceptance, ExecutionError, ExecutionWitness};
 pub use history::{HistoryError, SendCall};
 pub use path::{PathError, RouteChoice, SourcePath};
 pub use routes::RouteHistoryError;

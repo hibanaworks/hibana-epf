@@ -78,6 +78,72 @@ fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
     protocol
         .check_routes(&[capture], &order, &mut workspace)
         .unwrap();
+    let steps = [
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Choice([0, 1]),
+        hibana_epf::Unfold::Once(2),
+        hibana_epf::Unfold::More([3, 2]),
+        hibana_epf::Unfold::More([4, 2]),
+        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Sequence([5, 6]),
+        hibana_epf::Unfold::Once(7),
+        hibana_epf::Unfold::Sequence([3, 6]),
+        hibana_epf::Unfold::More([8, 9]),
+    ];
+    let mut proof = vec![0; hibana_epf::Protocol::unfolding_workspace_len(&steps)];
+    let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+    let choices = [
+        hibana_epf::RouteChoice {
+            span: [0, 2],
+            right: false,
+        },
+        hibana_epf::RouteChoice {
+            span: [2, 4],
+            right: false,
+        },
+        hibana_epf::RouteChoice {
+            span: [4, 6],
+            right: true,
+        },
+        hibana_epf::RouteChoice {
+            span: [7, 9],
+            right: false,
+        },
+    ];
+    let mut actors = vec![0; unfolded.path_workspace_len().unwrap()];
+    let path = unfolded.select(&choices, &mut actors).unwrap();
+    let executed = [0, 2, 5, 6, 7, 9];
+    let mut completed = 0;
+    let occurrences: Vec<_> = captured
+        .iter()
+        .map(|record| {
+            if matches!(
+                record.id(),
+                tap::SCOPE_REENTRY | tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION
+            ) {
+                Some(executed[completed])
+            } else if record.id() == tap::ENDPOINT_SEND {
+                let event = executed[completed];
+                completed += 1;
+                Some(event)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let witness = hibana_epf::ExecutionWitness {
+        session: 137,
+        order: &order,
+        occurrences: &occurrences,
+        acceptances: &[],
+    };
+    workspace.resize(
+        path.execution_workspace_len(&[capture], &witness).unwrap(),
+        0,
+    );
+    path.check_execution(&[capture], &witness, &mut workspace)
+        .unwrap();
     // Keep the complete ordinal sequence while replacing the reset that makes
     // the first change of arm legal with an irrelevant observation.
     let right = captured

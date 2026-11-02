@@ -12,6 +12,8 @@ pub enum HistoryError {
     Record { index: usize },
     /// Words needed for record links, scope sorting and actor-reference membership.
     Workspace { required: usize, actual: usize },
+    /// Required storage cannot be represented on this target.
+    Overflow,
 }
 
 /// The checked polls of one send and its publication, when present.
@@ -54,11 +56,17 @@ impl Protocol<'_> {
     /// Workspace words for `send_calls`: four per capture record, two per
     /// source event, one per scope marker and one bit per actor decision.
     pub fn send_call_workspace_len(&self, capture: Capture<'_>) -> usize {
+        self.call_words(capture.records().len())
+            .expect("send-call workspace size is not representable")
+    }
+
+    pub(super) fn call_words(&self, records: usize) -> Option<usize> {
         let layout = Layout::checked(*self);
-        4 * capture.records().len()
-            + 2 * layout.sources.len()
-            + layout.scopes.len()
-            + layout.actor_words()
+        records
+            .checked_mul(4)?
+            .checked_add(2 * layout.sources.len())?
+            .checked_add(layout.scopes.len())?
+            .checked_add(layout.actor_words())
     }
 
     /// Recover this producer's send boundaries in first-poll order.
@@ -89,7 +97,9 @@ impl Protocol<'_> {
         capture: Capture<'a>,
         workspace: &'w mut [usize],
     ) -> Result<impl Iterator<Item = SendCall<'w>> + 'w, HistoryError> {
-        let required = self.send_call_workspace_len(capture);
+        let required = self
+            .call_words(capture.records().len())
+            .ok_or(HistoryError::Overflow)?;
         if workspace.len() < required {
             return Err(HistoryError::Workspace {
                 required,

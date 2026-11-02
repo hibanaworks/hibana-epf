@@ -53,60 +53,75 @@ impl SourcePath<'_, '_, '_> {
     /// word. Capture correspondence must establish those boundaries as well.
     pub fn check_word(&self, word: &[SourcePoint]) -> Result<(), WordError> {
         for (index, &point) in word.iter().enumerate() {
-            let history = &word[..index];
-            if self.point_actor(point).is_none() {
-                return Err(WordError::Point { index });
-            }
-            if let Some(earlier) = history.iter().position(|&prior| prior == point) {
-                return Err(WordError::Duplicate { index, earlier });
-            }
-            if let SourcePoint::Sent(event) | SourcePoint::Received(event) = point
-                && !history.contains(&SourcePoint::Accepted(event))
-            {
-                return Err(WordError::Predecessor {
-                    index,
-                    prior: SourcePoint::Accepted(event),
-                });
-            }
-            let source = self.unfolding();
-            for event in 0..source.event_count() {
-                for prior in [
-                    SourcePoint::Local(event),
-                    SourcePoint::Sent(event),
-                    SourcePoint::Received(event),
-                ] {
-                    let Some(actor) = self.point_actor(prior) else {
-                        continue;
-                    };
-                    if Some(actor) != self.point_actor(point) {
-                        continue;
-                    }
-                    let ordered = match point {
-                        SourcePoint::Sent(_) => false,
-                        _ => {
-                            if event == point.event() {
-                                matches!(
-                                    (prior, point),
-                                    (SourcePoint::Sent(_), SourcePoint::Received(_))
-                                )
-                            } else {
-                                source.before(event, point.event())
-                            }
-                        }
-                    };
-                    let resumption = matches!(point, SourcePoint::Accepted(_))
-                        && history.iter().any(|&entry| {
-                            !matches!(entry, SourcePoint::Accepted(_))
-                                && self.point_actor(entry) == Some(actor)
-                                && source.same_resumption(event, point.event(), entry.event())
-                        });
-                    if (ordered || resumption) && !history.contains(&prior) {
-                        return Err(WordError::Predecessor { index, prior });
-                    }
+            self.check_next(word[..index].iter().copied(), point, index)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_next(
+        &self,
+        history: impl Clone + Iterator<Item = SourcePoint>,
+        point: SourcePoint,
+        index: usize,
+    ) -> Result<(), WordError> {
+        if self.point_actor(point).is_none() {
+            return Err(WordError::Point { index });
+        }
+        if let Some(earlier) = history.clone().position(|prior| prior == point) {
+            return Err(WordError::Duplicate { index, earlier });
+        }
+        if let Some(prior) = self.missing(history, point) {
+            return Err(WordError::Predecessor { index, prior });
+        }
+        Ok(())
+    }
+
+    // A readiness query does not append a source point. In particular, another
+    // poll of an already accepted send checks admission without duplicating it.
+    pub(super) fn missing(
+        &self,
+        history: impl Clone + Iterator<Item = SourcePoint>,
+        point: SourcePoint,
+    ) -> Option<SourcePoint> {
+        let contains = |prior| history.clone().any(|entry| entry == prior);
+        if let SourcePoint::Sent(event) | SourcePoint::Received(event) = point
+            && !contains(SourcePoint::Accepted(event))
+        {
+            return Some(SourcePoint::Accepted(event));
+        }
+        let source = self.unfolding();
+        for event in 0..source.event_count() {
+            for prior in [
+                SourcePoint::Local(event),
+                SourcePoint::Sent(event),
+                SourcePoint::Received(event),
+            ] {
+                let Some(actor) = self.point_actor(prior) else {
+                    continue;
+                };
+                if Some(actor) != self.point_actor(point) {
+                    continue;
+                }
+                let ordered = match point {
+                    SourcePoint::Sent(_) => false,
+                    _ if event == point.event() => matches!(
+                        (prior, point),
+                        (SourcePoint::Sent(_), SourcePoint::Received(_))
+                    ),
+                    _ => source.before(event, point.event()),
+                };
+                let resumption = matches!(point, SourcePoint::Accepted(_))
+                    && history.clone().any(|entry| {
+                        !matches!(entry, SourcePoint::Accepted(_))
+                            && self.point_actor(entry) == Some(actor)
+                            && source.same_resumption(event, point.event(), entry.event())
+                    });
+                if (ordered || resumption) && !contains(prior) {
+                    return Some(prior);
                 }
             }
         }
-        Ok(())
+        None
     }
 
     pub(super) fn point_actor(&self, point: SourcePoint) -> Option<u8> {

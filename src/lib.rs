@@ -23,9 +23,9 @@ use hibana::runtime::{
 
 pub use capture::{Capture, CaptureError};
 pub use protocol::{
-    CustodyError, Delivery, DeliveryError, HistoryError, PathError, Protocol, ProtocolError,
-    RecordId, RouteChoice, RouteHistoryError, SendCall, SourcePath, SourcePoint, Unfold, Unfolded,
-    UnfoldingError, WordError,
+    Acceptance, CustodyError, Delivery, DeliveryError, ExecutionError, ExecutionWitness,
+    HistoryError, PathError, Protocol, ProtocolError, RecordId, RouteChoice, RouteHistoryError,
+    SendCall, SourcePath, SourcePoint, Unfold, Unfolded, UnfoldingError, WordError,
 };
 pub use verifier::{Header, VerifyError, compute_hash};
 pub use vm::Trap;

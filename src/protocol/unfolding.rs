@@ -283,6 +283,68 @@ impl Unfolded<'_, '_> {
         self.steps[proof]
     }
 
+    pub(super) fn reentered(&self, event: usize, key: u16) -> bool {
+        let layout = Layout::checked(self.protocol);
+        let records = self.protocol.records;
+        let Some(target) = layout.scope(records, key) else {
+            return false;
+        };
+        let contains = |outer: u16| {
+            layout
+                .scope(records, outer)
+                .is_some_and(|bounds| bounds.first <= target.first && target.last <= bounds.last)
+        };
+        let mut resumed = false;
+        self.contexts(event, |proof, _, local| {
+            let region = get(self.rows, proof);
+            let original = records.get(layout.scopes.start + region.first);
+            match self.steps[proof] {
+                Unfold::More([earlier, _]) if local >= self.count(earlier) => {
+                    if !region.rolled && original.is_some_and(|row| contains(row.causal_key())) {
+                        resumed = true;
+                    }
+                }
+                Unfold::Independent([left, right]) => {
+                    let (child, at) = if local < self.count(left) {
+                        (left, local)
+                    } else {
+                        (right, local - self.count(left))
+                    };
+                    if original.is_some_and(|row| contains(row.causal_key()))
+                        && self.copy_range(child, at).is_some_and(|copy| copy[0] != 0)
+                    {
+                        resumed = true;
+                    }
+                }
+                Unfold::After {
+                    retained, earlier, ..
+                } if local >= self.count(earlier) && contains(retained) => resumed = true,
+                Unfold::Alongside {
+                    retained,
+                    earlier,
+                    next,
+                    focus,
+                    ..
+                }
+                | Unfold::Before {
+                    retained,
+                    earlier,
+                    next,
+                    focus,
+                    ..
+                } => {
+                    let start = self.count(earlier) + focus[0];
+                    if start <= local && local - start < self.count(next) && contains(retained) {
+                        resumed = true;
+                    }
+                }
+                _ => (),
+            }
+            !resumed
+        });
+        resumed
+    }
+
     // A proof step plus its base in proof-leaf order uniquely identifies an
     // invocation even when the same DAG step is reused in several visits.
     pub(super) fn contexts(

@@ -22,22 +22,57 @@ pub enum CustodyError {
     Owner { record: RecordId, role: u8 },
     /// Resolver evidence names no compiled choice authority.
     Resolver { record: RecordId },
+    /// Required storage cannot be represented on this target.
+    Overflow,
+}
+
+// Checked evidence links, shared by custody and source-execution checking.
+// Values index capture records, not Endpoint storage or application progress.
+pub(super) struct Correspondence<'w> {
+    roots: &'w [usize],
+    ranks: &'w [usize],
+    offsets: &'w [usize],
+}
+
+impl Correspondence<'_> {
+    pub(super) fn index(&self, id: RecordId) -> usize {
+        self.offsets[id.producer] + id.ordinal
+    }
+
+    pub(super) fn root(&self, id: RecordId) -> Option<usize> {
+        self.roots[self.index(id)].checked_sub(1)
+    }
+
+    pub(super) fn rank(&self, id: RecordId) -> usize {
+        self.ranks[self.index(id)]
+    }
+
+    pub(super) fn root_rank(&self, id: RecordId) -> Option<usize> {
+        self.root(id).map(|root| self.ranks[root])
+    }
 }
 
 impl Protocol<'_> {
     /// Words needed to check custody. Space depends on the actual capture sizes,
     /// compiled initial bindings and existing send-call checker's requirements.
     pub fn custody_workspace_len(&self, captures: &[Capture<'_>]) -> usize {
-        let records: usize = captures.iter().map(|capture| capture.records().len()).sum();
-        4 * records
-            + captures.len()
-            + 1
-            + Layout::checked(*self).initial.len()
-            + captures
-                .iter()
-                .map(|&capture| self.send_call_workspace_len(capture))
-                .max()
-                .unwrap_or(0)
+        self.custody_words(captures)
+            .expect("custody workspace size is not representable")
+    }
+
+    pub(super) fn custody_words(&self, captures: &[Capture<'_>]) -> Option<usize> {
+        let mut count = 0usize;
+        let mut scratch = 0;
+        for capture in captures {
+            let records = capture.records().len();
+            count = count.checked_add(records)?;
+            scratch = scratch.max(self.call_words(records)?);
+        }
+        count
+            .checked_mul(4)?
+            .checked_add(captures.len())?
+            .checked_add(1 + Layout::checked(*self).initial.len())?
+            .checked_add(scratch)
     }
 
     /// Replay delegated-role custody in one proposed ordering of observations.
@@ -64,7 +99,16 @@ impl Protocol<'_> {
         order: &[RecordId],
         workspace: &mut [usize],
     ) -> Result<(), CustodyError> {
-        let required = self.custody_workspace_len(captures);
+        self.checked_custody(captures, order, workspace).map(|_| ())
+    }
+
+    pub(super) fn checked_custody<'w>(
+        &self,
+        captures: &[Capture<'_>],
+        order: &[RecordId],
+        workspace: &'w mut [usize],
+    ) -> Result<Correspondence<'w>, CustodyError> {
+        let required = self.custody_words(captures).ok_or(CustodyError::Overflow)?;
         if workspace.len() < required {
             return Err(CustodyError::Workspace {
                 required,
@@ -238,7 +282,11 @@ impl Protocol<'_> {
                 }
             }
         }
-        Ok(())
+        Ok(Correspondence {
+            roots,
+            ranks,
+            offsets,
+        })
     }
 }
 
