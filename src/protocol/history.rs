@@ -462,13 +462,6 @@ impl Layout {
             && contains_actor(reference, reset.causal_key() >> 8, candidates)
     }
 
-    fn checked(protocol: Protocol<'_>) -> Self {
-        match Self::read(protocol.records) {
-            Ok(layout) => layout,
-            Err(_) => unreachable!("Protocol retains checked immutable headers"),
-        }
-    }
-
     fn select_actor(&self, records: &[TapEvent], actor: u8, candidates: &mut [usize]) {
         candidates.fill(0);
         for (index, decision) in records[self.decisions.clone()].iter().enumerate() {

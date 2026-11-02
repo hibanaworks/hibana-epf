@@ -2,7 +2,9 @@
 use core::ops::Range;
 use hibana::runtime::tap::{self, TapEvent};
 
+mod delivery;
 mod history;
+pub use delivery::{Delivery, DeliveryError, RecordId};
 pub use history::{HistoryError, SendCall};
 
 /// A complete, structurally checked snapshot from `tap::projected`.
@@ -124,6 +126,13 @@ fn check(condition: bool, index: usize) -> Result<(), ProtocolError> {
 }
 
 impl Layout {
+    fn checked(protocol: Protocol<'_>) -> Self {
+        match Self::read(protocol.records) {
+            Ok(layout) => layout,
+            Err(_) => unreachable!("Protocol retains checked immutable headers"),
+        }
+    }
+
     fn actor_words(&self) -> usize {
         self.decisions.len().div_ceil(usize::BITS as usize)
     }

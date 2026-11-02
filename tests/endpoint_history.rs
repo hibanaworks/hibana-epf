@@ -19,7 +19,7 @@ use hibana::{
         wire::Payload,
     },
 };
-use hibana_epf::{Capture, Epf, EpfStorage, HistoryError, Protocol};
+use hibana_epf::{Capture, DeliveryError, Epf, EpfStorage, HistoryError, Protocol};
 
 #[derive(Clone, Copy)]
 struct Frame {
@@ -159,6 +159,193 @@ impl Transport for DelayedPublication {
             Err(error) => Err(error),
         }
     }
+}
+
+// These handles reach one physical test inbox and the same sole binding.
+// Each runtime still owns its own ports, progress, tap ring and checkpoint.
+impl Transport for &DelayedPublication {
+    type Tx<'a>
+        = <DelayedPublication as Transport>::Tx<'a>
+    where
+        Self: 'a;
+    type Rx<'a>
+        = <DelayedPublication as Transport>::Rx<'a>
+    where
+        Self: 'a;
+
+    fn initial_endpoint_binding(&self, sid: SessionId, role: u8) -> Option<&EndpointBinding> {
+        (**self).initial_endpoint_binding(sid, role)
+    }
+
+    fn open(&self, port: PortOpen) -> (Self::Tx<'_>, Self::Rx<'_>) {
+        (**self).open(port)
+    }
+
+    fn poll_send(
+        &self,
+        tx: &mut (PortOpen, Option<FrameHeader>),
+        outgoing: Outgoing<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), TransportError>> {
+        (**self).poll_send(tx, outgoing, cx)
+    }
+
+    fn cancel_send(&self, tx: &mut (PortOpen, Option<FrameHeader>)) {
+        (**self).cancel_send(tx);
+    }
+
+    fn poll_recv<'a>(
+        &'a self,
+        rx: &'a mut (PortOpen, Option<Frame>),
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ReceivedFrame<'a>, TransportError>> {
+        (**self).poll_recv(rx, cx)
+    }
+
+    fn requeue(&self, rx: &mut (PortOpen, Option<Frame>)) -> Result<(), TransportError> {
+        (**self).requeue(rx)
+    }
+}
+
+#[test]
+fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_publication() {
+    type Loan = Msg<7, Endpoint<'static, 3>>;
+    type Use = Msg<8, ()>;
+    let global = g::seq(
+        g::send::<0, 1, Loan>(),
+        g::seq(g::send::<3, 2, Use>().roll(), g::send::<1, 0, Loan>()),
+    );
+    let p0 = project::<0>(&global);
+    let p1 = project::<1>(&global);
+    let p2 = project::<2>(&global);
+    let p3 = project::<3>(&global);
+    let transport = DelayedPublication {
+        inbox: Cell::new(Ok(None)),
+        reader: Cell::new(None),
+        // SAFETY: all three runtimes reach this sole fresh physical resource.
+        resource: Some(unsafe { EndpointBinding::new() }),
+        backpressured_receiver: None,
+    };
+    let mut slabs = [[0; 32768]; 3];
+    let [slab0, slab1, slab2] = &mut slabs;
+    let mut storage0 = SessionKitStorage::uninit();
+    let mut storage1 = SessionKitStorage::uninit();
+    let mut storage2 = SessionKitStorage::uninit();
+    let kit0 = storage0.init().rendezvous(slab0, &transport).unwrap();
+    let kit1 = storage1.init().rendezvous(slab1, &transport).unwrap();
+    let kit2 = storage2.init().rendezvous(slab2, &transport).unwrap();
+    let sid = SessionId::new(110);
+    let mut owner = kit0.enter(sid, &p0).unwrap();
+    let resource = kit0.enter(sid, &p3).unwrap();
+    let mut worker = kit1.enter(sid, &p1).unwrap();
+    let mut service = kit2.enter(sid, &p2).unwrap();
+    let mut tap0 = kit0.tap();
+    let mut tap1 = kit1.tap();
+    let mut tap2 = kit2.tap();
+    let mut records0: Vec<_> = tap0.by_ref().collect();
+    let mut records1: Vec<_> = tap1.by_ref().collect();
+    let mut records2: Vec<_> = tap2.by_ref().collect();
+    let mut cx = Context::from_waker(Waker::noop());
+    let resource = {
+        let mut lending = core::pin::pin!(owner.send::<Loan>(resource));
+        assert!(lending.as_mut().poll(&mut cx).is_pending());
+        let receiving = core::pin::pin!(worker.recv::<Loan>());
+        let Poll::Ready(Ok(mut resource)) = receiving.poll(&mut cx) else {
+            panic!("the separate runtime must receive the actual resource")
+        };
+        records0.extend(tap0.by_ref());
+        records1.extend(tap1.by_ref());
+        for _ in 0..2 {
+            let mut sending = core::pin::pin!(resource.send::<Use>(&()));
+            assert!(sending.as_mut().poll(&mut cx).is_pending());
+            let receiving = core::pin::pin!(service.recv::<Use>());
+            assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+            records1.extend(tap1.by_ref());
+            records2.extend(tap2.by_ref());
+            // The loan's publication is still absent on its other producer.
+            assert!(!records0.iter().any(
+                |record| record.id() == tap::ENDPOINT_SESSION && record.causal_key() as u8 == 1
+            ));
+            assert!(matches!(
+                sending.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            records1.extend(tap1.by_ref());
+        }
+        assert!(matches!(
+            lending.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        records0.extend(tap0.by_ref());
+        resource
+    };
+    {
+        let mut returning = core::pin::pin!(worker.send::<Loan>(resource));
+        assert!(returning.as_mut().poll(&mut cx).is_pending());
+        let receiving = core::pin::pin!(owner.recv::<Loan>());
+        let Poll::Ready(Ok(resource)) = receiving.poll(&mut cx) else {
+            panic!("the original runtime must receive the returned continuation")
+        };
+        assert!(matches!(
+            returning.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        drop(resource);
+    }
+    records0.extend(tap0.by_ref());
+    records1.extend(tap1.by_ref());
+    records2.extend(tap2.by_ref());
+    let originals = [records0.clone(), records1.clone(), records2.clone()];
+    let captures = [
+        Capture::new(&records0, tap0.checkpoint()).unwrap(),
+        Capture::new(&records1, tap1.checkpoint()).unwrap(),
+        Capture::new(&records2, tap2.checkpoint()).unwrap(),
+    ];
+    let snapshot: Vec<_> = tap::projected(&p0).collect();
+    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    for permutation in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+        let inputs = permutation.map(|index| captures[index]);
+        workspace.resize(protocol.delivery_workspace_len(&inputs), usize::MAX);
+        let deliveries: Vec<_> = protocol
+            .deliveries(&inputs, &mut workspace)
+            .unwrap()
+            .collect();
+        assert_eq!(deliveries.len(), 4);
+        for delivery in deliveries {
+            let sending =
+                inputs[delivery.first_poll.producer].records()[delivery.first_poll.ordinal];
+            let received = inputs[delivery.receive.producer].records()[delivery.receive.ordinal];
+            assert_eq!(sending.id(), tap::SEND_POLL);
+            assert_eq!(sending.arg1() as u16, received.arg1() as u16);
+            assert_ne!(delivery.first_poll.producer, delivery.receive.producer);
+            let event = sending.arg1() as u16;
+            let expected = if event == 0 {
+                (0, 1)
+            } else if event == 1 {
+                (1, 2)
+            } else {
+                (1, 0)
+            };
+            assert_eq!(
+                (
+                    permutation[delivery.first_poll.producer],
+                    permutation[delivery.receive.producer]
+                ),
+                expected
+            );
+        }
+    }
+    assert_eq!(
+        originals,
+        [records0.clone(), records1.clone(), records2.clone()]
+    );
+    let inputs = [captures[2]];
+    workspace.resize(protocol.delivery_workspace_len(&inputs), 0);
+    assert!(matches!(
+        protocol.deliveries(&inputs, &mut workspace),
+        Err(DeliveryError::Unmatched { .. })
+    ));
 }
 
 #[test]

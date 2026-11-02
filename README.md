@@ -240,7 +240,30 @@ Different producers still require separate captures, and each SessionId must
 identify one run. The supplied protocol must match the executable's saved
 build evidence. This correspondence does not authenticate records, establish
 physical acceptance, determine current ownership or certify source eligibility.
-Route/roll replay and cross-producer delivery remain unfinished.
+Route/roll replay and correspondence across changing producer ownership remain unfinished.
+
+`Protocol::deliveries(captures, workspace)` connects successful receives across
+producer captures to send calls. Within each session/source stream it uses the
+transport's affine FIFO contract, with one producer per side. Several producers
+on either side require further handoff evidence and return `Ambiguous`; their
+unrelated ordinals cannot resolve the order. A missing send, reused receipt or
+inconsistent producer history is rejected. It checks a common causal ordering
+of every producer's records and the poll-before-receive edges, then verifies
+that ordering by its defining inequalities. A cyclic exchange is rejected even
+when each individual frame has a matching send. Neither this ordering nor the
+first poll fixes the time of physical acceptance. Sender publication may still
+follow receipt. Open sends are retained as unmatched prefix operations, without
+claiming a completed session, source eligibility or payload agreement.
+
+The temporary storage is four words per input record, one per producer plus
+one, and the largest producer's send-call workspace. Captures are borrowed
+unchanged; the resulting delivery links refer to producer/ordinal coordinates.
+Tests drive actual owned Endpoint transfers and rolled resource requests across
+three runtimes, including receipt and resource use before loan publication.
+Small directed graphs are compared exhaustively with independent reachability.
+`DeliveryOrder.lean` proves that increasing ranks exclude causal cycles and
+allow receipt before publication. These claims specify the final order check;
+they do not prove FIFO transport, the entire Rust matcher or dynamic replay.
 
 Actual Endpoint tests include interleaved parallel calls finishing in reverse,
 two rolled executions of one source event, both resolved arms, transport faults

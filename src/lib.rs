@@ -22,7 +22,9 @@ use hibana::runtime::{
 };
 
 pub use capture::{Capture, CaptureError};
-pub use protocol::{HistoryError, Protocol, ProtocolError, SendCall};
+pub use protocol::{
+    Delivery, DeliveryError, HistoryError, Protocol, ProtocolError, RecordId, SendCall,
+};
 pub use verifier::{Header, VerifyError, compute_hash};
 pub use vm::Trap;
 
