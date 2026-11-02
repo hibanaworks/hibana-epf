@@ -24,7 +24,9 @@ theorem sequence_order_is_unchanged (source : Source) (first second : Nat) :
 
 theorem witness_retains_every_original_occurrence (source : Source) (start : Nat) :
     (witness source).occurrences start = source.messageEntries start := by
-  induction source generalizing start <;>
+  induction source generalizing start
+  case roll body ih => exact ih start
+  all_goals
     simp_all [witness, SourceUnfolding.oneCopy, SourceUnfolding.occurrences,
       Source.messageEntries]
 
