@@ -374,6 +374,13 @@ the pending-continuation fixtures. These claims do not prove general Rust/Lean
 refinement. This core preparation still needs whole-core qualification; an EPF
 gate pass alone does not establish that result.
 
+The local gate passed at EPF `395e801` with core `08d0439`: 93 native tests,
+88 strict-provenance Miri tests, 46 audited Lean claims and all 16 history defect
+controls, plus Clippy, doctests and no_std/thumbv6m builds. Input source hashes
+matched after the gate. Peak memory across the guarded process tree was
+688,160,768 bytes. These are mechanism checks, not application-effect or
+whole-core qualification.
+
 `Protocol::deliveries(captures, workspace)` connects successful receives across
 producer captures to send calls. Within each session/source stream it uses the
 transport's affine FIFO contract, with one producer per side. Several producers
