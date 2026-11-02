@@ -47,7 +47,7 @@ LEAN_PATH="$core/proofs/lean/.lake/build/lib/lean" \
 bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/capture-execution-lean.log" 14
 LEAN_PATH="$core/proofs/lean/.lake/build/lib/lean" \
   lean proofs/CompactSource.lean 2>&1 | tee "$out/compact-source-lean.log"
-bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/compact-source-lean.log" 4
+bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/compact-source-lean.log" 7
 shasum -a 256 --check "$out/source.sha256" > "$out/source-check.log"
 (cd "$core" && shasum -a 256 --check "$out/core-source.sha256") > "$out/core-source-check.log"
-echo "Observation proofs: ten source boundaries, four complete-prefix, thirteen send/reset/word, five causal-order, fourteen capture/source-execution and four compact-source claims"
+echo "Observation proofs: ten source boundaries, four complete-prefix, thirteen send/reset/word, five causal-order, fourteen capture/source-execution and seven compact-source/search claims"

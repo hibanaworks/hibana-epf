@@ -352,6 +352,12 @@ one-copy unfolding without constructing another AST. Four Lean claims check
 that this representation preserves event count, source identities, messages and
 sequence order.
 
+Binary subtree boundaries are found by classifying events on each side, including
+events inserted into a retained continuation. Tests compare every interval in
+mixed unfolding fixtures with exhaustive cut enumeration. Three further Lean
+claims establish the insertion mapping and the boundary search under that
+classification contract; they do not establish whole-Rust refinement.
+
 There is no fixed depth or visit horizon. The caller's proof capacity bounds
 this finite search. `AuditError::Exhausted` means no certificate was constructed
 within that capacity; it is not a verdict that the history or global is illegal.

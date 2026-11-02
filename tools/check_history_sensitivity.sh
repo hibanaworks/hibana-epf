@@ -10,7 +10,7 @@ cargo +stable test --locked --lib --features std protocol::history::tests \
 cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -84,6 +84,14 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
       perl -0pi -e 's/used\[producer\] < captures\[producer\]\.records\(\)\.len\(\)/used[producer] < captures[producer].records().len() \&\& order[..depth].iter().all(|prior| prior.producer <= producer)/g == 1 or die "missing record interleaving search\n"' \
         "$source/src/protocol/interpret.rs"
       ;;
+    SplitInsertion)
+      perl -0pi -e 's/event = focus\[0\] \+ event\.saturating_sub\(focus\[0\] \+ count\(next\)\);/event = event.saturating_sub(count(next));/g == 1 or die "missing insertion event mapping\n"' \
+        "$source/src/protocol/unfolding.rs"
+      ;;
+    SplitBoundary)
+      perl -0pi -e 's/if left \{\n                first = middle \+ 1;/if !left {\n                first = middle + 1;/g == 1 or die "missing structural boundary search\n"' \
+        "$source/src/protocol/unfolding.rs"
+      ;;
   esac
   git -C "$source" diff --binary > "$out/$mutation-mutation.patch"
   status=0
@@ -117,12 +125,14 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         an_observed_send_poll_can_end_in_a_transport_error_without_a_commit -- --exact ;;
       ConstructorOrder) cargo +stable test --locked --test source_interpretation \
         causal_order_search_matches_every_interleaving_and_rejects_an_early_reply -- --exact ;;
+      SplitInsertion|SplitBoundary) cargo +stable test --locked --lib \
+        protocol::unfolding::tests::structural_splits_match_full_cut_enumeration_across_all_unfolding_constructors -- --exact ;;
     esac
   ) > "$out/$mutation.log" 2>&1 || status=$?
   test "$status" = 101
   case "$mutation" in
     Length|Ordinals) grep -Fq 'test result: FAILED. 3 passed; 1 failed;' "$out/$mutation.log" ;;
-    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
+    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*|Split*) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
   esac
   case "$mutation" in
     Length) name=deleting_any_record_including_the_last_is_incomplete ;;
@@ -138,10 +148,11 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     PollAdmission|ConstructorValidation) name=source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame ;;
     AcceptanceEvidence) name=an_observed_send_poll_can_end_in_a_transport_error_without_a_commit ;;
     ConstructorOrder) name=causal_order_search_matches_every_interleaving_and_rejects_an_early_reply ;;
+    SplitInsertion|SplitBoundary) name=protocol::unfolding::tests::structural_splits_match_full_cut_enumeration_across_all_unfolding_constructors ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"
   find "$source/target" -type f -perm -100 -exec shasum -a 256 -- {} + > "$out/$mutation-binaries.sha256"
   printf 'mutation=%s\nexit=%s\n' "$mutation" "$status" > "$out/$mutation-result.txt"
   rm -r -- "$source"
 done
-echo "History sensitivity: seventeen prefix, call, delivery and source-execution defects fail their regressions"
+echo "History sensitivity: nineteen prefix, call, delivery, source-execution and split defects fail their regressions"

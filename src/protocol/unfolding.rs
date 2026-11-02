@@ -263,7 +263,7 @@ impl<'p> Protocol<'p> {
                     focus,
                     ..
                 } => {
-                    if subtree_kind(*self, steps, rows, tail, focus).is_none() {
+                    if subtree_at(*self, steps, rows, tail, focus, focus[0]).is_none() {
                         return Err(UnfoldingError::Step { index });
                     }
                     count(earlier)
@@ -662,7 +662,7 @@ impl Unfolded<'_, '_> {
 
     pub(super) fn kind(&self, span: [usize; 2]) -> Option<NodeKind> {
         let root = self.steps.len() - 1;
-        subtree_kind(self.protocol, self.steps, self.rows, root, span)
+        subtree_at(self.protocol, self.steps, self.rows, root, span, span[0]).map(|(kind, _)| kind)
     }
 
     pub(super) fn parts(&self, span: [usize; 2]) -> Option<(NodeKind, usize)> {
@@ -671,12 +671,21 @@ impl Unfolded<'_, '_> {
         if matches!(kind, NodeKind::Message) {
             return Some((kind, span[1]));
         }
-        let split = (span[0] + 1..span[1]).find(|&split| {
-            subtree_kind(self.protocol, self.steps, self.rows, root, [span[0], split]).is_some()
-                && subtree_kind(self.protocol, self.steps, self.rows, root, [split, span[1]])
-                    .is_some()
-        })?;
-        Some((kind, split))
+        // Each binary subtree has two contiguous, nonempty children. Classify
+        // an event through the derivation instead of testing every possible
+        // split by reconstructing two subtrees from the root.
+        let mut first = span[0] + 1;
+        let mut last = span[1];
+        while first < last {
+            let middle = first + (last - first) / 2;
+            let (_, left) = subtree_at(self.protocol, self.steps, self.rows, root, span, middle)?;
+            if left {
+                first = middle + 1;
+            } else {
+                last = middle;
+            }
+        }
+        (first < span[1]).then_some((kind, first))
     }
 
     pub(super) fn independent_between(&self, mut first: usize, mut second: usize) -> bool {
@@ -1059,12 +1068,13 @@ impl Layout {
         })
     }
 
-    fn source_kind(
+    fn source_at(
         &self,
         records: &[hibana::runtime::tap::TapEvent],
         mut region: Region,
         mut span: [usize; 2],
-    ) -> Option<NodeKind> {
+        mut event: usize,
+    ) -> Option<(NodeKind, bool)> {
         loop {
             region = self.canonical(records, region);
             if span[0] >= span[1] || span[1] > region.end - region.start {
@@ -1073,17 +1083,18 @@ impl Layout {
             let head = self.head(records, region)?;
             match head {
                 Head::Roll(body) => region = body,
-                Head::Message => return (span == [0, 1]).then_some(NodeKind::Message),
+                Head::Message => return (span == [0, 1]).then_some((NodeKind::Message, false)),
                 Head::Sequence(children) | Head::Parallel(children) | Head::Choice(children) => {
                     if span == [0, region.end - region.start] {
-                        return Some(match head {
+                        let kind = match head {
                             Head::Sequence(_) => NodeKind::Sequence,
                             Head::Parallel(_) => NodeKind::Parallel,
                             Head::Choice(_) => NodeKind::Choice(
                                 records[self.scopes.start + region.first].causal_key(),
                             ),
                             Head::Message | Head::Roll(_) => unreachable!(),
-                        });
+                        };
+                        return Some((kind, event < children[0].end - children[0].start));
                     }
                     let split = children[0].end - children[0].start;
                     if span[1] <= split {
@@ -1091,6 +1102,7 @@ impl Layout {
                     } else if span[0] >= split {
                         span[0] -= split;
                         span[1] -= split;
+                        event -= split;
                         region = children[1];
                     } else {
                         return None;
@@ -1157,7 +1169,7 @@ impl Layout {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NodeKind {
     Message,
     Sequence,
@@ -1165,13 +1177,20 @@ pub(super) enum NodeKind {
     Choice(u16),
 }
 
-fn subtree_kind(
+#[cfg(test)]
+mod tests;
+
+fn subtree_at(
     protocol: Protocol<'_>,
     steps: &[Unfold],
     rows: &[usize],
     mut at: usize,
     mut span: [usize; 2],
-) -> Option<NodeKind> {
+    mut event: usize,
+) -> Option<(NodeKind, bool)> {
+    if !(span[0] <= event && event < span[1]) {
+        return None;
+    }
     loop {
         let count = |node| rows[5 * node + 4];
         if span[0] >= span[1] || span[1] > count(at) {
@@ -1180,31 +1199,43 @@ fn subtree_kind(
         if span == [0, count(at)] {
             return Some(match steps[at] {
                 Unfold::Source => {
-                    return Layout::checked(protocol).source_kind(
+                    return Layout::checked(protocol).source_at(
                         protocol.records,
                         get(rows, at),
                         span,
+                        event,
                     );
                 }
                 Unfold::Once(body) => {
                     at = body;
                     continue;
                 }
-                Unfold::Sequence(_) | Unfold::More(_) | Unfold::After { .. } => NodeKind::Sequence,
-                Unfold::Parallel(_) | Unfold::Independent(_) => NodeKind::Parallel,
-                Unfold::Choice(_) => NodeKind::Choice(
-                    protocol.records[Layout::checked(protocol).scopes.start + get(rows, at).first]
-                        .causal_key(),
+                Unfold::Sequence([a, _])
+                | Unfold::More([a, _])
+                | Unfold::After { earlier: a, .. } => (NodeKind::Sequence, event < count(a)),
+                Unfold::Parallel([a, _]) | Unfold::Independent([a, _]) => {
+                    (NodeKind::Parallel, event < count(a))
+                }
+                Unfold::Choice([a, _]) => (
+                    NodeKind::Choice(
+                        protocol.records
+                            [Layout::checked(protocol).scopes.start + get(rows, at).first]
+                            .causal_key(),
+                    ),
+                    event < count(a),
                 ),
-                Unfold::Alongside { .. } | Unfold::Before { .. } => NodeKind::Sequence,
+                Unfold::Alongside { earlier, .. } | Unfold::Before { earlier, .. } => {
+                    (NodeKind::Sequence, event < count(earlier))
+                }
             });
         }
         match steps[at] {
             Unfold::Source => {
-                return Layout::checked(protocol).source_kind(
+                return Layout::checked(protocol).source_at(
                     protocol.records,
                     get(rows, at),
                     span,
+                    event,
                 );
             }
             Unfold::Once(body) => at = body,
@@ -1223,6 +1254,7 @@ fn subtree_kind(
                 } else if span[0] >= count(a) {
                     span[0] -= count(a);
                     span[1] -= count(a);
+                    event -= count(a);
                     at = b;
                 } else {
                     return None;
@@ -1251,24 +1283,35 @@ fn subtree_kind(
                 }
                 span[0] -= count(earlier);
                 span[1] -= count(earlier);
+                event -= count(earlier);
                 if span == [focus[0], focus[1] + count(next)] {
-                    return Some(if matches!(steps[at], Unfold::Before { .. }) {
-                        NodeKind::Sequence
-                    } else {
-                        NodeKind::Parallel
-                    });
+                    return Some((
+                        if matches!(steps[at], Unfold::Before { .. }) {
+                            NodeKind::Sequence
+                        } else {
+                            NodeKind::Parallel
+                        },
+                        event < focus[0] + count(next),
+                    ));
                 }
                 if focus[0] <= span[0] && span[1] <= focus[0] + count(next) {
                     span[0] -= focus[0];
                     span[1] -= focus[0];
+                    event -= focus[0];
                     at = next;
                 } else {
                     if span[1] <= focus[0] { /* unchanged prefix */
                     } else if span[0] >= focus[0] + count(next) {
                         span[0] -= count(next);
                         span[1] -= count(next);
+                        event -= count(next);
                     } else if span[0] <= focus[0] && span[1] >= focus[1] + count(next) {
                         span[1] -= count(next);
+                        // All inserted events occupy the original focus's
+                        // side of every enclosing binary node.
+                        if event >= focus[0] {
+                            event = focus[0] + event.saturating_sub(focus[0] + count(next));
+                        }
                     } else {
                         return None;
                     }
