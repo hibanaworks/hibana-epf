@@ -99,10 +99,10 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
       perl -0pi -e 's/(fn head\(.*?partition_point\(\|row\| \(row.arg0\(\) as usize\)) < region.start/$1 <= region.start/s == 1 or die "missing source head boundary\n"' "$source/src/protocol/unfolding.rs"
       ;;
     BranchDemand)
-      perl -0pi -e 's/ scratch\[split\.\.end\]\.iter\(\)\.max\(\)\.copied\(\)\.unwrap_or\(0\)/.max(scratch[split..end].iter().max().copied().unwrap_or(0))/g == 1 or die "missing alternative visit demand\n"' "$source/src/protocol/unfolding/generate.rs"
+      perl -0pi -e 's/\+ scratch\[split\.\.end\]\.iter\(\)\.max\(\)\.copied\(\)\.unwrap_or\(0\)/.max(scratch[split..end].iter().max().copied().unwrap_or(0))/g == 1 or die "missing alternative visit demand\n"' "$source/src/protocol/unfolding/generate.rs"
       ;;
     TypedArmSeed)
-      perl -0pi -e 's/super::routes::selected\(\*\*record, key,     ResolverEvidence)bounds\)\.is_some\(\)/record.id() == tap::ROUTE_ARM_SELECTION     ResolverEvidence)    ResolverEvidence) super::routes::selected(**record, key,     ResolverEvidence)bounds).is_some()/g == 1 or die "missing typed operation preference\n"' "$source/src/protocol/audit.rs"
+      perl -0pi -e 's/record\.id\(\) != tap::SEND_POLL/record.id() == tap::ROUTE_ARM_SELECTION/g == 2 or die "missing typed operation preference\n"' "$source/src/protocol/audit.rs"
       ;;
     InsertionPrune)
       perl -0pi -e 's/source\.has_insertions\(\)/false/g == 1 or die "missing insertion condition\n"' "$source/src/protocol/word.rs"

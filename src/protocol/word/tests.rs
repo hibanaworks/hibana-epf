@@ -57,8 +57,12 @@ fn reference(
 #[test]
 fn prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset() {
     let global = g::seq(
-        g::send::<0, 1, g::Msg<1, ()>>().roll(),
-        g::send::<0, 1, g::Msg<2, ()>>(),
+        g::seq(
+            g::send::<0, 1, g::Msg<1, ()>>(),
+            g::send::<1, 0, g::Msg<2, ()>>(),
+        )
+        .roll(),
+        g::send::<0, 1, g::Msg<3, ()>>(),
     );
     let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
     let retained = snapshot
@@ -107,18 +111,29 @@ fn prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset() {
                 ]
             })
             .collect();
-        for bits in 0..1usize << points.len() {
-            let history: Vec<_> = points
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &p)| (bits & (1 << i) != 0).then_some(p))
-                .collect();
-            for &point in &points {
-                assert_eq!(
-                    path.missing(history.iter().copied(), point),
-                    reference(path, &history, point),
-                    "{insertion:?} {bits} {point:?}"
+        // Either no initial visit or its complete request/reply. Enumerate
+        // every subset of the remaining acceptance/publication/receipt points,
+        // including an entered resumed sender with its return still missing.
+        for initial in [false, true] {
+            for bits in 0..1usize << (points.len() - 6) {
+                let mut history = if initial {
+                    points[..6].to_vec()
+                } else {
+                    Vec::new()
+                };
+                history.extend(
+                    points[6..]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &p)| (bits & (1 << i) != 0).then_some(p)),
                 );
+                for &point in &points {
+                    assert_eq!(
+                        path.missing(history.iter().copied(), point),
+                        reference(path, &history, point),
+                        "{insertion:?} {initial} {bits} {point:?}"
+                    );
+                }
             }
         }
     }

@@ -374,7 +374,8 @@ qualification must be measured separately.
 Execution checking skips prerequisites already present in the history and
 avoids resumption scans when the derivation has no inserted continuation.
 The prerequisite result is compared with the unfactored rule for every subset
-of operation points in ordinary, before and alongside fixtures. Separate
+of a request/reply's suffix points in ordinary, before and alongside fixtures,
+with its initial visit either complete or absent. Separate
 controls break scope lookup, source boundaries, visit demand, typed-arm
 preference and resumption pruning; each must fail its regression. These checks
 supplement the source-execution tests and Lean claims, rather than proving
