@@ -2,10 +2,14 @@
 use core::ops::Range;
 use hibana::runtime::tap::{self, TapEvent};
 
+mod custody;
 mod delivery;
 mod history;
+mod routes;
+pub use custody::CustodyError;
 pub use delivery::{Delivery, DeliveryError, RecordId};
 pub use history::{HistoryError, SendCall};
+pub use routes::RouteHistoryError;
 
 /// A complete, structurally checked snapshot from `tap::projected`.
 ///

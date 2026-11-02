@@ -19,6 +19,134 @@ use hibana_epf::{Epf, EpfStorage, ImageSpec};
 struct LocalOnly;
 
 #[test]
+fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
+    type Left = Msg<7, ()>;
+    type Right = Msg<8, ()>;
+    type Tail = Msg<9, ()>;
+    let global = g::seq(
+        g::route(g::send::<7, 7, Left>(), g::send::<7, 7, Right>())
+            .resolve::<17>()
+            .roll(),
+        g::send::<7, 7, Tail>(),
+    )
+    .roll();
+    let program = project::<7>(&global);
+    let selected = Cell::new(DecisionArm::Left);
+    let mut slab = [0; 8192];
+    let mut storage = SessionKitStorage::uninit();
+    let kit = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+    kit.set_resolver(
+        &program,
+        ResolverRef::<17>::decision_state(&selected, |choice| Ok(choice.get())),
+    )
+    .unwrap();
+    let mut endpoint = kit.enter(SessionId::new(137), &program).unwrap();
+    let mut records = kit.tap();
+    let mut captured: Vec<_> = records.by_ref().collect();
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let operation = core::pin::pin!(async {
+            endpoint.send::<Left>(&()).await?;
+            captured.extend(records.by_ref());
+            endpoint.send::<Left>(&()).await?;
+            captured.extend(records.by_ref());
+            selected.set(DecisionArm::Right);
+            endpoint.send::<Right>(&()).await?;
+            captured.extend(records.by_ref());
+            endpoint.send::<Tail>(&()).await?;
+            captured.extend(records.by_ref());
+            selected.set(DecisionArm::Left);
+            endpoint.send::<Left>(&()).await?;
+            captured.extend(records.by_ref());
+            endpoint.send::<Tail>(&()).await?;
+            captured.extend(records.by_ref());
+            Ok::<_, hibana::EndpointError>(())
+        });
+        assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    let mut workspace = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = hibana_epf::Protocol::new(&snapshot, &mut workspace).unwrap();
+    let capture = hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
+    let order: Vec<_> = (0..captured.len())
+        .map(|ordinal| hibana_epf::RecordId {
+            producer: 0,
+            ordinal,
+        })
+        .collect();
+    workspace.resize(protocol.custody_workspace_len(&[capture]), 0);
+    protocol
+        .check_routes(&[capture], &order, &mut workspace)
+        .unwrap();
+    // Keep the complete ordinal sequence while replacing the reset that makes
+    // the first change of arm legal with an irrelevant observation.
+    let right = captured
+        .iter()
+        .position(|record| record.id() == tap::ENDPOINT_SEND && record.arg1() as u16 == 1)
+        .unwrap();
+    let reset = captured[..right]
+        .iter()
+        .rposition(|record| record.id() == tap::SCOPE_REENTRY)
+        .unwrap();
+    let mut missing_reset = captured.clone();
+    let mut bytes: [u8; 16] = missing_reset[reset].into();
+    bytes[4..6].copy_from_slice(&0u16.to_be_bytes());
+    missing_reset[reset] = bytes.into();
+    let invalid = hibana_epf::Capture::new(&missing_reset, records.checkpoint()).unwrap();
+    assert!(
+        protocol
+            .check_routes(&[invalid], &order, &mut workspace)
+            .is_err()
+    );
+}
+
+#[test]
+fn a_static_local_row_cannot_be_replayed_without_a_new_visit() {
+    type Tick = Msg<7, ()>;
+    let global = g::send::<7, 7, Tick>();
+    let program = project::<7>(&global);
+    let mut slab = [0; 8192];
+    let mut storage = SessionKitStorage::uninit();
+    let kit = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+    let mut endpoint = kit.enter(SessionId::new(138), &program).unwrap();
+    let mut records = kit.tap();
+    let mut captured: Vec<_> = records.by_ref().collect();
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        core::pin::pin!(endpoint.send::<Tick>(&())).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    captured.extend(records.by_ref());
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    let mut workspace = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = hibana_epf::Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut replayed = captured.clone();
+    let mut bytes: [u8; 16] = (*captured
+        .iter()
+        .find(|record| record.id() == tap::ENDPOINT_SEND)
+        .unwrap())
+    .into();
+    bytes[..4].copy_from_slice(&(replayed.len() as u32).to_be_bytes());
+    replayed.push(bytes.into());
+    let invalid = hibana_epf::Capture::new(&replayed, Some(replayed.len() as u32)).unwrap();
+    let order: Vec<_> = (0..replayed.len())
+        .map(|ordinal| hibana_epf::RecordId {
+            producer: 0,
+            ordinal,
+        })
+        .collect();
+    workspace.resize(protocol.custody_workspace_len(&[invalid]), 0);
+    // Membership and ownership alone both accept this duplicate static row.
+    protocol
+        .check_custody(&[invalid], &order, &mut workspace)
+        .unwrap();
+    assert!(matches!(
+        protocol.check_routes(&[invalid], &order, &mut workspace),
+        Err(hibana_epf::RouteHistoryError::Duplicate { .. })
+    ));
+}
+
+#[test]
 fn live_reentry_records_retain_the_exact_scope_through_epf_observation() {
     type Tick = Msg<7, ()>;
     type Tail = Msg<8, ()>;

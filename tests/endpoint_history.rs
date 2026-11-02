@@ -19,7 +19,9 @@ use hibana::{
         wire::Payload,
     },
 };
-use hibana_epf::{Capture, DeliveryError, Epf, EpfStorage, HistoryError, Protocol};
+use hibana_epf::{
+    Capture, CustodyError, DeliveryError, Epf, EpfStorage, HistoryError, Protocol, RecordId,
+};
 
 #[derive(Clone, Copy)]
 struct Frame {
@@ -242,9 +244,34 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
     let mut tap0 = kit0.tap();
     let mut tap1 = kit1.tap();
     let mut tap2 = kit2.tap();
-    let mut records0: Vec<_> = tap0.by_ref().collect();
-    let mut records1: Vec<_> = tap1.by_ref().collect();
-    let mut records2: Vec<_> = tap2.by_ref().collect();
+    let mut order = Vec::new();
+    let mut records0: Vec<_> = tap0
+        .by_ref()
+        .inspect(|record| {
+            order.push(RecordId {
+                producer: 0,
+                ordinal: record.ts() as usize,
+            })
+        })
+        .collect();
+    let mut records1: Vec<_> = tap1
+        .by_ref()
+        .inspect(|record| {
+            order.push(RecordId {
+                producer: 1,
+                ordinal: record.ts() as usize,
+            })
+        })
+        .collect();
+    let mut records2: Vec<_> = tap2
+        .by_ref()
+        .inspect(|record| {
+            order.push(RecordId {
+                producer: 2,
+                ordinal: record.ts() as usize,
+            })
+        })
+        .collect();
     let mut cx = Context::from_waker(Waker::noop());
     let resource = {
         let mut lending = core::pin::pin!(owner.send::<Loan>(resource));
@@ -253,15 +280,35 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
         let Poll::Ready(Ok(mut resource)) = receiving.poll(&mut cx) else {
             panic!("the separate runtime must receive the actual resource")
         };
-        records0.extend(tap0.by_ref());
-        records1.extend(tap1.by_ref());
+        records0.extend(tap0.by_ref().inspect(|record| {
+            order.push(RecordId {
+                producer: 0,
+                ordinal: record.ts() as usize,
+            })
+        }));
+        records1.extend(tap1.by_ref().inspect(|record| {
+            order.push(RecordId {
+                producer: 1,
+                ordinal: record.ts() as usize,
+            })
+        }));
         for _ in 0..2 {
             let mut sending = core::pin::pin!(resource.send::<Use>(&()));
             assert!(sending.as_mut().poll(&mut cx).is_pending());
             let receiving = core::pin::pin!(service.recv::<Use>());
             assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
-            records1.extend(tap1.by_ref());
-            records2.extend(tap2.by_ref());
+            records1.extend(tap1.by_ref().inspect(|record| {
+                order.push(RecordId {
+                    producer: 1,
+                    ordinal: record.ts() as usize,
+                })
+            }));
+            records2.extend(tap2.by_ref().inspect(|record| {
+                order.push(RecordId {
+                    producer: 2,
+                    ordinal: record.ts() as usize,
+                })
+            }));
             // The loan's publication is still absent on its other producer.
             assert!(!records0.iter().any(
                 |record| record.id() == tap::ENDPOINT_SESSION && record.causal_key() as u8 == 1
@@ -270,31 +317,68 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
                 sending.as_mut().poll(&mut cx),
                 Poll::Ready(Ok(()))
             ));
-            records1.extend(tap1.by_ref());
+            records1.extend(tap1.by_ref().inspect(|record| {
+                order.push(RecordId {
+                    producer: 1,
+                    ordinal: record.ts() as usize,
+                })
+            }));
         }
         assert!(matches!(
             lending.as_mut().poll(&mut cx),
             Poll::Ready(Ok(()))
         ));
-        records0.extend(tap0.by_ref());
+        records0.extend(tap0.by_ref().inspect(|record| {
+            order.push(RecordId {
+                producer: 0,
+                ordinal: record.ts() as usize,
+            })
+        }));
         resource
     };
     {
         let mut returning = core::pin::pin!(worker.send::<Loan>(resource));
         assert!(returning.as_mut().poll(&mut cx).is_pending());
+        records1.extend(tap1.by_ref().inspect(|record| {
+            order.push(RecordId {
+                producer: 1,
+                ordinal: record.ts() as usize,
+            })
+        }));
         let receiving = core::pin::pin!(owner.recv::<Loan>());
         let Poll::Ready(Ok(resource)) = receiving.poll(&mut cx) else {
             panic!("the original runtime must receive the returned continuation")
         };
+        records0.extend(tap0.by_ref().inspect(|record| {
+            order.push(RecordId {
+                producer: 0,
+                ordinal: record.ts() as usize,
+            })
+        }));
         assert!(matches!(
             returning.as_mut().poll(&mut cx),
             Poll::Ready(Ok(()))
         ));
         drop(resource);
     }
-    records0.extend(tap0.by_ref());
-    records1.extend(tap1.by_ref());
-    records2.extend(tap2.by_ref());
+    records0.extend(tap0.by_ref().inspect(|record| {
+        order.push(RecordId {
+            producer: 0,
+            ordinal: record.ts() as usize,
+        })
+    }));
+    records1.extend(tap1.by_ref().inspect(|record| {
+        order.push(RecordId {
+            producer: 1,
+            ordinal: record.ts() as usize,
+        })
+    }));
+    records2.extend(tap2.by_ref().inspect(|record| {
+        order.push(RecordId {
+            producer: 2,
+            ordinal: record.ts() as usize,
+        })
+    }));
     let originals = [records0.clone(), records1.clone(), records2.clone()];
     let captures = [
         Capture::new(&records0, tap0.checkpoint()).unwrap(),
@@ -306,7 +390,25 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
     let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
     for permutation in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
         let inputs = permutation.map(|index| captures[index]);
+        let witnessed: Vec<_> = order
+            .iter()
+            .map(|id| RecordId {
+                producer: permutation
+                    .iter()
+                    .position(|&original| original == id.producer)
+                    .unwrap(),
+                ordinal: id.ordinal,
+            })
+            .collect();
+        workspace.resize(protocol.custody_workspace_len(&inputs), usize::MAX);
+        protocol
+            .check_custody(&inputs, &witnessed, &mut workspace)
+            .unwrap();
+        protocol
+            .check_routes(&inputs, &witnessed, &mut workspace)
+            .unwrap();
         workspace.resize(protocol.delivery_workspace_len(&inputs), usize::MAX);
+
         let deliveries: Vec<_> = protocol
             .deliveries(&inputs, &mut workspace)
             .unwrap()
@@ -881,6 +983,16 @@ fn a_pending_continuation_can_publish_after_the_other_view_reenters_its_roll() {
     assert!(calls.iter().all(|call| call.polls().count() == 2));
     drop(calls);
     // The same resource still has a usable continuation and is moved once.
+    let order: Vec<_> = (0..captured.len())
+        .map(|ordinal| RecordId {
+            producer: 0,
+            ordinal,
+        })
+        .collect();
+    workspace.resize(protocol.custody_workspace_len(&[capture]), 0);
+    protocol
+        .check_routes(&[capture], &order, &mut workspace)
+        .unwrap();
     let mut lending = core::pin::pin!(owner.send::<Loan>(resource));
     assert!(lending.as_mut().poll(&mut cx).is_pending());
     let receiving = core::pin::pin!(worker.recv::<Loan>());
@@ -985,6 +1097,16 @@ fn pending_siblings_can_share_the_reset_published_by_the_first_completed_send() 
             })
             .unwrap();
         drop(calls);
+        let order: Vec<_> = (0..captured.len())
+            .map(|ordinal| RecordId {
+                producer: 0,
+                ordinal,
+            })
+            .collect();
+        workspace.resize(protocol.custody_workspace_len(&[capture]), 0);
+        protocol
+            .check_routes(&[capture], &order, &mut workspace)
+            .unwrap();
         for mutation in 0..5 {
             let mut changed = captured.clone();
             let mut bytes = <[u8; 16]>::from(changed[reset]);
@@ -1163,6 +1285,59 @@ fn conditional_resource_holders_keep_their_own_call_before_loan_publication() {
         assert_eq!(calls.len(), 3);
         assert!(calls.iter().all(|call| call.polls().count() == 2));
         assert!(calls.iter().all(|call| call.publication().is_some()));
+        drop(calls);
+        let order: Vec<_> = (0..captured.len())
+            .map(|ordinal| RecordId {
+                producer: 0,
+                ordinal,
+            })
+            .collect();
+        let required = protocol.custody_workspace_len(&[capture]);
+        workspace.resize(required, usize::MAX);
+        protocol
+            .check_custody(&[capture], &order, &mut workspace)
+            .unwrap();
+        protocol
+            .check_routes(&[capture], &order, &mut workspace)
+            .unwrap();
+        assert!(matches!(
+            protocol.check_custody(&[capture], &order, &mut workspace[..required - 1]),
+            Err(CustodyError::Workspace { .. })
+        ));
+        assert!(matches!(
+            protocol.check_custody(&[capture], &order[..order.len() - 1], &mut workspace),
+            Err(CustodyError::Order { .. })
+        ));
+        let mut repeated = order.clone();
+        repeated[1] = repeated[0];
+        assert!(matches!(
+            protocol.check_custody(&[capture], &repeated, &mut workspace),
+            Err(CustodyError::Order { .. })
+        ));
+
+        // Both holders belong to the compiled actor candidate set. Changing
+        // all observations of Use preserves static membership and call links,
+        // but contradicts the transfer actually received in this execution.
+        let mut wrong_holder = captured.clone();
+        for record in &mut wrong_holder {
+            if record.arg1() as u16 == 4
+                && (record.id() == tap::SEND_POLL
+                    || (record.id() == tap::ENDPOINT_SEND && record.causal_key() as u8 == 1))
+            {
+                let mut bytes: [u8; 16] = (*record).into();
+                bytes[6] = if selected == DecisionArm::Left { 4 } else { 1 };
+                *record = bytes.into();
+            }
+        }
+        let invalid = Capture::new(&wrong_holder, records.checkpoint()).unwrap();
+        protocol
+            .send_calls(invalid, &mut workspace)
+            .unwrap()
+            .for_each(drop);
+        assert!(matches!(
+            protocol.check_custody(&[invalid], &order, &mut workspace),
+            Err(CustodyError::Owner { role: 3, .. })
+        ));
     }
 }
 
@@ -1342,5 +1517,41 @@ fn learning_a_resolved_choice_is_distinct_from_invoking_its_resolver() {
             u16::from(selected == DecisionArm::Right)
         );
         assert!(calls[0].publication().is_some());
+        drop(calls);
+        let order: Vec<_> = (0..captured.len())
+            .map(|ordinal| RecordId {
+                producer: 0,
+                ordinal,
+            })
+            .collect();
+        workspace.resize(protocol.custody_workspace_len(&[capture]), 0);
+        protocol
+            .check_routes(&[capture], &order, &mut workspace)
+            .unwrap();
+        for mutation in 0..4 {
+            let mut invalid = captured.clone();
+            let record = invalid
+                .iter_mut()
+                .find(|record| match mutation {
+                    0 => record.id() == tap::ROUTE_ARM_SELECTION && record.causal_key() >> 8 == 1,
+                    _ => record.id() == tap::RESOLVER_AUDIT,
+                })
+                .unwrap();
+            let mut bytes: [u8; 16] = (*record).into();
+            match mutation {
+                0 => bytes[15] ^= 1,
+                1 => bytes[7] ^= 1,
+                2 => bytes[15] ^= 1,
+                _ => bytes[6] = 1,
+            }
+            *record = bytes.into();
+            let invalid = Capture::new(&invalid, records.checkpoint()).unwrap();
+            assert!(
+                protocol
+                    .check_routes(&[invalid], &order, &mut workspace)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+        }
     }
 }

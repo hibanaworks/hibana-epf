@@ -242,6 +242,35 @@ build evidence. This correspondence does not authenticate records, establish
 physical acceptance, determine current ownership or certify source eligibility.
 Route/roll replay and correspondence across changing producer ownership remain unfinished.
 
+`Protocol::check_custody(captures, order, workspace)` replays actual resource
+transfers in a supplied causal ordering. The order must contain every record
+exactly once and preserve each producer's ordinals. Send calls and FIFO receipts
+are matched in that witnessed order; unrelated producer ordinals are never
+treated as a shared clock. The first poll makes the transferred role unavailable
+until its committed receive grants it to the recipient. Later publication does
+not revoke the recipient's right or restore the sender's. Operations through a
+delegated view, transfers and resolver invocations require the actual holder.
+Storage is derived by `custody_workspace_len`; it is temporary audit memory,
+without allocation or an application-side permission service.
+
+`Protocol::check_routes` includes those checks, then checks observed choices
+against operations and resolver results. Views on the same actor share choice
+history. A poll's prepared reentry is tentative; a committed enclosing reset
+starts a new visit. Repeating a completed operation requires a covering reset;
+a roll reset must lead to its claimed Endpoint commit. Tests accept changing
+arms through nested rolls, pending siblings sharing a reset, delayed
+publication and transfers across three separate runtimes. Mutations preserve
+static membership while changing the holder, choice or resolver result and
+must fail the corresponding dynamic check.
+
+These methods are parts of the history checker under development. They do not
+yet establish that a reset's body was complete, that a retained child was
+aligned with its parent, or that every necessary source predecessor had run.
+They must not be used as a completed protocol-conformance audit. The remaining
+source-execution check must cover those obligations before these stages can be
+combined into the final audit entry point. A witnessed order establishes
+compatibility with that order, not a unique distributed execution time.
+
 `Protocol::deliveries(captures, workspace)` connects successful receives across
 producer captures to send calls. Within each session/source stream it uses the
 transport's affine FIFO contract, with one producer per side. Several producers
