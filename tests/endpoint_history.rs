@@ -4,6 +4,7 @@ use core::{
     task::{Context, Poll, Waker},
 };
 use hibana::{
+    Endpoint,
     g::{self, Msg},
     runtime::{
         SessionKitStorage,
@@ -11,23 +12,42 @@ use hibana::{
         program::project,
         resolver::{DecisionArm, ResolverRef},
         tap::{self, TapEvent},
-        transport::{FrameHeader, Outgoing, PortOpen, ReceivedFrame, Transport, TransportError},
+        transport::{
+            EndpointBinding, FrameHeader, Outgoing, PortOpen, ReceivedFrame, Transport,
+            TransportError,
+        },
         wire::Payload,
     },
 };
-use hibana_epf::{Epf, EpfStorage};
+use hibana_epf::{Capture, Epf, EpfStorage, HistoryError, Protocol};
 
-// A single physical unit-frame inbox. A send makes its frame available on
+#[derive(Clone, Copy)]
+struct Frame {
+    header: FrameHeader,
+    bytes: [u8; 3], // unit payload or the three-byte owned Endpoint envelope
+    len: u8,
+}
+
+// A single physical frame inbox. A send makes its frame available on
 // the first poll and reports acceptance on the next. Only copied frame
 // headers survive a poll; no outgoing payload pointer is retained.
 struct DelayedPublication {
-    inbox: Cell<Result<Option<FrameHeader>, TransportError>>,
+    inbox: Cell<Result<Option<Frame>, TransportError>>,
     reader: Cell<Option<Waker>>,
+    resource: Option<EndpointBinding>,
 }
 
 impl Transport for DelayedPublication {
     type Tx<'a> = (PortOpen, Option<FrameHeader>);
-    type Rx<'a> = (PortOpen, Option<FrameHeader>);
+    type Rx<'a> = (PortOpen, Option<Frame>);
+
+    fn initial_endpoint_binding(&self, _: SessionId, role: u8) -> Option<&EndpointBinding> {
+        if role == 3 {
+            self.resource.as_ref()
+        } else {
+            None
+        }
+    }
 
     fn open(&self, port: PortOpen) -> (Self::Tx<'_>, Self::Rx<'_>) {
         ((port, None), (port, None))
@@ -39,7 +59,6 @@ impl Transport for DelayedPublication {
         outgoing: Outgoing<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), TransportError>> {
-        assert!(outgoing.payload().as_bytes().is_empty());
         assert_eq!(outgoing.lane(), tx.0.lane());
         let session = tx.0.session_id().raw().to_be_bytes();
         let label = outgoing.frame_label().raw().to_be_bytes();
@@ -60,7 +79,14 @@ impl Transport for DelayedPublication {
         }
         match self.inbox.get() {
             Ok(None) => {
-                self.inbox.set(Ok(Some(header)));
+                let bytes = outgoing.payload().as_bytes();
+                let mut copied = [0; 3];
+                copied[..bytes.len()].copy_from_slice(bytes);
+                self.inbox.set(Ok(Some(Frame {
+                    header,
+                    bytes: copied,
+                    len: bytes.len() as u8,
+                })));
                 tx.1 = Some(header);
                 if let Some(reader) = self.reader.take() {
                     reader.wake();
@@ -89,11 +115,15 @@ impl Transport for DelayedPublication {
         cx: &mut Context<'_>,
     ) -> Poll<Result<ReceivedFrame<'a>, TransportError>> {
         match self.inbox.get() {
-            Ok(Some(header)) => {
-                assert_eq!(header.bytes()[6], rx.0.local_role());
+            Ok(Some(frame)) => {
+                assert_eq!(frame.header.bytes()[6], rx.0.local_role());
                 self.inbox.set(Ok(None));
-                rx.1 = Some(header);
-                Poll::Ready(Ok(ReceivedFrame::framed(header, Payload::new(&[]))))
+                rx.1 = Some(frame);
+                let frame = rx.1.as_ref().unwrap();
+                Poll::Ready(Ok(ReceivedFrame::framed(
+                    frame.header,
+                    Payload::new(&frame.bytes[..usize::from(frame.len)]),
+                )))
             }
             Ok(None) => {
                 self.reader.set(Some(cx.waker().clone()));
@@ -104,10 +134,10 @@ impl Transport for DelayedPublication {
     }
 
     fn requeue(&self, rx: &mut Self::Rx<'_>) -> Result<(), TransportError> {
-        let header = rx.1.take().expect("requeue requires a received frame");
+        let frame = rx.1.take().expect("requeue requires a received frame");
         match self.inbox.get() {
             Ok(None) => {
-                self.inbox.set(Ok(Some(header)));
+                self.inbox.set(Ok(Some(frame)));
                 if let Some(reader) = self.reader.take() {
                     reader.wake();
                 }
@@ -134,6 +164,7 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
             DelayedPublication {
                 inbox: Cell::new(Ok(None)),
                 reader: Cell::new(None),
+                resource: None,
             },
         )
         .unwrap();
@@ -241,6 +272,19 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
         }
     }
     hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
+    let snapshot: Vec<_> = tap::projected(&p0).collect();
+    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+    workspace.resize(protocol.send_call_workspace_len(capture), 0);
+    let calls: Vec<_> = protocol
+        .send_calls(capture, &mut workspace)
+        .unwrap()
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].first_poll(), first_poll);
+    assert_eq!(calls[0].polls().count(), 2);
+    assert_eq!(calls[0].publication(), Some(sent));
     assert!(
         captured
             .windows(2)
@@ -265,6 +309,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                 DelayedPublication {
                     inbox: Cell::new(Ok(None)),
                     reader: Cell::new(None),
+                    resource: None,
                 },
             )
             .unwrap();
@@ -325,6 +370,357 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
             assert_eq!(commits, [(0, 1), (1, 2), (1, 1)]);
         }
         hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
+        let snapshot: Vec<_> = tap::projected(&p0).collect();
+        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let calls: Vec<_> = protocol
+            .send_calls(capture, &mut workspace)
+            .unwrap()
+            .collect();
+        assert_eq!(calls.len(), usize::from(!early));
+        if !early {
+            assert_eq!(calls[0].polls().count(), 2);
+            assert!(calls[0].publication().is_some());
+        }
+    }
+}
+
+#[test]
+fn repeated_source_events_have_distinct_calls_and_reject_broken_correspondence() {
+    type Message = Msg<7, ()>;
+    let global = g::send::<0, 1, Message>().roll();
+    let p0 = project::<0>(&global);
+    let p1 = project::<1>(&global);
+    let mut slab = [0; 8192];
+    let mut storage = SessionKitStorage::uninit();
+    let kit = storage
+        .init()
+        .rendezvous(
+            &mut slab,
+            DelayedPublication {
+                inbox: Cell::new(Ok(None)),
+                reader: Cell::new(None),
+                resource: None,
+            },
+        )
+        .unwrap();
+    let mut sender = kit.enter(SessionId::new(100), &p0).unwrap();
+    let mut receiver = kit.enter(SessionId::new(100), &p1).unwrap();
+    let mut records = kit.tap();
+    let mut captured: Vec<_> = records.by_ref().collect();
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..2 {
+        let mut sending = core::pin::pin!(sender.send::<Message>(&()));
+        assert!(sending.as_mut().poll(&mut cx).is_pending());
+        captured.extend(records.by_ref());
+        {
+            let receiving = core::pin::pin!(receiver.recv::<Message>());
+            assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        captured.extend(records.by_ref());
+        assert!(matches!(
+            sending.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        captured.extend(records.by_ref());
+    }
+    let checkpoint = records.checkpoint();
+    let snapshot: Vec<_> = tap::projected(&p0).collect();
+    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let capture = Capture::new(&captured, checkpoint).unwrap();
+    let required = protocol.send_call_workspace_len(capture);
+    assert!(matches!(
+        protocol.send_calls(capture, &mut []),
+        Err(HistoryError::Workspace { required: size, actual: 0 }) if size == required
+    ));
+    workspace.resize(required, 0);
+    let calls: Vec<_> = protocol
+        .send_calls(capture, &mut workspace)
+        .unwrap()
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.first_poll().arg1() as u16 == 0)
+    );
+    assert!(calls.iter().all(|call| call.polls().count() == 2));
+    assert!(calls.iter().all(|call| call.publication().is_some()));
+    assert!(calls[0].publication().unwrap().ts() < calls[1].first_poll().ts());
+    let reset = (calls[1].first_poll().arg1() >> 16) as u16;
+    assert_ne!(reset, u16::MAX);
+    let first_poll = calls[0].first_poll().ts() as usize;
+    let second_poll = calls[0].polls().nth(1).unwrap().ts() as usize;
+    let publication = calls[0].publication().unwrap().ts() as usize;
+    drop(calls);
+    for mutation in 0..9 {
+        let mut changed = captured.clone();
+        for (index, record) in changed.iter_mut().enumerate() {
+            let mut bytes = <[u8; 16]>::from(*record);
+            match mutation {
+                0 if record.id() == tap::SEND_POLL => {
+                    bytes[4..6].copy_from_slice(&tap::LANE_ACQUIRE.to_be_bytes());
+                }
+                1 if index == second_poll => {
+                    bytes[4..6].copy_from_slice(&tap::ENDPOINT_SEND.to_be_bytes());
+                    bytes[7] = 1;
+                    bytes[12..16].copy_from_slice(&0u32.to_be_bytes());
+                }
+                2 if index == publication => bytes[13] ^= 1, // wrong lane
+                3 if index == first_poll => bytes[7] = 1,    // wrong logical view
+                4 if matches!(record.id(), tap::SEND_POLL | tap::ENDPOINT_SEND) => bytes[6] = 2,
+                5 if index == first_poll => bytes[14..16].copy_from_slice(&u16::MAX.to_be_bytes()),
+                6 if index == first_poll => bytes[12..14].copy_from_slice(&0u16.to_be_bytes()),
+                7 if index == second_poll => bytes[12..14].copy_from_slice(&reset.to_be_bytes()),
+                8 if index == publication => {
+                    bytes[4..6].copy_from_slice(&tap::ENDPOINT_SESSION.to_be_bytes());
+                }
+                _ => {}
+            }
+            *record = TapEvent::from(bytes);
+        }
+        let capture = Capture::new(&changed, checkpoint).unwrap();
+        assert!(
+            matches!(
+                protocol.send_calls(capture, &mut workspace),
+                Err(HistoryError::Record { .. })
+            ),
+            "mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn parallel_calls_keep_their_own_polls_when_publications_finish_in_reverse() {
+    type First = Msg<10, ()>;
+    type Second = Msg<11, ()>;
+    let global = g::par(g::send::<0, 1, First>(), g::send::<0, 2, Second>());
+    let p0 = project::<0>(&global);
+    let p1 = project::<1>(&global);
+    let p2 = project::<2>(&global);
+    let mut slab = [0; 16384];
+    let mut storage = SessionKitStorage::uninit();
+    let kit = storage
+        .init()
+        .rendezvous(
+            &mut slab,
+            DelayedPublication {
+                inbox: Cell::new(Ok(None)),
+                reader: Cell::new(None),
+                resource: None,
+            },
+        )
+        .unwrap();
+    let sid = SessionId::new(102);
+    let mut owner = kit.enter(sid, &p0).unwrap();
+    let mut left = kit.enter(sid, &p1).unwrap();
+    let mut right = kit.enter(sid, &p2).unwrap();
+    let mut records = kit.tap();
+    let mut captured: Vec<_> = records.by_ref().collect();
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let [mut first, mut second] = owner.par().unwrap();
+        let mut first = core::pin::pin!(first.send::<First>(&()));
+        assert!(first.as_mut().poll(&mut cx).is_pending());
+        {
+            let receiving = core::pin::pin!(left.recv::<First>());
+            assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        captured.extend(records.by_ref());
+        let mut second = core::pin::pin!(second.send::<Second>(&()));
+        assert!(second.as_mut().poll(&mut cx).is_pending());
+        {
+            let receiving = core::pin::pin!(right.recv::<Second>());
+            assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        assert!(matches!(second.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        captured.extend(records.by_ref());
+        assert!(matches!(first.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+        captured.extend(records.by_ref());
+    }
+    let snapshot: Vec<_> = tap::projected(&p0).collect();
+    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+    workspace.resize(protocol.send_call_workspace_len(capture), 0);
+    let calls: Vec<_> = protocol
+        .send_calls(capture, &mut workspace)
+        .unwrap()
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].first_poll().arg1() as u16, 0);
+    assert_eq!(calls[1].first_poll().arg1() as u16, 1);
+    assert!(calls[0].first_poll().ts() < calls[1].first_poll().ts());
+    assert!(calls[1].publication().unwrap().ts() < calls[0].publication().unwrap().ts());
+    for (source, call) in calls.iter().enumerate() {
+        let polls: Vec<_> = call.polls().collect();
+        assert_eq!(polls.len(), 2);
+        assert!(
+            polls
+                .iter()
+                .all(|poll| usize::from(poll.arg1() as u16) == source)
+        );
+        assert!(polls[0].ts() < polls[1].ts());
+        assert!(polls[1].ts() < call.publication().unwrap().ts());
+    }
+}
+
+#[test]
+fn conditional_resource_holders_keep_their_own_call_before_loan_publication() {
+    type Loan = Msg<7, Endpoint<'static, 3>>;
+    type Skip = Msg<8, ()>;
+    type Use = Msg<9, ()>;
+    let global = g::seq(
+        g::route(
+            g::seq(g::send::<0, 1, Loan>(), g::send::<0, 4, Skip>()),
+            g::seq(g::send::<0, 1, Skip>(), g::send::<0, 4, Loan>()),
+        )
+        .resolve::<17>(),
+        g::send::<3, 2, Use>(),
+    );
+    let p0 = project::<0>(&global);
+    let p1 = project::<1>(&global);
+    let p2 = project::<2>(&global);
+    let p3 = project::<3>(&global);
+    let p4 = project::<4>(&global);
+    for selected in [DecisionArm::Left, DecisionArm::Right] {
+        let mut slab = [0; 32768];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                DelayedPublication {
+                    inbox: Cell::new(Ok(None)),
+                    reader: Cell::new(None),
+                    // SAFETY: all ports reach this one fresh physical fixture.
+                    resource: Some(unsafe { EndpointBinding::new() }),
+                },
+            )
+            .unwrap();
+        kit.set_resolver(
+            &p0,
+            ResolverRef::<17>::decision_state(&selected, |selected| Ok(*selected)),
+        )
+        .unwrap();
+        let sid = SessionId::new(101);
+        let mut owner = kit.enter(sid, &p0).unwrap();
+        let mut first = kit.enter(sid, &p1).unwrap();
+        let mut service = kit.enter(sid, &p2).unwrap();
+        let resource = kit.enter(sid, &p3).unwrap();
+        let mut other = kit.enter(sid, &p4).unwrap();
+        let mut records = kit.tap();
+        let mut captured: Vec<_> = records.by_ref().collect();
+        let mut cx = Context::from_waker(Waker::noop());
+        // The right arm first informs role 1, then lends to role 4.
+        if selected == DecisionArm::Right {
+            let mut sending = core::pin::pin!(owner.send::<Skip>(&()));
+            assert!(sending.as_mut().poll(&mut cx).is_pending());
+            {
+                let receiving = core::pin::pin!(first.recv::<Skip>());
+                assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+            }
+            assert!(matches!(
+                sending.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            captured.extend(records.by_ref());
+        }
+        {
+            let mut lending = core::pin::pin!(owner.send::<Loan>(resource));
+            assert!(lending.as_mut().poll(&mut cx).is_pending());
+            let mut resource = if selected == DecisionArm::Left {
+                let receiving = core::pin::pin!(first.recv::<Loan>());
+                let Poll::Ready(Ok(resource)) = receiving.poll(&mut cx) else {
+                    panic!("role 1 must receive its resource")
+                };
+                resource
+            } else {
+                let receiving = core::pin::pin!(other.recv::<Loan>());
+                let Poll::Ready(Ok(resource)) = receiving.poll(&mut cx) else {
+                    panic!("role 4 must receive its resource")
+                };
+                resource
+            };
+            captured.extend(records.by_ref());
+            {
+                let mut sending = core::pin::pin!(resource.send::<Use>(&()));
+                assert!(sending.as_mut().poll(&mut cx).is_pending());
+                {
+                    let receiving = core::pin::pin!(service.recv::<Use>());
+                    assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+                }
+                assert!(matches!(
+                    sending.as_mut().poll(&mut cx),
+                    Poll::Ready(Ok(()))
+                ));
+            }
+            captured.extend(records.by_ref());
+            let snapshot: Vec<_> = tap::projected(&p0).collect();
+            assert!(
+                snapshot
+                    .iter()
+                    .any(|row| row.id() == tap::PROJECTED_ACTOR_DECISION)
+            );
+            let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+            let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+            let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+            workspace.resize(protocol.send_call_workspace_len(capture), 0);
+            let calls: Vec<_> = protocol
+                .send_calls(capture, &mut workspace)
+                .unwrap()
+                .collect();
+            let loan = calls
+                .iter()
+                .find(|call| call.first_poll().causal_key() == 0 && call.publication().is_none())
+                .unwrap();
+            assert_eq!(loan.polls().count(), 1);
+            let used = calls
+                .iter()
+                .find(|call| call.first_poll().causal_key() as u8 == 3)
+                .unwrap();
+            assert_eq!(
+                used.first_poll().causal_key() >> 8,
+                if selected == DecisionArm::Left { 1 } else { 4 }
+            );
+            assert_eq!(used.first_poll().arg1() as u16, 4);
+            assert_eq!(used.polls().count(), 2);
+            assert!(used.publication().is_some());
+            drop(calls);
+            assert!(matches!(
+                lending.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            captured.extend(records.by_ref());
+        }
+        if selected == DecisionArm::Left {
+            let mut sending = core::pin::pin!(owner.send::<Skip>(&()));
+            assert!(sending.as_mut().poll(&mut cx).is_pending());
+            {
+                let receiving = core::pin::pin!(other.recv::<Skip>());
+                assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+            }
+            assert!(matches!(
+                sending.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(()))
+            ));
+            captured.extend(records.by_ref());
+        }
+        let snapshot: Vec<_> = tap::projected(&p0).collect();
+        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let calls: Vec<_> = protocol
+            .send_calls(capture, &mut workspace)
+            .unwrap()
+            .collect();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|call| call.polls().count() == 2));
+        assert!(calls.iter().all(|call| call.publication().is_some()));
     }
 }
 
@@ -348,6 +744,7 @@ fn an_observed_send_poll_can_end_in_a_transport_error_without_a_commit() {
                 DelayedPublication {
                     inbox: Cell::new(Err(error)),
                     reader: Cell::new(None),
+                    resource: None,
                 },
             )
             .unwrap();
@@ -371,6 +768,18 @@ fn an_observed_send_poll_can_end_in_a_transport_error_without_a_commit() {
             tap::ENDPOINT_SEND | tap::ENDPOINT_RECV | tap::TRANSPORT_FRAME | tap::SCOPE_REENTRY
         )));
         hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
+        let snapshot: Vec<_> = tap::projected(&program).collect();
+        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let calls: Vec<_> = protocol
+            .send_calls(capture, &mut workspace)
+            .unwrap()
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].polls().count(), 1);
+        assert_eq!(calls[0].publication(), None);
     }
 }
 
@@ -391,6 +800,7 @@ fn learning_a_resolved_choice_is_distinct_from_invoking_its_resolver() {
                 DelayedPublication {
                     inbox: Cell::new(Ok(None)),
                     reader: Cell::new(None),
+                    resource: None,
                 },
             )
             .unwrap();
@@ -473,5 +883,20 @@ fn learning_a_resolved_choice_is_distinct_from_invoking_its_resolver() {
             learned.arg1() & 0xffff,
             u32::from(selected == DecisionArm::Right)
         );
+        let snapshot: Vec<_> = tap::projected(&p0).collect();
+        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let calls: Vec<_> = protocol
+            .send_calls(capture, &mut workspace)
+            .unwrap()
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].first_poll().arg1() as u16,
+            u16::from(selected == DecisionArm::Right)
+        );
+        assert!(calls[0].publication().is_some());
     }
 }

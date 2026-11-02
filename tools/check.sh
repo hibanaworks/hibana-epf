@@ -12,4 +12,4 @@ export MIRIFLAGS="${MIRIFLAGS:+$MIRIFLAGS }-Zmiri-strict-provenance"
 cargo +"$(cat tools/miri-toolchain)" miri test --locked \
     --lib --test production_path --test endpoint_observation --test endpoint_history --test protocol --test capture -- --test-threads=1
 bash tools/check_proofs.sh
-bash tools/check_capture_sensitivity.sh
+bash tools/check_history_sensitivity.sh

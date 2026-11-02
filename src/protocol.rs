@@ -2,6 +2,9 @@
 use core::ops::Range;
 use hibana::runtime::tap::{self, TapEvent};
 
+mod history;
+pub use history::{HistoryError, SendCall};
+
 /// A complete, structurally checked snapshot from `tap::projected`.
 ///
 /// This borrows the original records, including source structure and immutable
@@ -19,7 +22,7 @@ pub enum ProtocolError {
     Record { index: usize },
     /// Section counts disagree with the supplied record count.
     Length { expected: usize, actual: usize },
-    /// Workspace must hold two words per scope marker and one per actor decision.
+    /// Workspace needs two words per scope marker and one bit per actor decision.
     Workspace { required: usize, actual: usize },
 }
 
@@ -28,7 +31,7 @@ impl<'a> Protocol<'a> {
     /// This checks the headers and total length; `new` checks the section data.
     pub fn workspace_len(records: &[TapEvent]) -> Result<usize, ProtocolError> {
         let layout = Layout::read(records)?;
-        Ok(2 * layout.scopes.len() + layout.decisions.len())
+        Ok(2 * layout.scopes.len() + layout.actor_words())
     }
 
     /// Check a complete snapshot using temporary caller-owned workspace.
@@ -42,7 +45,7 @@ impl<'a> Protocol<'a> {
     /// independently prove their correspondence to the original Rust global.
     pub fn new(records: &'a [TapEvent], workspace: &mut [usize]) -> Result<Self, ProtocolError> {
         let layout = Layout::read(records)?;
-        let required = 2 * layout.scopes.len() + layout.decisions.len();
+        let required = 2 * layout.scopes.len() + layout.actor_words();
         if workspace.len() < required {
             return Err(ProtocolError::Workspace {
                 required,
@@ -121,6 +124,10 @@ fn check(condition: bool, index: usize) -> Result<(), ProtocolError> {
 }
 
 impl Layout {
+    fn actor_words(&self) -> usize {
+        self.decisions.len().div_ceil(usize::BITS as usize)
+    }
+
     fn read(records: &[TapEvent]) -> Result<Self, ProtocolError> {
         if records.len() < 2 {
             return Err(ProtocolError::Length {
@@ -381,6 +388,7 @@ impl Layout {
         candidates: &mut [usize],
     ) -> Result<(), ProtocolError> {
         let actor = self.key >> 8;
+        candidates.fill(0);
         let valid = |reference: u32, before: usize| {
             if reference < 256 {
                 reference <= u32::from(self.max_role)
@@ -402,7 +410,9 @@ impl Layout {
             )?;
             let belongs = contains_actor(row.arg0(), actor, candidates)
                 || contains_actor(row.arg1(), actor, candidates);
-            candidates[ordinal] = usize::from(belongs);
+            if belongs {
+                candidates[ordinal / usize::BITS as usize] |= 1 << (ordinal % usize::BITS as usize);
+            }
         }
         for (ordinal, index) in self.bindings.clone().enumerate() {
             let row = records[index];
@@ -410,8 +420,8 @@ impl Layout {
                 row.id() == tap::PROJECTED_BINDING
                     && row.ts() == ordinal as u32
                     && row.causal_key() == self.key
-                    && valid(row.arg0(), 256 + candidates.len())
-                    && valid(row.arg1(), 256 + candidates.len()),
+                    && valid(row.arg0(), 256 + self.decisions.len())
+                    && valid(row.arg1(), 256 + self.decisions.len()),
                 index,
             )?;
         }
@@ -482,6 +492,7 @@ fn contains_actor(reference: u32, actor: u16, candidates: &[usize]) -> bool {
     if reference < 256 {
         reference == u32::from(actor)
     } else {
-        candidates[reference as usize - 256] != 0
+        let index = reference as usize - 256;
+        candidates[index / usize::BITS as usize] & (1 << (index % usize::BITS as usize)) != 0
     }
 }

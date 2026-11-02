@@ -211,6 +211,37 @@ derives the workspace size from the declared markers and actor decisions.
 The reader handles nested `par`/`route`/`roll` and multiple delegated resources.
 It checks the actor bindings supplied by the compiler; it does not prove their
 derivation from the Rust global or check a dynamic execution history.
+Its temporary actor-membership workspace uses one bit per decision.
+
+`Protocol::send_calls(capture, workspace)` links the producer's actual checked
+polls to sender publication. Size the caller-owned workspace with
+`send_call_workspace_len`. The calls are returned in first-poll order; iterating
+their polls follows checked forward links and does not scan overlapping calls.
+Repeated polls of one pending future form one call. A later roll execution of
+the same source event forms another. Failed or unfinished calls retain no
+publication, and a receive can occur before publication.
+
+Before yielding calls, the reader checks source identity, logical view, direction,
+lane, possible actor and enclosing prepared roll. It then checks the generated
+links separately: every poll occurs once, every transport publication occurs
+once, links move forward and same-key calls do not overlap. Both phases use
+temporary caller-owned storage; the resulting links borrow that storage.
+Different producers still require separate captures, and each SessionId must
+identify one run. The supplied protocol must match the executable's saved
+build evidence. This correspondence does not authenticate records, establish
+physical acceptance, determine current ownership or certify source eligibility.
+Route/roll replay and cross-producer delivery remain unfinished.
+
+Actual Endpoint tests include interleaved parallel calls finishing in reverse,
+two rolled executions of one source event, both resolved arms, transport faults
+and conditional resource holders using the resource before loan publication.
+Nine record mutations and eight malformed-link cases exercise rejection.
+Two defect controls independently remove interval or poll-coverage checks and
+must fail their named regressions. `SendCalls.lean` proves five general facts
+about successful record-position marking and word/bit coordinates; the SMT
+checks cover 32- and 64-bit masks with a truncated-index negative control.
+These models specify those checks, not a refinement proof of the whole Rust
+link constructor or dynamic source replay.
 
 ## Check locally
 
@@ -221,4 +252,5 @@ derivation from the Rust global or check a dynamic execution history.
 The checks include actual Endpoint choices and roll reentry, live pipe output
 before EOF, partial-record rejection, image replacement, resolver behavior,
 Clippy, no_std builds and strict-provenance Miri. They require Rust stable, the
-Miri toolchain recorded in `tools/miri-toolchain`, and `thumbv6m-none-eabi`.
+Miri toolchain recorded in `tools/miri-toolchain`, `thumbv6m-none-eabi`, Lean
+selected by the core dependency, and Z3.

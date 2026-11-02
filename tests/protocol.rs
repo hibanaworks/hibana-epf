@@ -82,6 +82,60 @@ fn conditional_actor_references_and_full_range_ids_survive_import() {
             65536
         );
         check_snapshot(&snapshot);
+        // Equivalent repeated decisions exercise membership beyond two machine
+        // words without requiring a larger choreography or counting this
+        // reader fixture as another Endpoint execution.
+        let mut expanded = snapshot.clone();
+        let count = (snapshot[0].arg1() >> 16) as usize;
+        let enlarged = count + 2 * usize::BITS as usize;
+        let last = 255 + count as u32;
+        let at = snapshot
+            .iter()
+            .rposition(|row| row.id() == tap::PROJECTED_ACTOR_DECISION)
+            .unwrap()
+            + 1;
+        let template = snapshot[at - 1];
+        let decisions = (count..enlarged).map(|ordinal| {
+            let reference = 256 + ordinal as u32;
+            let node = word(template, 0, reference);
+            let node = word(node, 8, reference - 1);
+            word(node, 12, reference - 1)
+        });
+        expanded.splice(at..at, decisions);
+        let mut updated = Vec::new();
+        for (index, row) in expanded.iter_mut().enumerate() {
+            if row.id() != tap::PROJECTED_BINDING {
+                continue;
+            }
+            for offset in [8, 12] {
+                let reference = if offset == 8 { row.arg0() } else { row.arg1() };
+                if reference == last {
+                    *row = word(*row, offset, 255 + enlarged as u32);
+                    updated.push((index, offset));
+                }
+            }
+        }
+        assert!(!updated.is_empty());
+        expanded[0] = word(
+            expanded[0],
+            12,
+            (enlarged as u32) << 16 | (snapshot[0].arg1() & 0xffff),
+        );
+        check_snapshot(&expanded);
+        let markers = (expanded[0].arg0() & 0xffff) as usize;
+        assert_eq!(
+            Protocol::workspace_len(&expanded).unwrap(),
+            2 * markers + enlarged.div_ceil(usize::BITS as usize)
+        );
+        // Padding bits in the final word are not declared actor decisions.
+        for (index, offset) in updated {
+            let mut malformed = expanded.clone();
+            malformed[index] = word(malformed[index], offset, 256 + enlarged as u32);
+            assert!(matches!(
+                Protocol::new(&malformed, &mut vec![usize::MAX; 2 * malformed.len()]),
+                Err(ProtocolError::Record { index: rejected }) if rejected == index
+            ));
+        }
     }
 }
 
