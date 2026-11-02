@@ -165,7 +165,20 @@ impl SourcePath<'_, '_, '_> {
                         ordinal: used[producer],
                     };
                     used[producer] += 1;
-                    match protocol.custody_prefix(captures, &order[..depth + 1], scratch) {
+                    // Prefix custody is a search prune. When every remaining
+                    // record belongs to this producer, there is no alternate
+                    // suffix to choose; interpret_order checks the complete
+                    // custody once before any execution can be certified.
+                    let prefix = if used.iter().enumerate().any(|(other, &taken)| {
+                        other != producer && taken < captures[other].records().len()
+                    }) {
+                        protocol
+                            .custody_prefix(captures, &order[..depth + 1], scratch)
+                            .map(|_| ())
+                    } else {
+                        Ok(())
+                    };
+                    match prefix {
                         Ok(_) => {
                             depth += 1;
                             if depth != count {
