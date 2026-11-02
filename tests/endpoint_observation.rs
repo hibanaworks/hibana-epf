@@ -60,8 +60,8 @@ fn audit_capture(
         Unfold,
     };
     let captures = [Capture::new(captured, checkpoint).unwrap()];
-    let mut workspace = vec![0; Protocol::workspace_len(snapshot).unwrap()];
-    let protocol = Protocol::new(snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(snapshot).unwrap()];
+    let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
     let capacity = 2 * captured.len() + 1;
     let mut unfolding = vec![Unfold::Source; capacity];
     let mut choices = vec![
@@ -89,10 +89,7 @@ fn audit_capture(
         };
         captured.len()
     ];
-    workspace.resize(
-        protocol.audit_workspace_len(&captures, capacity).unwrap(),
-        0,
-    );
+    let mut workspace = std::vec![0; protocol.audit_workspace_len(&captures, capacity).unwrap()];
     let audit = protocol.audit(
         &captures,
         AuditStorage {
@@ -178,19 +175,60 @@ fn automatic_audit_checks_resolver_calls_from_outgoing_offers_in_each_visit() {
         })
         .collect();
     let captures = [hibana_epf::Capture::new(&missing, Some(missing.len() as u32)).unwrap()];
-    let mut workspace = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = hibana_epf::Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = hibana_epf::Protocol::new(&snapshot, &mut source_storage).unwrap();
     let order: Vec<_> = (0..missing.len())
         .map(|ordinal| hibana_epf::RecordId {
             producer: 0,
             ordinal,
         })
         .collect();
-    workspace.resize(protocol.custody_workspace_len(&captures), 0);
+    let mut workspace = std::vec![0; protocol.custody_workspace_len(&captures)];
     assert!(matches!(
         protocol.check_routes(&captures, &order, &mut workspace),
         Err(hibana_epf::RouteHistoryError::Record { .. })
     ));
+}
+
+#[test]
+fn automatic_audit_infers_typed_branch_visits_without_resolver_or_offer_records() {
+    let rows = Cell::new(Vec::new());
+    let recorder = |event| {
+        let mut captured = rows.take();
+        captured.push(event);
+        rows.set(captured);
+    };
+    let global = g::route(
+        g::seq(g::send::<7, 7, Msg<1, ()>>(), g::send::<7, 7, Msg<2, ()>>()),
+        g::seq(g::send::<7, 7, Msg<3, ()>>(), g::send::<7, 7, Msg<4, ()>>()),
+    )
+    .roll();
+    let program = project::<7>(&global);
+    let mut slab = [0; 8192];
+    let mut storage = SessionKitStorage::uninit();
+    let rv = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+    rv.observe(&recorder);
+    let mut endpoint = rv.enter(SessionId::new(1), &program).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let operation = core::pin::pin!(async {
+        endpoint.send::<Msg<3, ()>>(&()).await?;
+        endpoint.send::<Msg<4, ()>>(&()).await?;
+        endpoint.send::<Msg<1, ()>>(&()).await?;
+        endpoint.send::<Msg<2, ()>>(&()).await?;
+        Ok::<_, hibana::EndpointError>(())
+    });
+    assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+    let captured = rows.take();
+    assert!(
+        !captured
+            .iter()
+            .any(|r| matches!(r.id(), tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION))
+    );
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    assert_eq!(
+        audit_capture(&snapshot, &captured, rv.tap().checkpoint()).unwrap(),
+        8
+    );
 }
 
 #[test]
@@ -240,8 +278,8 @@ fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
         assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
     }
     let snapshot: Vec<_> = tap::projected(&program).collect();
-    let mut workspace = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = hibana_epf::Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = hibana_epf::Protocol::new(&snapshot, &mut source_storage).unwrap();
     let capture = hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
     let order: Vec<_> = (0..captured.len())
         .map(|ordinal| hibana_epf::RecordId {
@@ -249,7 +287,7 @@ fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
             ordinal,
         })
         .collect();
-    workspace.resize(protocol.custody_workspace_len(&[capture]), 0);
+    let mut workspace = std::vec![0; protocol.custody_workspace_len(&[capture])];
     protocol
         .check_routes(&[capture], &order, &mut workspace)
         .unwrap();
@@ -383,8 +421,8 @@ fn a_static_local_row_cannot_be_replayed_without_a_new_visit() {
     ));
     captured.extend(records.by_ref());
     let snapshot: Vec<_> = tap::projected(&program).collect();
-    let mut workspace = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = hibana_epf::Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = hibana_epf::Protocol::new(&snapshot, &mut source_storage).unwrap();
     let mut replayed = captured.clone();
     let mut bytes: [u8; 16] = (*captured
         .iter()
@@ -400,7 +438,7 @@ fn a_static_local_row_cannot_be_replayed_without_a_new_visit() {
             ordinal,
         })
         .collect();
-    workspace.resize(protocol.custody_workspace_len(&[invalid]), 0);
+    let mut workspace = std::vec![0; protocol.custody_workspace_len(&[invalid])];
     // Membership and ownership alone both accept this duplicate static row.
     protocol
         .check_custody(&[invalid], &order, &mut workspace)
@@ -428,8 +466,8 @@ fn live_reentry_records_retain_the_exact_scope_through_epf_observation() {
         })
         .unwrap()
         .causal_key();
-    let mut workspace = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
-    let _protocol = hibana_epf::Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
+    let _protocol = hibana_epf::Protocol::new(&snapshot, &mut source_storage).unwrap();
     let mut slab = [0; 8192];
     let mut storage = SessionKitStorage::uninit();
     let kit = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();

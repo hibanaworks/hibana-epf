@@ -8,10 +8,10 @@ use hibana::{
 use hibana_epf::{Protocol, Unfold, UnfoldingError};
 
 fn check(snapshot: &[TapEvent], steps: &[Unfold], expected: (&[u16], &[(usize, usize)])) {
-    let mut scratch = vec![0; Protocol::workspace_len(snapshot).unwrap()];
-    let protocol = Protocol::new(snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(snapshot).unwrap()];
+    let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
     let words = Protocol::unfolding_workspace_len(steps);
-    scratch.resize(words, 0);
+    let mut scratch = std::vec![0; words];
     assert!(
         matches!(protocol.unfolding(steps, &mut scratch[..words - 1]),
         Err(UnfoldingError::Workspace { required, .. }) if required == words)
@@ -85,9 +85,9 @@ fn original_scope_identity_distinguishes_nested_rolls_with_equal_event_bounds() 
         steps.push(Unfold::More([once, body]));
         body = twice;
     }
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
-    scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(&steps)];
     let unfolded = protocol.unfolding(&steps, &mut scratch).unwrap();
     assert_eq!(unfolded.event_count(), 256);
     for event in 0..256 {
@@ -282,8 +282,8 @@ fn a_range_that_crosses_subtrees_cannot_remove_source_dependencies() {
         .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
         .unwrap()
         .causal_key();
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let steps = [
         Unfold::Source,
         Unfold::Once(0),
@@ -300,7 +300,7 @@ fn a_range_that_crosses_subtrees_cannot_remove_source_dependencies() {
             focus: [0, 2],
         },
     ];
-    scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
+    let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(&steps)];
     assert!(matches!(
         protocol.unfolding(&steps, &mut scratch),
         Err(UnfoldingError::Step { index: 7 })
@@ -357,8 +357,9 @@ fn malformed_or_unreachable_proof_steps_never_publish_a_checked_unfolding() {
         g::send::<0, 0, g::Msg<2, ()>>(),
     );
     let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let mut scratch = std::vec::Vec::<usize>::new();
     let cases: &[&[Unfold]] = &[
         &[],
         &[Unfold::Once(0)],
@@ -413,8 +414,8 @@ fn a_compiled_subtree_matches_explicit_first_copies_without_copying_its_ast() {
     )
     .roll();
     let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let explicit = [
         Unfold::Source,
         Unfold::Source,
@@ -488,8 +489,8 @@ fn an_unchanged_subtree_supplies_the_retained_entry_for_a_later_resumption() {
         .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
         .unwrap()
         .causal_key();
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let steps = [
         Unfold::Source,
         Unfold::Source,

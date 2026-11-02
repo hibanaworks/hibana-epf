@@ -322,8 +322,8 @@ mod tests {
     fn repeated_fifo_occurrences_have_distinct_receipts_without_a_shared_clock() {
         let global = g::send::<0, 1, g::Msg<7, ()>>().roll();
         let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let poll = operation(&snapshot, 0, tap::SEND_POLL);
         let publication = operation(&snapshot, 0, tap::ENDPOINT_SEND);
         let receive = operation(&snapshot, 0, tap::ENDPOINT_RECV);
@@ -337,7 +337,7 @@ mod tests {
             Capture::new(&receipts, Some(2)).unwrap(),
         ];
         let required = protocol.delivery_workspace_len(&captures);
-        workspace.resize(required, usize::MAX);
+        let mut workspace = std::vec![usize::MAX; required];
         assert!(
             matches!(protocol.deliveries(&captures, &mut workspace[..required - 1]),
             Err(DeliveryError::Workspace { required: size, .. }) if size == required)
@@ -391,8 +391,9 @@ mod tests {
     fn missing_reused_or_unordered_producer_evidence_cannot_supply_a_receive() {
         let global = g::send::<0, 1, g::Msg<7, ()>>().roll();
         let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+        let mut workspace = std::vec::Vec::<usize>::new();
         let mut sends = [
             operation(&snapshot, 0, tap::SEND_POLL),
             operation(&snapshot, 0, tap::ENDPOINT_SEND),
@@ -445,8 +446,8 @@ mod tests {
             g::send::<1, 0, g::Msg<8, ()>>(),
         );
         let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let mut first = [
             operation(&snapshot, 1, tap::ENDPOINT_RECV),
             operation(&snapshot, 0, tap::SEND_POLL),
@@ -463,7 +464,7 @@ mod tests {
             Capture::new(&first, Some(3)).unwrap(),
             Capture::new(&second, Some(3)).unwrap(),
         ];
-        workspace.resize(protocol.delivery_workspace_len(&inputs), 0);
+        let mut workspace = std::vec![0; protocol.delivery_workspace_len(&inputs)];
         assert!(matches!(
             protocol.deliveries(&inputs, &mut workspace),
             Err(DeliveryError::Cycle)

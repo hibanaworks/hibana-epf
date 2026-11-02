@@ -89,10 +89,10 @@ fn audit(args: Vec<String>) -> Result<(), String> {
             Capture::new(records, Some(*checkpoint)).map_err(|e| format!("capture: {e:?}"))
         })
         .collect::<Result<_, _>>()?;
-    let mut workspace =
+    let mut source_storage =
         vec![0; Protocol::workspace_len(&compiled).map_err(|e| format!("protocol: {e:?}"))?];
     let protocol =
-        Protocol::new(&compiled, &mut workspace).map_err(|e| format!("protocol: {e:?}"))?;
+        Protocol::new(&compiled, &mut source_storage).map_err(|e| format!("protocol: {e:?}"))?;
     let count = captures.iter().map(|capture| capture.records().len()).sum();
     let mut unfolding = vec![Unfold::Source; capacity];
     let mut choices = vec![
@@ -122,12 +122,9 @@ fn audit(args: Vec<String>) -> Result<(), String> {
         };
         count
     ];
-    workspace.resize(
-        protocol
+    let mut workspace = std::vec![0; protocol
             .audit_workspace_len(&captures, capacity)
-            .map_err(|e| format!("audit: {e:?}"))?,
-        0,
-    );
+            .map_err(|e| format!("audit: {e:?}"))?];
     let checked = protocol
         .audit(
             &captures,

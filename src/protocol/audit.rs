@@ -301,6 +301,9 @@ fn route_choices(
 // distributed visit number: the opposite arm remains in the exhaustive search
 // and every completed candidate still passes check_execution. Use one
 // producer's actor stream rather than treating producer ordinals as a clock.
+// Typed operations can establish an arm before an offer records it. Count
+// those operations once per observed enclosing reset, rather than counting
+// each message or treating a later offer as the first visit.
 fn route_preference(
     source: Unfolded<'_, '_>,
     earlier: &[RouteChoice],
@@ -314,23 +317,44 @@ fn route_preference(
     let visit = earlier.iter().filter(|choice|
         matches!(source.kind(choice.span), Some(NodeKind::Choice(prior)) if prior == key)
     ).count();
+    let protocol = source.protocol();
+    let bounds = protocol.scope(key).unwrap();
     let matches = |record: &&tap::TapEvent| {
-        record.id() == tap::ROUTE_ARM_SELECTION
-            && record.arg0() == session
-            && record.arg1() >> 16 == u32::from(key)
+        record.arg0() == session
+            && record.id() != tap::SEND_POLL
+            && super::routes::selected(**record, key, &bounds).is_some()
     };
     for capture in captures {
         let Some(first) = capture.records().iter().find(matches) else {
             continue;
         };
         let actor = first.causal_key() >> 8;
-        return capture
+        let mut number = 0;
+        let mut seen = false;
+        for record in capture
             .records()
             .iter()
-            .filter(matches)
-            .filter(|record| record.causal_key() >> 8 == actor)
-            .nth(visit)
-            .is_some_and(|record| record.arg1() as u16 == 1);
+            .filter(|record| record.arg0() == session && record.causal_key() >> 8 == actor)
+        {
+            if record.id() == tap::SCOPE_REENTRY
+                && protocol
+                    .scope((record.arg1() >> 16) as u16)
+                    .is_some_and(|outer| outer.first <= bounds.first && bounds.last <= outer.last)
+                && seen
+            {
+                number += 1;
+                seen = false;
+            }
+            if record.id() != tap::SEND_POLL
+                && let Some(arm) = super::routes::selected(*record, key, &bounds)
+            {
+                if number == visit {
+                    return arm == 1;
+                }
+                seen = true;
+            }
+        }
+        return false;
     }
     false
 }
@@ -341,6 +365,67 @@ mod tests {
     use super::*;
     use hibana::{g, runtime::program::project};
     use std::vec;
+
+    #[test]
+    fn typed_operations_seed_distinct_branch_visits_before_later_offer_evidence() {
+        let global = g::route(
+            g::send::<7, 7, g::Msg<1, ()>>(),
+            g::send::<7, 7, g::Msg<2, ()>>(),
+        )
+        .roll();
+        let snapshot = tap::projected(&project::<7>(&global)).collect::<std::vec::Vec<_>>();
+        let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+        let reset = snapshot
+            .iter()
+            .find(|r| r.id() == tap::PROJECTED_SCOPE && r.causal_key() >> 13 == 1)
+            .unwrap()
+            .causal_key();
+        let choice = snapshot
+            .iter()
+            .find(|r| r.id() == tap::PROJECTED_CHOICE)
+            .unwrap()
+            .causal_key();
+        let record = |ordinal: u32, kind: u16, key: u16, detail: u32| {
+            let mut bytes = [0; 16];
+            bytes[..4].copy_from_slice(&ordinal.to_be_bytes());
+            bytes[4..6].copy_from_slice(&kind.to_be_bytes());
+            bytes[6..8].copy_from_slice(&key.to_be_bytes());
+            bytes[8..12].copy_from_slice(&1u32.to_be_bytes());
+            bytes[12..].copy_from_slice(&detail.to_be_bytes());
+            tap::TapEvent::from(bytes)
+        };
+        let rows = [
+            record(0, tap::ENDPOINT_SEND, 0x0701, 7 << 24 | 1),
+            record(1, tap::SCOPE_REENTRY, 0x0707, u32::from(reset) << 16),
+            record(2, tap::ROUTE_ARM_SELECTION, 0x0703, u32::from(choice) << 16),
+            record(3, tap::ENDPOINT_SEND, 0x0701, 7 << 24),
+        ];
+        let captures = [Capture::new(&rows, Some(4)).unwrap()];
+        let mut steps = [Unfold::Source; 3];
+        let mut search = [0; 28];
+        let count = super::super::unfolding::generate::seed(
+            protocol,
+            &captures,
+            1,
+            &mut steps,
+            &mut search,
+        )
+        .unwrap();
+        let mut proof = [0; 15];
+        let source = protocol.unfolding(&steps[..count], &mut proof).unwrap();
+        assert_eq!(source.event_count(), 4);
+        let mut choices = [RouteChoice {
+            span: [0, 0],
+            right: false,
+        }; 4];
+        assert_eq!(
+            route_choices(source, &mut choices, 0, &captures, 1, &mut search),
+            2
+        );
+        assert!(choices[0].right);
+        assert!(!choices[1].right);
+    }
 
     #[test]
     fn an_observed_arm_changes_search_order_without_removing_the_opposite_arm() {
@@ -354,8 +439,8 @@ mod tests {
             .find(|r| r.id() == tap::PROJECTED_CHOICE)
             .unwrap()
             .causal_key();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let steps = [Unfold::Source];
         let mut proof = [0; 5];
         let source = protocol.unfolding(&steps, &mut proof).unwrap();

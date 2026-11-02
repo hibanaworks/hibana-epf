@@ -8,11 +8,11 @@ use hibana::{
 use hibana_epf::{Protocol, ProtocolError};
 
 fn check_snapshot(snapshot: &[TapEvent]) {
-    let mut workspace = vec![usize::MAX; Protocol::workspace_len(snapshot).unwrap()];
-    let program = Protocol::new(snapshot, &mut workspace).unwrap();
-    workspace.fill(usize::MAX);
+    let mut source_storage = vec![usize::MAX; Protocol::workspace_len(snapshot).unwrap()];
+    let program = Protocol::new(snapshot, &mut source_storage).unwrap();
     assert_eq!(program.records(), snapshot);
     assert_eq!(program.records().as_ptr(), snapshot.as_ptr());
+    source_storage.fill(usize::MAX);
 }
 
 fn word(event: TapEvent, offset: usize, value: u32) -> TapEvent {

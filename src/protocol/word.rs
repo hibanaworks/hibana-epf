@@ -1,6 +1,9 @@
 //! Check occurrence words using source actor order and retained-body dependencies.
 use super::{Layout, SourcePath};
 
+#[cfg(test)]
+mod tests;
+
 /// One point of a proposed source execution, indexed in its checked unfolding.
 ///
 /// Acceptance, sender publication and receiver commit are separate points.
@@ -90,6 +93,8 @@ impl SourcePath<'_, '_, '_> {
             return Some(SourcePoint::Accepted(event));
         }
         let source = self.unfolding();
+        let target_actor = self.point_actor(point);
+        let can_resume = matches!(point, SourcePoint::Accepted(_)) && source.has_insertions();
         for event in 0..source.event_count() {
             for prior in [
                 SourcePoint::Local(event),
@@ -99,7 +104,7 @@ impl SourcePath<'_, '_, '_> {
                 let Some(actor) = self.point_actor(prior) else {
                     continue;
                 };
-                if Some(actor) != self.point_actor(point) {
+                if Some(actor) != target_actor || contains(prior) {
                     continue;
                 }
                 let ordered = match point {
@@ -110,13 +115,16 @@ impl SourcePath<'_, '_, '_> {
                     ),
                     _ => source.before(event, point.event()),
                 };
-                let resumption = matches!(point, SourcePoint::Accepted(_))
+                if ordered {
+                    return Some(prior);
+                }
+                let resumption = can_resume
                     && history.clone().any(|entry| {
                         !matches!(entry, SourcePoint::Accepted(_))
                             && self.point_actor(entry) == Some(actor)
                             && source.same_resumption(event, point.event(), entry.event())
                     });
-                if (ordered || resumption) && !contains(prior) {
+                if resumption {
                     return Some(prior);
                 }
             }

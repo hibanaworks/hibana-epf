@@ -10,7 +10,7 @@ cargo +stable test --locked --lib --features std protocol::history::tests \
 cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary ResolverEvidence; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -92,6 +92,21 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
       perl -0pi -e 's/if left \{\n                first = middle \+ 1;/if !left {\n                first = middle + 1;/g == 1 or die "missing structural boundary search\n"' \
         "$source/src/protocol/unfolding.rs"
       ;;
+    ScopeLookup)
+      perl -0pi -e 's/records\[index\]\.causal_key\(\) < key/records[index].causal_key() <= key/g == 1 or die "missing indexed scope lower bound\n"' "$source/src/protocol.rs"
+      ;;
+    HeadPrefix)
+      perl -0pi -e 's/(fn head\(.*?partition_point\(\|row\| \(row.arg0\(\) as usize\)) < region.start/$1 <= region.start/s == 1 or die "missing source head boundary\n"' "$source/src/protocol/unfolding.rs"
+      ;;
+    BranchDemand)
+      perl -0pi -e 's/ scratch\[split\.\.end\]\.iter\(\)\.max\(\)\.copied\(\)\.unwrap_or\(0\)/.max(scratch[split..end].iter().max().copied().unwrap_or(0))/g == 1 or die "missing alternative visit demand\n"' "$source/src/protocol/unfolding/generate.rs"
+      ;;
+    TypedArmSeed)
+      perl -0pi -e 's/super::routes::selected\(\*\*record, key,     ResolverEvidence)bounds\)\.is_some\(\)/record.id() == tap::ROUTE_ARM_SELECTION     ResolverEvidence)    ResolverEvidence) super::routes::selected(**record, key,     ResolverEvidence)bounds).is_some()/g == 1 or die "missing typed operation preference\n"' "$source/src/protocol/audit.rs"
+      ;;
+    InsertionPrune)
+      perl -0pi -e 's/source\.has_insertions\(\)/false/g == 1 or die "missing insertion condition\n"' "$source/src/protocol/word.rs"
+      ;;
     ResolverEvidence)
       perl -0pi -e 's/if audit\.is_none_or\(/if false \&\& audit.is_none_or(/g == 1 or die "missing resolver evidence check\n"' \
         "$source/src/protocol/routes.rs"
@@ -131,6 +146,11 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         causal_order_search_matches_every_interleaving_and_rejects_an_early_reply -- --exact ;;
       SplitInsertion|SplitBoundary) cargo +stable test --locked --lib \
         protocol::unfolding::tests::structural_splits_match_full_cut_enumeration_across_all_unfolding_constructors -- --exact ;;
+      ScopeLookup) cargo +stable test --locked --lib protocol::index_tests::retained_scope_index_matches_exhaustive_marker_lookup -- --exact ;;
+      HeadPrefix) cargo +stable test --locked --test source_unfolding compiled_scope_nesting_preserves_sequence_parallel_and_choice -- --exact ;;
+      BranchDemand) cargo +stable test --locked --lib protocol::unfolding::generate::tests::branch_demands_add_while_sequence_parallel_and_nested_roll_share_visits -- --exact ;;
+      TypedArmSeed) cargo +stable test --locked --lib protocol::audit::tests::typed_operations_seed_distinct_branch_visits_before_later_offer_evidence -- --exact ;;
+      InsertionPrune) cargo +stable test --locked --lib protocol::word::tests::prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset -- --exact ;;
       ResolverEvidence) cargo +stable test --locked --test endpoint_observation \
         automatic_audit_checks_resolver_calls_from_outgoing_offers_in_each_visit -- --exact ;;
     esac
@@ -138,7 +158,7 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
   test "$status" = 101
   case "$mutation" in
     Length|Ordinals) grep -Fq 'test result: FAILED. 3 passed; 1 failed;' "$out/$mutation.log" ;;
-    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*|Split*|ResolverEvidence) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
+    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*|Split*|ResolverEvidence|ScopeLookup|HeadPrefix|BranchDemand|TypedArmSeed|InsertionPrune) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
   esac
   case "$mutation" in
     Length) name=deleting_any_record_including_the_last_is_incomplete ;;
@@ -155,6 +175,11 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     AcceptanceEvidence) name=an_observed_send_poll_can_end_in_a_transport_error_without_a_commit ;;
     ConstructorOrder) name=causal_order_search_matches_every_interleaving_and_rejects_an_early_reply ;;
     SplitInsertion|SplitBoundary) name=protocol::unfolding::tests::structural_splits_match_full_cut_enumeration_across_all_unfolding_constructors ;;
+    ScopeLookup) name=protocol::index_tests::retained_scope_index_matches_exhaustive_marker_lookup ;;
+    HeadPrefix) name=compiled_scope_nesting_preserves_sequence_parallel_and_choice ;;
+    BranchDemand) name=protocol::unfolding::generate::tests::branch_demands_add_while_sequence_parallel_and_nested_roll_share_visits ;;
+    TypedArmSeed) name=protocol::audit::tests::typed_operations_seed_distinct_branch_visits_before_later_offer_evidence ;;
+    InsertionPrune) name=protocol::word::tests::prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset ;;
     ResolverEvidence) name=automatic_audit_checks_resolver_calls_from_outgoing_offers_in_each_visit ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"
@@ -162,4 +187,4 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
   printf 'mutation=%s\nexit=%s\n' "$mutation" "$status" > "$out/$mutation-result.txt"
   rm -r -- "$source"
 done
-echo "History sensitivity: twenty prefix, call, delivery, source-execution, split and resolver-evidence defects fail their regressions"
+echo "History sensitivity: twenty-five prefix, call, delivery, source-execution, index, construction and resolver-evidence defects fail their regressions"

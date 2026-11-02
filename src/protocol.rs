@@ -25,12 +25,14 @@ pub use word::{SourcePoint, WordError};
 
 /// A complete, structurally checked snapshot from `tap::projected`.
 ///
-/// This borrows the original records, including source structure and immutable
-/// actor bindings. It holds no execution cursor or current resource owners.
+/// This borrows the original records and their validated scope index, including
+/// source structure and immutable actor bindings. It holds no execution cursor
+/// or current resource owners.
 /// Checking this input does not establish that an execution followed it.
 #[derive(Clone, Copy, Debug)]
 pub struct Protocol<'a> {
     records: &'a [TapEvent],
+    scope_index: &'a [usize],
 }
 
 /// A malformed compiled snapshot or insufficient caller-supplied workspace.
@@ -52,32 +54,47 @@ impl<'a> Protocol<'a> {
         Ok(2 * layout.scopes.len() + layout.actor_words())
     }
 
-    /// Check a complete snapshot using temporary caller-owned workspace.
+    /// Check a complete snapshot and retain its sorted scope index.
     ///
-    /// Size `workspace` with `workspace_len`. Only the records remain borrowed
-    /// after this call; the workspace may immediately be reused.
+    /// Size `storage` with `workspace_len`. Both records and storage remain
+    /// borrowed while the protocol is used. History checking uses separate
+    /// temporary workspace; it does not rebuild this immutable index.
     ///
     /// The checks establish section boundaries, scope nesting, choice and actor
     /// references, initial issuance and the presence, direction and order of
     /// local rows. Actor bindings come from the compiled source; this does not
     /// independently prove their correspondence to the original Rust global.
-    pub fn new(records: &'a [TapEvent], workspace: &mut [usize]) -> Result<Self, ProtocolError> {
+    ///
+    /// The index cannot be changed while a protocol still uses it.
+    /// ```compile_fail
+    /// use hibana::{runtime::tap::TapEvent};
+    /// use hibana_epf::Protocol;
+    /// fn overwrite(records: &[TapEvent], storage: &mut [usize]) {
+    ///     let protocol = Protocol::new(records, storage).unwrap();
+    ///     storage.fill(0);
+    ///     let _ = protocol.records();
+    /// }
+    /// ```
+    pub fn new(records: &'a [TapEvent], storage: &'a mut [usize]) -> Result<Self, ProtocolError> {
         let layout = Layout::read(records)?;
         let required = 2 * layout.scopes.len() + layout.actor_words();
-        if workspace.len() < required {
+        if storage.len() < required {
             return Err(ProtocolError::Workspace {
                 required,
-                actual: workspace.len(),
+                actual: storage.len(),
             });
         }
-        let (markers, rest) = workspace[..required].split_at_mut(layout.scopes.len());
+        let (markers, rest) = storage[..required].split_at_mut(layout.scopes.len());
         let (groups, candidates) = rest.split_at_mut(layout.scopes.len());
         let choices = layout.check_scopes(records, markers, groups)?;
         layout.check_choices(records, markers, groups, choices)?;
         layout.check_issuance(records)?;
         layout.check_actors(records, markers, candidates)?;
         layout.check_rows(records, candidates)?;
-        Ok(Self { records })
+        Ok(Self {
+            records,
+            scope_index: markers,
+        })
     }
 
     /// The original complete snapshot, without copying or rewriting its rows.
@@ -85,6 +102,9 @@ impl<'a> Protocol<'a> {
         self.records
     }
 }
+
+#[cfg(test)]
+mod index_tests;
 
 struct Layout {
     sources: Range<usize>,
@@ -522,35 +542,13 @@ fn contains_actor(reference: u32, actor: u16, candidates: &[usize]) -> bool {
     }
 }
 
-impl Layout {
-    fn scope(&self, records: &[TapEvent], key: u16) -> Option<Scope> {
-        let mut first = None;
-        let mut split = None;
-        let mut last = None;
-        for index in self.scopes.clone() {
-            let row = records[index];
-            if row.causal_key() != key {
-                continue;
-            }
-            // Route scopes record enter/exit for each arm. Their second
-            // marker is the left arm's exit, hence the branch boundary.
-            if key >> 13 == 0 && first.is_some() && split.is_none() {
-                split = Some(row.arg0());
-            }
-            first.get_or_insert(index);
-            if row.arg1() & 3 == 1 {
-                split = Some(row.arg0());
-            }
-            last = Some(index);
-        }
-        let first = first?;
-        let last = last?;
-        Some(Scope {
-            start: records[first].arg0(),
-            split,
-            end: records[last].arg0(),
-            first,
-            last,
-        })
+impl Protocol<'_> {
+    fn scope(&self, key: u16) -> Option<Scope> {
+        let records = self.records;
+        let group = self
+            .scope_index
+            .partition_point(|&index| records[index].causal_key() < key);
+        let &first = self.scope_index.get(group)?;
+        (records[first].causal_key() == key).then(|| scope(records, self.scope_index, group))
     }
 }

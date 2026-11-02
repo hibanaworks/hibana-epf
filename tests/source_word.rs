@@ -15,10 +15,10 @@ fn later_publication_cannot_hide_an_acceptance_before_its_source_predecessor() {
         g::send::<0, 1, g::Msg<7, ()>>(),
     );
     let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let steps = [Unfold::Source, Unfold::Source, Unfold::Sequence([0, 1])];
-    scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
+    let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(&steps)];
     let unfolded = protocol.unfolding(&steps, &mut scratch).unwrap();
     let mut rows = vec![0; unfolded.path_workspace_len().unwrap()];
     let path = unfolded.select(&[], &mut rows).unwrap();
@@ -67,8 +67,8 @@ fn a_parallel_join_requires_both_sides_without_ordering_the_siblings() {
         g::send::<0, 0, g::Msg<3, ()>>(),
     );
     let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let steps = [
         Unfold::Source,
         Unfold::Source,
@@ -76,7 +76,7 @@ fn a_parallel_join_requires_both_sides_without_ordering_the_siblings() {
         Unfold::Source,
         Unfold::Sequence([2, 3]),
     ];
-    scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
+    let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(&steps)];
     let unfolded = protocol.unfolding(&steps, &mut scratch).unwrap();
     let mut rows = vec![0; unfolded.path_workspace_len().unwrap()];
     let path = unfolded.select(&[], &mut rows).unwrap();
@@ -107,8 +107,8 @@ fn only_a_committed_resumed_body_delays_the_outgoing_continuation() {
         .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
         .unwrap()
         .causal_key();
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let steps = [
         Unfold::Source,
         Unfold::Source,
@@ -123,7 +123,7 @@ fn only_a_committed_resumed_body_delays_the_outgoing_continuation() {
             focus: [0, 1],
         },
     ];
-    scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
+    let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(&steps)];
     let unfolded = protocol.unfolding(&steps, &mut scratch).unwrap();
     let mut rows = vec![0; unfolded.path_workspace_len().unwrap()];
     let path = unfolded.select(&[], &mut rows).unwrap();
@@ -161,8 +161,8 @@ fn an_old_incoming_continuation_can_arrive_after_the_other_view_resumes() {
         .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
         .unwrap()
         .causal_key();
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let steps = [
         Unfold::Source,
         Unfold::Source,
@@ -177,7 +177,7 @@ fn an_old_incoming_continuation_can_arrive_after_the_other_view_resumes() {
             focus: [0, 1],
         },
     ];
-    scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
+    let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(&steps)];
     let unfolded = protocol.unfolding(&steps, &mut scratch).unwrap();
     let mut rows = vec![0; unfolded.path_workspace_len().unwrap()];
     let path = unfolded.select(&[], &mut rows).unwrap();
@@ -237,9 +237,9 @@ fn reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations() {
             focus: [0, 1],
         },
     ];
-    let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
-    scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(&steps)];
     let unfolded = protocol.unfolding(&steps, &mut scratch).unwrap();
     let mut rows = vec![0; unfolded.path_workspace_len().unwrap()];
     let path = unfolded.select(&[], &mut rows).unwrap();

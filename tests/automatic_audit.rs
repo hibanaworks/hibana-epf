@@ -27,8 +27,8 @@ fn check(
     records: &[TapEvent],
     capacity: usize,
 ) -> Result<usize, AuditError> {
-    let mut scratch = vec![0; Protocol::workspace_len(snapshot).unwrap()];
-    let protocol = Protocol::new(snapshot, &mut scratch).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(snapshot).unwrap()];
+    let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
     let captures = [Capture::new(records, Some(records.len() as u32)).unwrap()];
     let mut steps = vec![Unfold::Source; capacity];
     let mut choices = vec![
@@ -56,10 +56,7 @@ fn check(
         };
         records.len()
     ];
-    scratch.resize(
-        protocol.audit_workspace_len(&captures, capacity).unwrap(),
-        0,
-    );
+    let mut scratch = std::vec![0; protocol.audit_workspace_len(&captures, capacity).unwrap()];
     let audit = protocol.audit(
         &captures,
         AuditStorage {

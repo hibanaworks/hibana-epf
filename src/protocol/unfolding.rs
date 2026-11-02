@@ -148,10 +148,10 @@ impl<'p> Protocol<'p> {
             }
             let expected = get(rows, index);
             let head = layout
-                .head(self.records, expected)
+                .head(*self, expected)
                 .ok_or(UnfoldingError::Step { index })?;
             let mut assign = |child: usize, source: Region| {
-                let source = layout.canonical(self.records, source);
+                let source = layout.canonical(*self, source);
                 if child >= index {
                     return Err(UnfoldingError::Step { index });
                 }
@@ -175,8 +175,7 @@ impl<'p> Protocol<'p> {
                     assign(next, source)?;
                 }
                 (Unfold::Independent(children), Head::Roll(source)) => {
-                    let Some(Head::Parallel(mut sources)) = layout.head(self.records, source)
-                    else {
+                    let Some(Head::Parallel(mut sources)) = layout.head(*self, source) else {
                         return Err(UnfoldingError::Step { index });
                     };
                     for source in &mut sources {
@@ -194,9 +193,9 @@ impl<'p> Protocol<'p> {
                     Head::Sequence([left, _]),
                 ) => {
                     let source = layout
-                        .retained(self.records, left, retained)
+                        .retained(*self, left, retained)
                         .ok_or(UnfoldingError::Step { index })?;
-                    let Some(Head::Roll(body)) = layout.head(self.records, source) else {
+                    let Some(Head::Roll(body)) = layout.head(*self, source) else {
                         return Err(UnfoldingError::Step { index });
                     };
                     assign(earlier, expected)?;
@@ -220,7 +219,7 @@ impl<'p> Protocol<'p> {
                     Head::Sequence([left, right]),
                 ) => {
                     let source = layout
-                        .retained(self.records, left, retained)
+                        .retained(*self, left, retained)
                         .ok_or(UnfoldingError::Step { index })?;
                     assign(earlier, left)?;
                     assign(next, source)?;
@@ -293,12 +292,12 @@ impl Unfolded<'_, '_> {
     pub(super) fn reentered(&self, event: usize, key: u16) -> bool {
         let layout = Layout::checked(self.protocol);
         let records = self.protocol.records;
-        let Some(target) = layout.scope(records, key) else {
+        let Some(target) = self.protocol.scope(key) else {
             return false;
         };
         let contains = |outer: u16| {
-            layout
-                .scope(records, outer)
+            self.protocol
+                .scope(outer)
                 .is_some_and(|bounds| bounds.first <= target.first && target.last <= bounds.last)
         };
         let mut resumed = false;
@@ -447,8 +446,7 @@ impl Unfolded<'_, '_> {
             match self.steps[at] {
                 Unfold::Source => {
                     return matches!(
-                        Layout::checked(self.protocol)
-                            .head(self.protocol.records, get(self.rows, at)),
+                        Layout::checked(self.protocol).head(self.protocol, get(self.rows, at)),
                         Some(Head::Roll(_))
                     )
                     .then_some([0, self.count(at)]);
@@ -464,6 +462,12 @@ impl Unfolded<'_, '_> {
                 _ => return None,
             }
         }
+    }
+
+    pub(super) fn has_insertions(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, Unfold::Alongside { .. } | Unfold::Before { .. }))
     }
 
     pub(super) fn same_resumption(
@@ -587,11 +591,10 @@ impl Unfolded<'_, '_> {
                 Unfold::Source => {
                     let layout = Layout::checked(self.protocol);
                     let region = get(self.rows, earlier);
-                    let Head::Sequence([left, _]) = layout.head(self.protocol.records, region)?
-                    else {
+                    let Head::Sequence([left, _]) = layout.head(self.protocol, region)? else {
                         return None;
                     };
-                    let scope = layout.retained(self.protocol.records, left, retained)?;
+                    let scope = layout.retained(self.protocol, left, retained)?;
                     Some([scope.start - region.start, scope.end - region.start])
                 }
                 _ => None,
@@ -608,10 +611,9 @@ impl Unfolded<'_, '_> {
 
     fn anchor(&self, mut at: usize, retained: u16) -> Option<[usize; 2]> {
         let layout = Layout::checked(self.protocol);
-        let records = self.protocol.records;
         let target = layout.canonical(
-            records,
-            layout.retained(records, get(self.rows, at), retained)?,
+            self.protocol,
+            layout.retained(self.protocol, get(self.rows, at), retained)?,
         );
         let mut base = 0;
         loop {
@@ -628,12 +630,12 @@ impl Unfolded<'_, '_> {
             match self.steps[at] {
                 Unfold::Sequence([a, b]) | Unfold::Parallel([a, b]) | Unfold::Choice([a, b]) => {
                     if layout
-                        .retained(records, get(self.rows, a), retained)
+                        .retained(self.protocol, get(self.rows, a), retained)
                         .is_some()
                     {
                         at = a;
                     } else if layout
-                        .retained(records, get(self.rows, b), retained)
+                        .retained(self.protocol, get(self.rows, b), retained)
                         .is_some()
                     {
                         base += self.count(a);
@@ -644,7 +646,7 @@ impl Unfolded<'_, '_> {
                 }
                 Unfold::Source => {
                     let region = get(self.rows, at);
-                    let scope = layout.retained(records, region, retained)?;
+                    let scope = layout.retained(self.protocol, region, retained)?;
                     return Some([
                         base + scope.start - region.start,
                         base + scope.end - region.start,
@@ -843,7 +845,7 @@ impl Unfolded<'_, '_> {
             match self.steps[at] {
                 Unfold::Source => {
                     return Layout::checked(self.protocol).source_before(
-                        self.protocol.records,
+                        self.protocol,
                         get(self.rows, at),
                         first,
                         second,
@@ -957,16 +959,20 @@ fn get(rows: &[usize], index: usize) -> Region {
 }
 
 impl Layout {
-    fn canonical(&self, records: &[hibana::runtime::tap::TapEvent], region: Region) -> Region {
+    fn canonical(&self, protocol: Protocol<'_>, region: Region) -> Region {
+        let records = protocol.records;
         let mut first = region.last;
         let mut last = 0;
-        for marker in region.first..region.last {
+        let candidates =
+            &records[self.scopes.start + region.first..self.scopes.start + region.last];
+        let skip = candidates.partition_point(|row| (row.arg0() as usize) < region.start);
+        for marker in region.first + skip..region.last {
             let index = self.scopes.start + marker;
             let row = records[index];
             if row.arg1() & 3 != 0 {
                 continue;
             }
-            let Some(scope) = self.scope(records, row.causal_key()) else {
+            let Some(scope) = protocol.scope(row.causal_key()) else {
                 continue;
             };
             if scope.first != index
@@ -989,7 +995,8 @@ impl Layout {
         }
     }
 
-    fn head(&self, records: &[hibana::runtime::tap::TapEvent], region: Region) -> Option<Head> {
+    fn head(&self, protocol: Protocol<'_>, region: Region) -> Option<Head> {
+        let records = protocol.records;
         if region.start >= region.end {
             return None;
         }
@@ -999,13 +1006,19 @@ impl Layout {
                 ..region
             }));
         }
-        for marker in region.first..region.last {
+        let candidates =
+            &records[self.scopes.start + region.first..self.scopes.start + region.last];
+        let skip = candidates.partition_point(|row| (row.arg0() as usize) < region.start);
+        for marker in region.first + skip..region.last {
             let index = self.scopes.start + marker;
             let row = records[index];
+            if row.arg0() as usize > region.start {
+                break;
+            }
             if row.arg1() & 3 != 0 || row.arg0() as usize != region.start {
                 continue;
             }
-            let scope = self.scope(records, row.causal_key())?;
+            let scope = protocol.scope(row.causal_key())?;
             if scope.first != index
                 || scope.last >= self.scopes.start + region.last
                 || scope.end as usize > region.end
@@ -1070,7 +1083,7 @@ impl Layout {
 
     fn source_at(
         &self,
-        records: &[hibana::runtime::tap::TapEvent],
+        protocol: Protocol<'_>,
         mut region: Region,
         mut span: [usize; 2],
         mut event: usize,
@@ -1079,7 +1092,7 @@ impl Layout {
             if span[0] >= span[1] || span[1] > region.end - region.start {
                 return None;
             }
-            let head = self.head(records, region)?;
+            let head = self.head(protocol, region)?;
             match head {
                 Head::Roll(body) => region = body,
                 Head::Message => return (span == [0, 1]).then_some((NodeKind::Message, false)),
@@ -1111,13 +1124,13 @@ impl Layout {
 
     fn source_before(
         &self,
-        records: &[hibana::runtime::tap::TapEvent],
+        protocol: Protocol<'_>,
         mut region: Region,
         mut first: usize,
         mut second: usize,
     ) -> bool {
         loop {
-            let Some(head) = self.head(records, region) else {
+            let Some(head) = self.head(protocol, region) else {
                 return false;
             };
             match head {
@@ -1139,16 +1152,11 @@ impl Layout {
         }
     }
 
-    fn retained(
-        &self,
-        records: &[hibana::runtime::tap::TapEvent],
-        parent: Region,
-        key: u16,
-    ) -> Option<Region> {
+    fn retained(&self, protocol: Protocol<'_>, parent: Region, key: u16) -> Option<Region> {
         if key >> 13 != 1 {
             return None;
         }
-        let scope = self.scope(records, key)?;
+        let scope = protocol.scope(key)?;
         let first = scope.first - self.scopes.start;
         let last = scope.last - self.scopes.start + 1;
         (parent.start <= scope.start as usize
@@ -1196,7 +1204,7 @@ fn subtree_at(
             return Some(match steps[at] {
                 Unfold::Source => {
                     return Layout::checked(protocol).source_at(
-                        protocol.records,
+                        protocol,
                         get(rows, at),
                         span,
                         event,
@@ -1227,12 +1235,7 @@ fn subtree_at(
         }
         match steps[at] {
             Unfold::Source => {
-                return Layout::checked(protocol).source_at(
-                    protocol.records,
-                    get(rows, at),
-                    span,
-                    event,
-                );
+                return Layout::checked(protocol).source_at(protocol, get(rows, at), span, event);
             }
             Unfold::Once(body) => at = body,
             Unfold::Sequence([a, b])

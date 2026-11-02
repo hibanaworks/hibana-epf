@@ -56,8 +56,8 @@ impl Protocol<'_> {
             let current = observed(id);
             if current.id() == tap::SCOPE_REENTRY {
                 let key = (current.arg1() >> 16) as u16;
-                let bounds = layout
-                    .scope(self.records, key)
+                let bounds = self
+                    .scope(key)
                     .ok_or(RouteHistoryError::Reentry { record: id })?;
                 let valid = match key >> 13 {
                     0 => current.arg1() as u16 <= 1 && self.records[bounds.first].arg1() & 4 != 0,
@@ -101,7 +101,7 @@ impl Protocol<'_> {
                     u16::MAX
                 };
                 let fresh = prepared != u16::MAX
-                    && layout.scope(self.records, prepared).is_some_and(|scope| {
+                    && self.scope(prepared).is_some_and(|scope| {
                         scope.start <= event as u32 && (event as u32) < scope.end
                     });
                 if !fresh {
@@ -113,8 +113,8 @@ impl Protocol<'_> {
                             continue;
                         }
                         if prior.id() == tap::SCOPE_REENTRY
-                            && layout
-                                .scope(self.records, (prior.arg1() >> 16) as u16)
+                            && self
+                                .scope((prior.arg1() >> 16) as u16)
                                 .is_some_and(|scope| {
                                     scope.start <= event as u32 && (event as u32) < scope.end
                                 })
@@ -174,9 +174,7 @@ impl Protocol<'_> {
         // them once per choice while checking the same record/choice pairs.
         for choice in &self.records[layout.choices.clone()] {
             let key = choice.causal_key();
-            let bounds = layout
-                .scope(self.records, key)
-                .expect("checked choice has a source scope");
+            let bounds = self.scope(key).expect("checked choice has a source scope");
             for (position, &id) in order.iter().enumerate() {
                 let current = observed(id);
                 let Some(arm) = selected(current, key, &bounds) else {
@@ -185,8 +183,8 @@ impl Protocol<'_> {
                 if current.id() == tap::SEND_POLL {
                     let prepared = (current.arg1() >> 16) as u16;
                     if prepared != u16::MAX
-                        && layout
-                            .scope(self.records, prepared)
+                        && self
+                            .scope(prepared)
                             .is_some_and(|outer| contains(&outer, &bounds))
                     {
                         continue;
@@ -201,8 +199,8 @@ impl Protocol<'_> {
                     }
                     if prior.id() == tap::SCOPE_REENTRY {
                         let reset_key = (prior.arg1() >> 16) as u16;
-                        if layout
-                            .scope(self.records, reset_key)
+                        if self
+                            .scope(reset_key)
                             .is_some_and(|outer| contains(&outer, &bounds))
                         {
                             if reset_key == key && prior.arg1() as u16 != u16::from(arm) {
@@ -218,8 +216,8 @@ impl Protocol<'_> {
                     if prior.id() == tap::SEND_POLL {
                         let prepared = (prior.arg1() >> 16) as u16;
                         if prepared != u16::MAX
-                            && layout
-                                .scope(self.records, prepared)
+                            && self
+                                .scope(prepared)
                                 .is_some_and(|outer| contains(&outer, &bounds))
                         {
                             continue;
@@ -253,7 +251,7 @@ fn committed(record: TapEvent) -> bool {
     )
 }
 
-fn selected(record: TapEvent, key: u16, bounds: &Scope) -> Option<u8> {
+pub(super) fn selected(record: TapEvent, key: u16, bounds: &Scope) -> Option<u8> {
     if record.id() == tap::ROUTE_ARM_SELECTION && record.arg1() >> 16 == u32::from(key) {
         return Some(record.arg1() as u8);
     }

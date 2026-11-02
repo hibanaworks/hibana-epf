@@ -47,8 +47,9 @@ fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
             .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
             .unwrap()
             .causal_key();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+        let mut workspace = std::vec::Vec::<usize>::new();
         let steps = [
             Unfold::Source,
             Unfold::Source,
@@ -169,8 +170,9 @@ fn causal_order_search_matches_every_interleaving_and_rejects_an_early_reply() {
         g::send::<8, 7, g::Msg<2, ()>>(),
     );
     let snapshot: Vec<_> = tap::projected(&project::<7>(&global)).collect();
-    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let mut workspace = std::vec::Vec::<usize>::new();
     let steps = [Unfold::Source, Unfold::Source, Unfold::Sequence([0, 1])];
     let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
     let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();

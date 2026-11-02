@@ -564,8 +564,8 @@ mod tests {
         let global = g::send::<0, 1, Message>().roll();
         let program = project::<0>(&global);
         let snapshot: Vec<_> = tap::projected(&program).collect();
-        let mut work = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut work).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let records = records(&[
             (tap::SEND_POLL, 0xffff_0000),
             (tap::SEND_POLL, 0xffff_0000),
@@ -575,7 +575,7 @@ mod tests {
             (tap::ENDPOINT_SEND, 0),
         ]);
         let capture = Capture::new(&records, Some(6)).unwrap();
-        work.resize(records.len(), 0);
+        let mut work = std::vec![0; records.len()];
         protocol
             .check_call_links(
                 capture,
@@ -612,8 +612,8 @@ mod tests {
         let global = g::send::<0, 1, Message>().roll();
         let program = project::<0>(&global);
         let snapshot: Vec<_> = tap::projected(&program).collect();
-        let mut work = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut work).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let records = records(&[
             (tap::SEND_POLL, 0xffff_0000),
             (tap::SEND_POLL, 0xffff_0000),
@@ -621,7 +621,7 @@ mod tests {
             (tap::ENDPOINT_SEND, 0),
         ]);
         let capture = Capture::new(&records, Some(4)).unwrap();
-        work.resize(records.len(), 0);
+        let mut work = std::vec![0; records.len()];
         assert!(matches!(
             protocol.check_call_links(capture, (&[0; 4], &[3, 4, 0, 0]), &mut work),
             Err(HistoryError::Record { index: 1 })

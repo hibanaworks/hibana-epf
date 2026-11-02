@@ -209,11 +209,13 @@ Replaying row labels alone cannot establish dynamic eligibility, even when
 every observation is retained. The source-execution checker uses the complete
 snapshot rather than treating local rows as an audit choreography.
 
-`Protocol::new(snapshot, workspace)` checks that input before history replay.
-It borrows the original snapshot and releases its temporary workspace after
-checking section counts, scope intervals, choice and actor references, initial
-issuance and local-operation coverage. `Protocol::workspace_len(snapshot)`
-derives the workspace size from the declared markers and actor decisions.
+`Protocol::new(snapshot, storage)` checks that input before history replay.
+It borrows the original snapshot and retains the validated, sorted scope index
+in caller-owned storage. History checks use separate temporary workspace and
+reuse the index. `Protocol::workspace_len(snapshot)` derives the storage size
+from the declared markers and actor decisions. Validation checks section
+counts, scope intervals, choice and actor references, initial issuance and
+local-operation coverage.
 The reader handles nested `par`/`route`/`roll` and multiple delegated resources.
 It checks the actor bindings supplied by the compiler; it does not prove their
 derivation from the Rust global or check a dynamic execution history.
@@ -341,8 +343,13 @@ acceptance intervals. Its only protocol input is the checked compiled snapshot.
 capacity, the compiled source and the complete captures. The returned `Audit`
 borrows those outputs and the retained proof and actor workspace.
 
-The first candidate uses observed commit counts to guide common repeated
-bodies. Counts are a construction hint, never evidence of a visit. If it fails,
+The first candidate uses observed commit counts to guide repeated bodies.
+Opposite route arms add their visit demands; sequential and parallel children
+share visits, while nested rolls account for their own repetitions. Typed
+operations can suggest an arm before a later offer records it. The preference
+groups one actor's observations by enclosing resets, rather than counting each
+message as another visit. These are construction hints, never evidence of a visit.
+If this candidate fails,
 the constructor enumerates source-typed derivation trees in increasing size,
 including independently repeated parallel bodies and retained-body insertion
 before, alongside and after a continuation. It searches all active route arms
@@ -363,6 +370,15 @@ this finite search. `AuditError::Exhausted` means no certificate was constructed
 within that capacity; it is not a verdict that the history or global is illegal.
 Worst-case search is exponential. Large-task throughput and consumer
 qualification must be measured separately.
+
+Execution checking skips prerequisites already present in the history and
+avoids resumption scans when the derivation has no inserted continuation.
+The prerequisite result is compared with the unfactored rule for every subset
+of operation points in ordinary, before and alongside fixtures. Separate
+controls break scope lookup, source boundaries, visit demand, typed-arm
+preference and resumption pruning; each must fail its regression. These checks
+supplement the source-execution tests and Lean claims, rather than proving
+general Rust refinement or practical completion for every finite search.
 
 The host CLI accepts canonical 16-byte record files and an independently saved
 checkpoint for each producer:

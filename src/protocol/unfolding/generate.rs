@@ -38,7 +38,7 @@ pub(crate) fn seed(
             }
         }
     }
-    for (count, received) in counts.iter_mut().zip(receives) {
+    for (count, received) in counts.iter_mut().zip(receives.iter()) {
         *count = (*count).max(*received);
     }
     let root = Region {
@@ -55,8 +55,8 @@ pub(crate) fn seed(
     let mut output = 0;
     let mut returned = None;
     loop {
-        let region = layout.canonical(protocol.records, get(frames, depth));
-        let head = layout.head(protocol.records, region)?;
+        let region = layout.canonical(protocol, get(frames, depth));
+        let head = layout.head(protocol, region)?;
         let phase = frames[5 * depth + 4];
         let factor = factors[depth];
         let append = |step, output: &mut usize, steps: &mut [Unfold]| {
@@ -65,14 +65,27 @@ pub(crate) fn seed(
             *output += 1;
             Some(slot)
         };
+        let compact = phase == 0
+            && counts[region.start..region.end]
+                .iter()
+                .all(|&n| n <= factor)
+            && (region.first..region.last).all(|marker| {
+                let row = protocol.records[layout.scopes.start + marker];
+                if row.causal_key() >> 13 != 1 || row.arg1() & 3 != 0 {
+                    return true;
+                }
+                let scope = protocol.scope(row.causal_key()).expect("checked scope");
+                let body = Region {
+                    start: scope.start as usize,
+                    end: scope.end as usize,
+                    first: marker + 1,
+                    last: scope.last - layout.scopes.start,
+                    rolled: false,
+                };
+                visits(&layout, protocol, body, counts, factor, receives) == 1
+            });
         let result = match (phase, head) {
-            (0, _)
-                if counts[region.start..region.end]
-                    .iter()
-                    .all(|&n| n <= factor) =>
-            {
-                Some(append(Unfold::Source, &mut output, steps)?)
-            }
+            (0, _) if compact => Some(append(Unfold::Source, &mut output, steps)?),
             (0, Head::Message) => Some(append(Unfold::Source, &mut output, steps)?),
             (
                 0,
@@ -83,11 +96,7 @@ pub(crate) fn seed(
                 if child >= capacity {
                     return None;
                 }
-                put(
-                    frames,
-                    child,
-                    layout.canonical(protocol.records, children[0]),
-                );
+                put(frames, child, layout.canonical(protocol, children[0]));
                 frames[5 * child + 4] = 0;
                 factors[child] = factor;
                 depth = child;
@@ -103,11 +112,7 @@ pub(crate) fn seed(
                 if child >= capacity {
                     return None;
                 }
-                put(
-                    frames,
-                    child,
-                    layout.canonical(protocol.records, children[1]),
-                );
+                put(frames, child, layout.canonical(protocol, children[1]));
                 frames[5 * child + 4] = 0;
                 factors[child] = factor;
                 depth = child;
@@ -132,9 +137,9 @@ pub(crate) fn seed(
                 if child >= capacity {
                     return None;
                 }
-                let visits = visits(&layout, protocol, body, counts, factor);
+                let visits = visits(&layout, protocol, body, counts, factor, receives);
                 first[depth] = visits;
-                put(frames, child, layout.canonical(protocol.records, body));
+                put(frames, child, layout.canonical(protocol, body));
                 frames[5 * child + 4] = 0;
                 factors[child] = factor.checked_mul(visits)?;
                 depth = child;
@@ -164,27 +169,44 @@ fn visits(
     body: Region,
     counts: &[usize],
     factor: usize,
+    scratch: &mut [usize],
 ) -> usize {
-    let mut visits = 1;
-    for (source, &count) in counts.iter().enumerate().take(body.end).skip(body.start) {
-        let in_nested_roll = (body.first..body.last).any(|marker| {
-            let row = protocol.records[layout.scopes.start + marker];
-            row.causal_key() >> 13 == 1
-                && row.arg1() & 3 == 0
-                && layout
-                    .scope(protocol.records, row.causal_key())
-                    .is_some_and(|scope| {
-                        scope.first >= layout.scopes.start + body.first
-                            && scope.last < layout.scopes.start + body.last
-                            && scope.start as usize <= source
-                            && source < scope.end as usize
-                    })
-        });
-        if !in_nested_roll {
-            visits = visits.max(count.div_ceil(factor));
+    // Collapse completed source subtrees in marker order. A sequence or par
+    // shares visits; opposite route arms need separate visits. A nested roll
+    // can account for its own repetitions within one enclosing visit.
+    scratch[body.start..body.end].copy_from_slice(&counts[body.start..body.end]);
+    for marker in body.first..body.last {
+        let index = layout.scopes.start + marker;
+        let row = protocol.records[index];
+        let scope = protocol.scope(row.causal_key()).unwrap();
+        if scope.last != index
+            || scope.first < layout.scopes.start + body.first
+            || (scope.start as usize) < body.start
+            || scope.end as usize > body.end
+        {
+            continue;
         }
+        let start = scope.start as usize;
+        let end = scope.end as usize;
+        let value = match row.causal_key() >> 13 {
+            0 => {
+                let split = scope.split.unwrap() as usize;
+                scratch[start..split].iter().max().copied().unwrap_or(0)
+                    + scratch[split..end].iter().max().copied().unwrap_or(0)
+            }
+            1 => usize::from(scratch[start..end].iter().any(|&n| n != 0)),
+            _ => scratch[start..end].iter().max().copied().unwrap_or(0),
+        };
+        scratch[start..end].fill(0);
+        scratch[start] = value;
     }
-    visits
+    scratch[body.start..body.end]
+        .iter()
+        .max()
+        .copied()
+        .unwrap_or(0)
+        .div_ceil(factor)
+        .max(1)
 }
 
 pub(crate) struct Derivations<'p, 'w> {
@@ -233,8 +255,8 @@ impl<'p, 'w> Derivations<'p, 'w> {
                 self.rows[5 * index + 4] = 0;
             }
             let begin = self.rows[5 * index + 4];
-            let region = layout.canonical(self.protocol.records, get(self.rows, index));
-            let head = layout.head(self.protocol.records, region)?;
+            let region = layout.canonical(self.protocol, get(self.rows, index));
+            let head = layout.head(self.protocol, region)?;
             let candidate = configuration(
                 &layout,
                 self.protocol,
@@ -252,11 +274,7 @@ impl<'p, 'w> Derivations<'p, 'w> {
             self.steps[index] = step;
             self.digits[..index].fill(0);
             for (child, start, source) in children.into_iter().flatten() {
-                put(
-                    self.rows,
-                    child,
-                    layout.canonical(self.protocol.records, source),
-                );
+                put(self.rows, child, layout.canonical(self.protocol, source));
                 self.rows[5 * child + 4] = start;
             }
             if index == 0 {
@@ -310,7 +328,7 @@ fn configuration(
                 return Some((Unfold::More(children), rows));
             }
             rank -= partitions;
-            if let Some(Head::Parallel(mut sources)) = layout.head(protocol.records, body)
+            if let Some(Head::Parallel(mut sources)) = layout.head(protocol, body)
                 && rank < partitions
             {
                 for source in &mut sources {
@@ -347,10 +365,10 @@ fn configuration(
                     continue;
                 }
                 let retained = row.causal_key();
-                let Some(source) = layout.retained(protocol.records, left, retained) else {
+                let Some(source) = layout.retained(protocol, left, retained) else {
                     continue;
                 };
-                let Head::Roll(body) = layout.head(protocol.records, source)? else {
+                let Head::Roll(body) = layout.head(protocol, source)? else {
                     continue;
                 };
                 if rank < partitions {
@@ -417,5 +435,54 @@ fn configuration(
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use hibana::{g, runtime::program::project};
+    use std::vec;
+
+    #[test]
+    fn branch_demands_add_while_sequence_parallel_and_nested_roll_share_visits() {
+        let global = g::par(
+            g::route(
+                g::seq(
+                    g::send::<7, 7, g::Msg<1, ()>>(),
+                    g::send::<7, 7, g::Msg<2, ()>>(),
+                ),
+                g::seq(
+                    g::send::<7, 7, g::Msg<3, ()>>(),
+                    g::send::<7, 7, g::Msg<4, ()>>(),
+                ),
+            ),
+            g::send::<7, 7, g::Msg<5, ()>>().roll(),
+        )
+        .roll();
+        let snapshot = tap::projected(&project::<7>(&global)).collect::<std::vec::Vec<_>>();
+        let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+        let layout = Layout::checked(protocol);
+        let root = Region {
+            start: 0,
+            end: 5,
+            first: 0,
+            last: layout.scopes.len(),
+            rolled: false,
+        };
+        let Head::Roll(body) = layout.head(protocol, root).unwrap() else {
+            panic!("outer roll");
+        };
+        let mut scratch = [0; 5];
+        assert_eq!(
+            visits(&layout, protocol, body, &[3, 3, 2, 2, 100], 1, &mut scratch),
+            5
+        );
+        assert_eq!(
+            visits(&layout, protocol, body, &[3, 3, 2, 2, 100], 2, &mut scratch),
+            3
+        );
     }
 }

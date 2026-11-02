@@ -11,9 +11,9 @@ use hibana::{
 use std::{vec, vec::Vec};
 
 fn compare(snapshot: &[TapEvent], steps: &[Unfold]) {
-    let mut scratch = vec![0; Protocol::workspace_len(snapshot).unwrap()];
-    let protocol = Protocol::new(snapshot, &mut scratch).unwrap();
-    scratch.resize(Protocol::unfolding_workspace_len(steps), 0);
+    let mut source_storage = vec![0; Protocol::workspace_len(snapshot).unwrap()];
+    let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
+    let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(steps)];
     let source = protocol.unfolding(steps, &mut scratch).unwrap();
     for first in 0..=source.event_count() {
         for last in 0..=source.event_count() + 1 {

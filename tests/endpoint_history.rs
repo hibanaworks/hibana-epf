@@ -386,8 +386,9 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
         Capture::new(&records2, tap2.checkpoint()).unwrap(),
     ];
     let snapshot: Vec<_> = tap::projected(&p0).collect();
-    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let mut workspace = std::vec::Vec::<usize>::new();
     let steps = [
         hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Source,
@@ -745,10 +746,10 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
     }
     hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
     let snapshot: Vec<_> = tap::projected(&p0).collect();
-    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-    workspace.resize(protocol.send_call_workspace_len(capture), 0);
+    let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
     let calls: Vec<_> = protocol
         .send_calls(capture, &mut workspace)
         .unwrap()
@@ -844,10 +845,10 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
         }
         hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
         let snapshot: Vec<_> = tap::projected(&p0).collect();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
         let calls: Vec<_> = protocol
             .send_calls(capture, &mut workspace)
             .unwrap()
@@ -1120,15 +1121,15 @@ fn repeated_source_events_have_distinct_calls_and_reject_broken_correspondence()
     }
     let checkpoint = records.checkpoint();
     let snapshot: Vec<_> = tap::projected(&p0).collect();
-    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let capture = Capture::new(&captured, checkpoint).unwrap();
     let required = protocol.send_call_workspace_len(capture);
     assert!(matches!(
         protocol.send_calls(capture, &mut []),
         Err(HistoryError::Workspace { required: size, actual: 0 }) if size == required
     ));
-    workspace.resize(required, 0);
+    let mut workspace = std::vec![0; required];
     let calls: Vec<_> = protocol
         .send_calls(capture, &mut workspace)
         .unwrap()
@@ -1235,10 +1236,10 @@ fn parallel_calls_keep_their_own_polls_when_publications_finish_in_reverse() {
         captured.extend(records.by_ref());
     }
     let snapshot: Vec<_> = tap::projected(&p0).collect();
-    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-    workspace.resize(protocol.send_call_workspace_len(capture), 0);
+    let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
     let calls: Vec<_> = protocol
         .send_calls(capture, &mut workspace)
         .unwrap()
@@ -1354,10 +1355,10 @@ fn a_pending_continuation_can_publish_after_the_other_view_reenters_its_roll() {
         [(0, 2), (0, 1), (0, 2), (1, 1), (1, 2), (0, 1)]
     );
     let snapshot: Vec<_> = tap::projected(&p0).collect();
-    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-    workspace.resize(protocol.send_call_workspace_len(capture), 0);
+    let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
     let calls: Vec<_> = protocol
         .send_calls(capture, &mut workspace)
         .unwrap()
@@ -1592,8 +1593,8 @@ fn an_old_send_keeps_one_call_while_another_view_finishes_reentry() {
         .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
         .unwrap()
         .causal_key();
-    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
     let steps = [
         hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Source,
@@ -1676,10 +1677,7 @@ fn an_old_send_keeps_one_call_while_another_view_finishes_reentry() {
         occurrences: &occurrences,
         acceptances: &acceptances,
     };
-    workspace.resize(
-        path.execution_workspace_len(&[capture], &witness).unwrap(),
-        0,
-    );
+    let mut workspace = std::vec![0; path.execution_workspace_len(&[capture], &witness).unwrap()];
     path.check_execution(&[capture], &witness, &mut workspace)
         .unwrap();
 }
@@ -1751,10 +1749,10 @@ fn pending_siblings_can_share_the_reset_published_by_the_first_completed_send() 
             captured.extend(records.by_ref());
         }
         let snapshot: Vec<_> = tap::projected(&p0).collect();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
         let calls: Vec<_> = protocol
             .send_calls(capture, &mut workspace)
             .unwrap()
@@ -1972,10 +1970,10 @@ fn conditional_resource_holders_keep_their_own_call_before_loan_publication() {
                     .iter()
                     .any(|row| row.id() == tap::PROJECTED_ACTOR_DECISION)
             );
-            let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-            let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+            let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+            let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
             let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-            workspace.resize(protocol.send_call_workspace_len(capture), 0);
+            let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
             let calls: Vec<_> = protocol
                 .send_calls(capture, &mut workspace)
                 .unwrap()
@@ -2017,10 +2015,10 @@ fn conditional_resource_holders_keep_their_own_call_before_loan_publication() {
             captured.extend(records.by_ref());
         }
         let snapshot: Vec<_> = tap::projected(&p0).collect();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
         let calls: Vec<_> = protocol
             .send_calls(capture, &mut workspace)
             .unwrap()
@@ -2130,10 +2128,10 @@ fn an_observed_send_poll_can_end_in_a_transport_error_without_a_commit() {
         )));
         hibana_epf::Capture::new(&captured, records.checkpoint()).unwrap();
         let snapshot: Vec<_> = tap::projected(&program).collect();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
         let calls: Vec<_> = protocol
             .send_calls(capture, &mut workspace)
             .unwrap()
@@ -2286,10 +2284,10 @@ fn learning_a_resolved_choice_is_distinct_from_invoking_its_resolver() {
             u32::from(selected == DecisionArm::Right)
         );
         let snapshot: Vec<_> = tap::projected(&p0).collect();
-        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
         let capture = Capture::new(&captured, records.checkpoint()).unwrap();
-        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let mut workspace = std::vec![0; protocol.send_call_workspace_len(capture)];
         let calls: Vec<_> = protocol
             .send_calls(capture, &mut workspace)
             .unwrap()
