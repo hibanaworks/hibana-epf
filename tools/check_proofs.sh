@@ -17,12 +17,13 @@ git rev-parse HEAD > "$out/epf-revision.txt"
 git diff --binary HEAD > "$out/epf-source.patch"
 printf '%s\n' "$selected" > "$out/core-revision.txt"
 shasum -a 256 proofs/CommitObservations.lean proofs/Capture.lean proofs/SendCalls.lean \
-  proofs/DeliveryOrder.lean proofs/CaptureExecution.lean tools/check_proofs.sh > "$out/source.sha256"
+  proofs/DeliveryOrder.lean proofs/CaptureExecution.lean proofs/CompactSource.lean tools/check_proofs.sh > "$out/source.sha256"
 cp proofs/CommitObservations.lean "$out/CommitObservations.lean"
 cp proofs/Capture.lean "$out/Capture.lean"
 cp proofs/SendCalls.lean "$out/"
 cp proofs/DeliveryOrder.lean "$out/"
 cp proofs/CaptureExecution.lean "$out/"
+cp proofs/CompactSource.lean "$out/"
 (
   cd "$core"
   git ls-files -z proofs/lean | xargs -0 shasum -a 256 --
@@ -44,6 +45,9 @@ bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/delivery
 LEAN_PATH="$core/proofs/lean/.lake/build/lib/lean" \
   lean proofs/CaptureExecution.lean 2>&1 | tee "$out/capture-execution-lean.log"
 bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/capture-execution-lean.log" 14
+LEAN_PATH="$core/proofs/lean/.lake/build/lib/lean" \
+  lean proofs/CompactSource.lean 2>&1 | tee "$out/compact-source-lean.log"
+bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/compact-source-lean.log" 4
 shasum -a 256 --check "$out/source.sha256" > "$out/source-check.log"
 (cd "$core" && shasum -a 256 --check "$out/core-source.sha256") > "$out/core-source-check.log"
-echo "Observation proofs: ten source boundaries, four complete-prefix, thirteen send/reset/word, five causal-order and fourteen capture/source-execution claims"
+echo "Observation proofs: ten source boundaries, four complete-prefix, thirteen send/reset/word, five causal-order, fourteen capture/source-execution and four compact-source claims"

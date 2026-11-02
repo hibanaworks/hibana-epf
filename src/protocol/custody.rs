@@ -108,6 +108,25 @@ impl Protocol<'_> {
         order: &[RecordId],
         workspace: &'w mut [usize],
     ) -> Result<Correspondence<'w>, CustodyError> {
+        self.custody_words(captures).ok_or(CustodyError::Overflow)?;
+        let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
+        if order.len() != count {
+            return Err(CustodyError::Order {
+                position: order.len().min(count),
+            });
+        }
+        self.custody_prefix(captures, order, workspace)
+    }
+
+    // Search may discard a record-order prefix whose custody already fails.
+    // This is the same walk used for the complete check; it certifies no audit
+    // until checked_custody has required every captured record exactly once.
+    pub(super) fn custody_prefix<'w>(
+        &self,
+        captures: &[Capture<'_>],
+        order: &[RecordId],
+        workspace: &'w mut [usize],
+    ) -> Result<Correspondence<'w>, CustodyError> {
         let required = self.custody_words(captures).ok_or(CustodyError::Overflow)?;
         if workspace.len() < required {
             return Err(CustodyError::Workspace {
@@ -116,7 +135,7 @@ impl Protocol<'_> {
             });
         }
         let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
-        if order.len() != count {
+        if order.len() > count {
             return Err(CustodyError::Order {
                 position: order.len().min(count),
             });

@@ -10,7 +10,7 @@ cargo +stable test --locked --lib --features std protocol::history::tests \
 cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -80,6 +80,10 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
       perl -0pi -e 's/match self\.check_execution\(captures, \&trial, scratch\)/match Ok::<(), ExecutionError>(())/g == 1 or die "missing completed-candidate validation\n"' \
         "$source/src/protocol/interpret.rs"
       ;;
+    ConstructorOrder)
+      perl -0pi -e 's/used\[producer\] < captures\[producer\]\.records\(\)\.len\(\)/used[producer] < captures[producer].records().len() \&\& order[..depth].iter().all(|prior| prior.producer <= producer)/g == 1 or die "missing record interleaving search\n"' \
+        "$source/src/protocol/interpret.rs"
+      ;;
   esac
   git -C "$source" diff --binary > "$out/$mutation-mutation.patch"
   status=0
@@ -111,12 +115,14 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame -- --exact ;;
       AcceptanceEvidence) cargo +stable test --locked --test endpoint_history \
         an_observed_send_poll_can_end_in_a_transport_error_without_a_commit -- --exact ;;
+      ConstructorOrder) cargo +stable test --locked --test source_interpretation \
+        causal_order_search_matches_every_interleaving_and_rejects_an_early_reply -- --exact ;;
     esac
   ) > "$out/$mutation.log" 2>&1 || status=$?
   test "$status" = 101
   case "$mutation" in
     Length|Ordinals) grep -Fq 'test result: FAILED. 3 passed; 1 failed;' "$out/$mutation.log" ;;
-    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|ConstructorValidation) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
+    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
   esac
   case "$mutation" in
     Length) name=deleting_any_record_including_the_last_is_incomplete ;;
@@ -131,10 +137,11 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     InvocationContext) name=reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations ;;
     PollAdmission|ConstructorValidation) name=source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame ;;
     AcceptanceEvidence) name=an_observed_send_poll_can_end_in_a_transport_error_without_a_commit ;;
+    ConstructorOrder) name=causal_order_search_matches_every_interleaving_and_rejects_an_early_reply ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"
   find "$source/target" -type f -perm -100 -exec shasum -a 256 -- {} + > "$out/$mutation-binaries.sha256"
   printf 'mutation=%s\nexit=%s\n' "$mutation" "$status" > "$out/$mutation-result.txt"
   rm -r -- "$source"
 done
-echo "History sensitivity: sixteen prefix, call, delivery and source-execution defects fail their regressions"
+echo "History sensitivity: seventeen prefix, call, delivery and source-execution defects fail their regressions"

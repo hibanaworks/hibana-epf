@@ -32,17 +32,17 @@ fn separate_visits_can_select_different_holders_without_sharing_a_choice() {
     let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
     let steps = [
-        Unfold::Message,
-        Unfold::Message,
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Sequence([2, 3]),
         Unfold::Sequence([1, 4]),
         Unfold::Sequence([0, 5]),
-        Unfold::Message,
-        Unfold::Message,
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Sequence([9, 10]),
         Unfold::Sequence([8, 11]),
         Unfold::Sequence([7, 12]),
@@ -88,14 +88,14 @@ fn a_conditional_holder_is_resolved_from_the_same_selected_source_choice() {
     let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
     let steps = [
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Sequence([0, 1]),
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Sequence([3, 4]),
         Unfold::Choice([2, 5]),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Sequence([6, 7]),
     ];
     scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
@@ -150,10 +150,10 @@ fn independent_visits_need_physical_separation_in_addition_to_the_source_proof()
     let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
     let steps = [
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Once(0),
         Unfold::More([1, 0]),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Once(3),
         Unfold::Independent([2, 4]),
     ];
@@ -202,13 +202,13 @@ fn a_retained_visit_cannot_transfer_the_same_resource_as_its_parallel_continuati
         .unwrap()
         .causal_key();
     let steps = [
-        Unfold::Message,
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Sequence([1, 2]),
         Unfold::Sequence([0, 3]),
         Unfold::Once(4),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Alongside {
             retained,
             earlier: 5,
@@ -244,11 +244,11 @@ fn an_unselected_old_arm_cannot_anchor_a_resumed_body() {
         .unwrap()
         .causal_key();
     let steps = [
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Once(0),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Choice([1, 2]),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Sequence([3, 4]),
         Unfold::After {
             retained,

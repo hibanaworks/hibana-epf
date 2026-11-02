@@ -79,13 +79,13 @@ fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
         .check_routes(&[capture], &order, &mut workspace)
         .unwrap();
     let steps = [
-        hibana_epf::Unfold::Message,
-        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Source,
+        hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Choice([0, 1]),
         hibana_epf::Unfold::Once(2),
         hibana_epf::Unfold::More([3, 2]),
         hibana_epf::Unfold::More([4, 2]),
-        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Sequence([5, 6]),
         hibana_epf::Unfold::Once(7),
         hibana_epf::Unfold::Sequence([3, 6]),
@@ -146,13 +146,14 @@ fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
         .unwrap();
     let mut inferred = vec![None; order.len()];
     let mut inferred_acceptances = [];
+    let mut inferred_order = order.clone();
     workspace.resize(path.interpretation_workspace_len(&[capture]).unwrap(), 0);
     let automatic = path
         .interpret(
             &[capture],
             hibana_epf::ExecutionStorage {
                 session: 137,
-                order: &order,
+                order: &mut inferred_order,
                 occurrences: &mut inferred,
                 acceptances: &mut inferred_acceptances,
             },

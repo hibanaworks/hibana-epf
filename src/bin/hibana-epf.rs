@@ -41,12 +41,154 @@ fn run() -> Result<(), String> {
         "replay" => replay(args.collect(), ReplayInput::File),
         "stream" => replay(args.collect(), ReplayInput::Stdin),
         "diagnose" => diagnose(args.collect()),
+        "audit" => audit(args.collect()),
         "help" | "--help" | "-h" => {
             help();
             Ok(())
         }
         other => Err(format!("unknown command: {other}")),
     }
+}
+
+fn audit(args: Vec<String>) -> Result<(), String> {
+    use hibana::runtime::tap::TapEvent;
+    use hibana_epf::{
+        Acceptance, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId, RouteChoice,
+        Unfold,
+    };
+    if args.len() < 5 || (args.len() - 3) % 2 != 0 {
+        return Err("usage: hibana-epf audit PROTOCOL.bin SESSION DERIVATION_CAPACITY CAPTURE.bin CHECKPOINT [CAPTURE.bin CHECKPOINT ...]".into());
+    }
+    let records = |path: &str| -> Result<Vec<TapEvent>, String> {
+        let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        if bytes.len() % 16 != 0 {
+            return Err(format!("{path}: incomplete 16-byte record"));
+        }
+        Ok(bytes
+            .chunks_exact(16)
+            .map(|row| TapEvent::from(<[u8; 16]>::try_from(row).unwrap()))
+            .collect())
+    };
+    let compiled = records(&args[0])?;
+    let session = args[1].parse::<u32>().map_err(|_| "invalid session")?;
+    let capacity = args[2]
+        .parse::<usize>()
+        .map_err(|_| "invalid derivation capacity")?;
+    let inputs: Vec<_> = args[3..]
+        .chunks_exact(2)
+        .map(|pair| {
+            let checkpoint = pair[1]
+                .parse::<u32>()
+                .map_err(|_| "invalid producer checkpoint")?;
+            Ok((records(&pair[0])?, checkpoint))
+        })
+        .collect::<Result<_, String>>()?;
+    let captures: Vec<_> = inputs
+        .iter()
+        .map(|(records, checkpoint)| {
+            Capture::new(records, Some(*checkpoint)).map_err(|e| format!("capture: {e:?}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut workspace =
+        vec![0; Protocol::workspace_len(&compiled).map_err(|e| format!("protocol: {e:?}"))?];
+    let protocol =
+        Protocol::new(&compiled, &mut workspace).map_err(|e| format!("protocol: {e:?}"))?;
+    let count = captures.iter().map(|capture| capture.records().len()).sum();
+    let mut unfolding = vec![Unfold::Source; capacity];
+    let mut choices = vec![
+        RouteChoice {
+            span: [0, 0],
+            right: false
+        };
+        protocol
+            .audit_choice_capacity(capacity)
+            .map_err(|e| format!("audit: {e:?}"))?
+    ];
+    let mut order = vec![
+        RecordId {
+            producer: 0,
+            ordinal: 0
+        };
+        count
+    ];
+    let mut occurrences = vec![None; count];
+    let mut acceptances = vec![
+        Acceptance {
+            first_poll: RecordId {
+                producer: 0,
+                ordinal: 0
+            },
+            before: 0
+        };
+        count
+    ];
+    workspace.resize(
+        protocol
+            .audit_workspace_len(&captures, capacity)
+            .map_err(|e| format!("audit: {e:?}"))?,
+        0,
+    );
+    let checked = protocol
+        .audit(
+            &captures,
+            AuditStorage {
+                unfolding: &mut unfolding,
+                choices: &mut choices,
+                execution: ExecutionStorage {
+                    session,
+                    order: &mut order,
+                    occurrences: &mut occurrences,
+                    acceptances: &mut acceptances,
+                },
+            },
+            &mut workspace,
+        )
+        .map_err(|e| format!("no dynamic audit certificate: {e:?}"))?;
+    let source = checked.path.unfolding();
+    let mut output = io::BufWriter::new(io::stdout().lock());
+    write!(output, "{{\"kind\":\"source_interpretation\",\"session\":{session},\"expanded_events\":{},\"order\":[", source.event_count()).map_err(|e| e.to_string())?;
+    for (index, (id, occurrence)) in checked
+        .execution
+        .order
+        .iter()
+        .zip(checked.execution.occurrences)
+        .enumerate()
+    {
+        if index != 0 {
+            write!(output, ",").map_err(|e| e.to_string())?;
+        }
+        write!(
+            output,
+            "{{\"producer\":{},\"ordinal\":{},\"occurrence\":",
+            id.producer, id.ordinal
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(event) = occurrence {
+            write!(
+                output,
+                "{event},\"source_event\":{}",
+                source.origin(*event).unwrap()
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            write!(output, "null,\"source_event\":null").map_err(|e| e.to_string())?;
+        }
+        write!(output, "}}").map_err(|e| e.to_string())?;
+    }
+    write!(output, "],\"acceptances\":[").map_err(|e| e.to_string())?;
+    for (index, acceptance) in checked.execution.acceptances.iter().enumerate() {
+        if index != 0 {
+            write!(output, ",").map_err(|e| e.to_string())?;
+        }
+        write!(
+            output,
+            "{{\"producer\":{},\"first_poll\":{},\"before\":{}}}",
+            acceptance.first_poll.producer, acceptance.first_poll.ordinal, acceptance.before
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    writeln!(output, "]}}").map_err(|e| e.to_string())?;
+    output.flush().map_err(|e| e.to_string())
 }
 
 fn image_command(args: Vec<String>) -> Result<(), String> {
@@ -579,6 +721,7 @@ commands:
   diagnose <recipe> [--out out.hepo] [--site n] <trace.hbt|->
   replay [--recipe recipe|--image image.epf] [--out out.hepo] [--site n] <trace.hbt|->
   stream [--recipe recipe|--image image.epf] [--out out.hepo] [--site n] < tap-record-stream
+  audit PROTOCOL.bin SESSION DERIVATION_CAPACITY CAPTURE.bin CHECKPOINT [CAPTURE.bin CHECKPOINT ...]
   explain-tap <trace.hbt|->
   explain-out <out.hepo|->
   wrap-image <image.epf|-> [-o image.hepf]"

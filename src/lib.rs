@@ -23,10 +23,10 @@ use hibana::runtime::{
 
 pub use capture::{Capture, CaptureError};
 pub use protocol::{
-    Acceptance, CustodyError, Delivery, DeliveryError, ExecutionError, ExecutionStorage,
-    ExecutionWitness, HistoryError, InterpretationError, PathError, Protocol, ProtocolError,
-    RecordId, RouteChoice, RouteHistoryError, SendCall, SourcePath, SourcePoint, Unfold, Unfolded,
-    UnfoldingError, WordError,
+    Acceptance, Audit, AuditError, AuditStorage, CustodyError, Delivery, DeliveryError,
+    ExecutionError, ExecutionStorage, ExecutionWitness, HistoryError, InterpretationError,
+    PathError, Protocol, ProtocolError, RecordId, RouteChoice, RouteHistoryError, SendCall,
+    SourcePath, SourcePoint, Unfold, Unfolded, UnfoldingError, WordError,
 };
 pub use verifier::{Header, VerifyError, compute_hash};
 pub use vm::Trap;

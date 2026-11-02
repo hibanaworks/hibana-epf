@@ -6,13 +6,13 @@ use super::{
 use crate::Capture;
 use hibana::runtime::tap::{self, TapEvent};
 
-/// Caller-owned evidence outputs for one run in a complete record order.
+/// Caller-owned evidence outputs for one run in complete producer captures.
 /// These arrays never hold application progress or permissions.
 pub struct ExecutionStorage<'a> {
     /// Session whose source interpretation is being constructed.
     pub session: u32,
-    /// Complete proposed causal order, preserving producer ordinals.
-    pub order: &'a [RecordId],
+    /// One output slot per captured record. Initial contents are ignored.
+    pub order: &'a mut [RecordId],
     /// One writable occurrence entry per ordered record.
     pub occurrences: &'a mut [Option<usize>],
     /// One output slot per completed wire call, at most the record count.
@@ -24,6 +24,8 @@ pub struct ExecutionStorage<'a> {
 pub enum InterpretationError {
     /// Invalid causal evidence or a failure independent of attribution.
     Evidence(ExecutionError),
+    /// One ordering slot is required per captured record.
+    Order { required: usize, actual: usize },
     /// One occurrence slot is required per ordered record.
     Occurrences { required: usize, actual: usize },
     /// Too few slots for the completed wire calls.
@@ -32,13 +34,13 @@ pub enum InterpretationError {
     Workspace { required: usize, actual: usize },
     /// Required storage is not representable on this target.
     Overflow,
-    /// No attribution in this selected unfolding passes the checker.
+    /// No producer-preserving order and attribution in this path passes checking.
     /// This neither rejects the global nor excludes another unfolding.
     NoInterpretation,
 }
 
 impl SourcePath<'_, '_, '_> {
-    /// Seven words per captured record, plus custody checking space.
+    /// Eight words per captured record, one per producer, plus custody space.
     /// There is no fixed source-depth, visit-count or search-step capacity.
     pub fn interpretation_workspace_len(
         &self,
@@ -54,14 +56,21 @@ impl SourcePath<'_, '_, '_> {
         source
             .protocol()
             .custody_words(captures)
-            .and_then(|n| records.checked_mul(7)?.checked_add(n))
+            .and_then(|n| {
+                records
+                    .checked_mul(8)?
+                    .checked_add(captures.len())?
+                    .checked_add(n)
+            })
             .ok_or(InterpretationError::Overflow)
     }
 
     /// Construct a checked interpretation of this particular finite source path.
     ///
-    /// Reuses checked call/FIFO evidence and searches the expanded occurrence
-    /// domain. A completed call's acceptance is proposed after its first poll;
+    /// Searches producer-order-preserving record interleavings and the expanded
+    /// occurrence domain. Custody-invalid prefixes are discarded by the same
+    /// custody walk used to check a complete order. A completed call's acceptance
+    /// is proposed after its first poll;
     /// every poll's source admission is still checked separately. Acceptance
     /// alone advances no actor or resumed body. This supplies an interval
     /// witness rather than claiming a recovered physical acceptance time.
@@ -89,6 +98,13 @@ impl SourcePath<'_, '_, '_> {
             occurrences,
             acceptances,
         } = storage;
+        let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
+        if order.len() != count {
+            return Err(InterpretationError::Order {
+                required: count,
+                actual: order.len(),
+            });
+        }
         if occurrences.len() != order.len() {
             return Err(InterpretationError::Occurrences {
                 required: order.len(),
@@ -97,8 +113,104 @@ impl SourcePath<'_, '_, '_> {
         }
         let source = self.unfolding();
         let protocol = source.protocol();
+        let (next, rest) = workspace[..required].split_at_mut(count);
+        let (used, scratch) = rest.split_at_mut(captures.len());
+        // Validate every producer before searching. A malformed capture cannot
+        // be hidden by choosing a different interleaving or an empty prefix.
+        protocol
+            .custody_prefix(captures, &[], scratch)
+            .map_err(|error| {
+                InterpretationError::Evidence(ExecutionError::History(RouteHistoryError::Custody(
+                    error,
+                )))
+            })?;
+        next.fill(0);
+        used.fill(0);
+        let mut depth = 0;
+        loop {
+            if depth == count {
+                match self.interpret_order(
+                    captures,
+                    ExecutionStorage {
+                        session,
+                        order: &mut *order,
+                        occurrences: &mut *occurrences,
+                        acceptances: &mut *acceptances,
+                    },
+                    scratch,
+                ) {
+                    Ok(accepted) => {
+                        return Ok(ExecutionWitness {
+                            session,
+                            order,
+                            occurrences,
+                            acceptances: &acceptances[..accepted],
+                        });
+                    }
+                    Err(
+                        InterpretationError::NoInterpretation
+                        | InterpretationError::Evidence(
+                            ExecutionError::History(_) | ExecutionError::Acceptance { .. },
+                        ),
+                    ) => {}
+                    Err(error) => return Err(error),
+                }
+            } else {
+                let candidate = (next[depth]..captures.len())
+                    .find(|&producer| used[producer] < captures[producer].records().len());
+                if let Some(producer) = candidate {
+                    next[depth] = producer + 1;
+                    order[depth] = RecordId {
+                        producer,
+                        ordinal: used[producer],
+                    };
+                    used[producer] += 1;
+                    match protocol.custody_prefix(captures, &order[..depth + 1], scratch) {
+                        Ok(_) => {
+                            depth += 1;
+                            if depth != count {
+                                next[depth] = 0;
+                            }
+                        }
+                        Err(
+                            super::CustodyError::Unmatched { .. }
+                            | super::CustodyError::Owner { .. },
+                        ) => {
+                            used[producer] -= 1;
+                        }
+                        Err(error) => {
+                            return Err(InterpretationError::Evidence(ExecutionError::History(
+                                RouteHistoryError::Custody(error),
+                            )));
+                        }
+                    }
+                    continue;
+                }
+            }
+            if depth == 0 {
+                return Err(InterpretationError::NoInterpretation);
+            }
+            depth -= 1;
+            used[order[depth].producer] -= 1;
+        }
+    }
+
+    fn interpret_order(
+        &self,
+        captures: &[Capture<'_>],
+        storage: ExecutionStorage<'_>,
+        workspace: &mut [usize],
+    ) -> Result<usize, InterpretationError> {
+        let ExecutionStorage {
+            session,
+            order,
+            occurrences,
+            acceptances,
+        } = storage;
+        let source = self.unfolding();
+        let protocol = source.protocol();
         let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
-        let (classes, rest) = workspace[..required].split_at_mut(count);
+        let (classes, rest) = workspace.split_at_mut(count);
         let (variables, rest) = rest.split_at_mut(count);
         let (next, scratch) = rest.split_at_mut(count);
         let links = protocol
@@ -285,11 +397,6 @@ impl SourcePath<'_, '_, '_> {
                 Err(error) => return Err(InterpretationError::Evidence(error)),
             }
         }
-        Ok(ExecutionWitness {
-            session,
-            order,
-            occurrences,
-            acceptances,
-        })
+        Ok(accepted)
     }
 }

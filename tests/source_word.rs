@@ -17,7 +17,7 @@ fn later_publication_cannot_hide_an_acceptance_before_its_source_predecessor() {
     let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
     let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
-    let steps = [Unfold::Message, Unfold::Message, Unfold::Sequence([0, 1])];
+    let steps = [Unfold::Source, Unfold::Source, Unfold::Sequence([0, 1])];
     scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
     let unfolded = protocol.unfolding(&steps, &mut scratch).unwrap();
     let mut rows = vec![0; unfolded.path_workspace_len().unwrap()];
@@ -70,10 +70,10 @@ fn a_parallel_join_requires_both_sides_without_ordering_the_siblings() {
     let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
     let steps = [
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Parallel([0, 1]),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Sequence([2, 3]),
     ];
     scratch.resize(Protocol::unfolding_workspace_len(&steps), 0);
@@ -110,11 +110,11 @@ fn only_a_committed_resumed_body_delays_the_outgoing_continuation() {
     let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
     let steps = [
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Sequence([0, 1]),
         Unfold::Once(2),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Alongside {
             retained,
             earlier: 3,
@@ -164,11 +164,11 @@ fn an_old_incoming_continuation_can_arrive_after_the_other_view_resumes() {
     let mut scratch = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut scratch).unwrap();
     let steps = [
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Sequence([0, 1]),
         Unfold::Once(2),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Alongside {
             retained,
             earlier: 3,
@@ -215,11 +215,11 @@ fn reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations() {
     let inner = roll(2);
     let outer = roll(3);
     let steps = [
-        Unfold::Message,
-        Unfold::Message,
+        Unfold::Source,
+        Unfold::Source,
         Unfold::Sequence([0, 1]),
         Unfold::Once(2),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Alongside {
             retained: inner,
             earlier: 3,
@@ -228,7 +228,7 @@ fn reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations() {
             focus: [0, 1],
         },
         Unfold::Once(5),
-        Unfold::Message,
+        Unfold::Source,
         Unfold::Alongside {
             retained: outer,
             earlier: 6,

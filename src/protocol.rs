@@ -2,6 +2,7 @@
 use core::ops::Range;
 use hibana::runtime::tap::{self, TapEvent};
 
+mod audit;
 mod custody;
 mod delivery;
 mod execution;
@@ -11,6 +12,7 @@ mod path;
 mod routes;
 mod unfolding;
 mod word;
+pub use audit::{Audit, AuditError, AuditStorage};
 pub use custody::CustodyError;
 pub use delivery::{Delivery, DeliveryError, RecordId};
 pub use execution::{Acceptance, ExecutionError, ExecutionWitness};

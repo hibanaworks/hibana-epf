@@ -50,8 +50,8 @@ fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
         let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
         let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
         let steps = [
-            Unfold::Message,
-            Unfold::Message,
+            Unfold::Source,
+            Unfold::Source,
             if is_parallel {
                 Unfold::Parallel([0, 1])
             } else {
@@ -128,11 +128,18 @@ fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
                 }
                 let mut occurrences = vec![None; records.len()];
                 let mut acceptances: [Acceptance; 0] = [];
+                let mut inferred_order = vec![
+                    RecordId {
+                        producer: usize::MAX,
+                        ordinal: usize::MAX,
+                    };
+                    order.len()
+                ];
                 let actual = path.interpret(
                     &[capture],
                     ExecutionStorage {
                         session: 1,
-                        order: &order,
+                        order: &mut inferred_order,
                         occurrences: &mut occurrences,
                         acceptances: &mut acceptances,
                     },
@@ -144,6 +151,7 @@ fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
                     "par={is_parallel}, length={length}, sequence={sequence}"
                 );
                 if let Ok(witness) = actual {
+                    assert_eq!(witness.order, order);
                     path.check_execution(&[capture], &witness, &mut workspace)
                         .unwrap();
                     successful += 1;
@@ -151,5 +159,162 @@ fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
             }
         }
         assert_eq!(successful, if is_parallel { 13 } else { 5 });
+    }
+}
+
+#[test]
+fn causal_order_search_matches_every_interleaving_and_rejects_an_early_reply() {
+    let global = g::seq(
+        g::send::<7, 8, g::Msg<1, ()>>(),
+        g::send::<8, 7, g::Msg<2, ()>>(),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<7>(&global)).collect();
+    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let steps = [Unfold::Source, Unfold::Source, Unfold::Sequence([0, 1])];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut rows = vec![0; unfolded.path_workspace_len().unwrap()];
+    let path = unfolded.select(&[], &mut rows).unwrap();
+    let observed = |ordinal, actor: u8, id, source: u16| {
+        let lane = (snapshot[2 + usize::from(source)].arg0() >> 8) as u8;
+        let (direction, detail) = if id == tap::SEND_POLL {
+            (actor, 0xffff_0000 | u32::from(source))
+        } else {
+            (
+                if id == tap::ENDPOINT_SEND { 1 } else { 2 },
+                u32::from(actor) << 24 | u32::from(lane) << 16 | u32::from(source),
+            )
+        };
+        let mut bytes: [u8; 16] = record(ordinal, id, direction, detail).into();
+        bytes[6] = actor;
+        TapEvent::from(bytes)
+    };
+    // Synthetic complete captures. The early reply is impossible in every
+    // interleaving because its producer has not yet committed the request.
+    for early in [false, true] {
+        let first = [
+            observed(0, 7, tap::SEND_POLL, 0),
+            observed(1, 7, tap::ENDPOINT_SEND, 0),
+            observed(2, 7, tap::ENDPOINT_RECV, 1),
+        ];
+        let second = if early {
+            [
+                observed(0, 8, tap::SEND_POLL, 1),
+                observed(1, 8, tap::ENDPOINT_SEND, 1),
+                observed(2, 8, tap::ENDPOINT_RECV, 0),
+            ]
+        } else {
+            [
+                observed(0, 8, tap::ENDPOINT_RECV, 0),
+                observed(1, 8, tap::SEND_POLL, 1),
+                observed(2, 8, tap::ENDPOINT_SEND, 1),
+            ]
+        };
+        let captures = [
+            Capture::new(&first, Some(3)).unwrap(),
+            Capture::new(&second, Some(3)).unwrap(),
+        ];
+        for captures in [captures, [captures[1], captures[0]]] {
+            workspace.resize(path.interpretation_workspace_len(&captures).unwrap(), 0);
+            let mut valid_orders = Vec::new();
+            let mut checked = 0;
+            for mask in (0u32..64).filter(|word| word.count_ones() == 3) {
+                let mut ordinals = [0; 2];
+                let order: Vec<_> = (0..6)
+                    .map(|position| {
+                        let producer = (mask >> position & 1) as usize;
+                        let ordinal = ordinals[producer];
+                        ordinals[producer] += 1;
+                        RecordId { producer, ordinal }
+                    })
+                    .collect();
+                let occurrences: Vec<_> = order
+                    .iter()
+                    .map(|id| {
+                        Some(captures[id.producer].records()[id.ordinal].arg1() as u16 as usize)
+                    })
+                    .collect();
+                let acceptances: Vec<_> = order
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, id)| {
+                        captures[id.producer].records()[id.ordinal].id() == tap::SEND_POLL
+                    })
+                    .map(|(position, &first_poll)| Acceptance {
+                        first_poll,
+                        before: position + 1,
+                    })
+                    .collect();
+                let witness = ExecutionWitness {
+                    session: 1,
+                    order: &order,
+                    occurrences: &occurrences,
+                    acceptances: &acceptances,
+                };
+                if path
+                    .check_execution(&captures, &witness, &mut workspace)
+                    .is_ok()
+                {
+                    valid_orders.push(order);
+                }
+                checked += 1;
+            }
+            assert_eq!(checked, 20);
+            assert_eq!(valid_orders.is_empty(), early);
+            let mut order = [RecordId {
+                producer: usize::MAX,
+                ordinal: usize::MAX,
+            }; 6];
+            let mut occurrences = [None; 6];
+            let mut acceptances = [Acceptance {
+                first_poll: RecordId {
+                    producer: 0,
+                    ordinal: 0,
+                },
+                before: 0,
+            }; 2];
+            let result = path.interpret(
+                &captures,
+                ExecutionStorage {
+                    session: 1,
+                    order: &mut order,
+                    occurrences: &mut occurrences,
+                    acceptances: &mut acceptances,
+                },
+                &mut workspace,
+            );
+            if early {
+                assert!(matches!(
+                    result,
+                    Err(hibana_epf::InterpretationError::NoInterpretation)
+                ));
+            } else {
+                let witness = result.unwrap();
+                assert!(valid_orders.iter().any(|order| order == witness.order));
+                path.check_execution(&captures, &witness, &mut workspace)
+                    .unwrap();
+            }
+            let mut short = [RecordId {
+                producer: usize::MAX,
+                ordinal: usize::MAX,
+            }; 5];
+            assert!(matches!(
+                path.interpret(
+                    &captures,
+                    ExecutionStorage {
+                        session: 1,
+                        order: &mut short,
+                        occurrences: &mut occurrences,
+                        acceptances: &mut acceptances,
+                    },
+                    &mut workspace,
+                ),
+                Err(hibana_epf::InterpretationError::Order {
+                    required: 6,
+                    actual: 5
+                })
+            ));
+        }
     }
 }

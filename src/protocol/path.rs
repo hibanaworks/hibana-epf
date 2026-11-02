@@ -165,7 +165,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                         owners[resource] = receiver;
                     }
                 }
-                NodeKind::Choice(proof) => {
+                NodeKind::Choice(scope) => {
                     let (index, choice) = choices
                         .iter()
                         .enumerate()
@@ -173,7 +173,6 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                         .ok_or(PathError::Choice {
                             index: choices.len(),
                         })?;
-                    let scope = self.choice_scope(proof);
                     let ordinal = records[layout.choices.clone()]
                         .iter()
                         .position(|row| row.causal_key() == scope)
@@ -251,12 +250,10 @@ impl SourcePath<'_, '_, '_> {
     pub(super) fn choice_at(&self, event: usize, scope: u16) -> Option<bool> {
         self.choices.iter().find_map(|choice| {
             let (kind, _) = self.source.parts(choice.span)?;
-            let NodeKind::Choice(proof) = kind else {
+            let NodeKind::Choice(found) = kind else {
                 return None;
             };
-            (choice.span[0] <= event
-                && event < choice.span[1]
-                && self.source.choice_scope(proof) == scope)
+            (choice.span[0] <= event && event < choice.span[1] && found == scope)
                 .then_some(choice.right)
         })
     }

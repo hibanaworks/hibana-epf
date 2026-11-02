@@ -389,11 +389,11 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
     let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
     let steps = [
-        hibana_epf::Unfold::Message,
-        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Source,
+        hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Once(1),
         hibana_epf::Unfold::More([2, 1]),
-        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Sequence([3, 4]),
         hibana_epf::Unfold::Sequence([0, 5]),
     ];
@@ -499,22 +499,76 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
             witnessed.len()
         ];
         workspace.resize(path.interpretation_workspace_len(&inputs).unwrap(), 0);
+        let mut inferred_order = vec![
+            RecordId {
+                producer: usize::MAX,
+                ordinal: usize::MAX,
+            };
+            witnessed.len()
+        ];
         let automatic = path
             .interpret(
                 &inputs,
                 hibana_epf::ExecutionStorage {
                     session: 110,
-                    order: &witnessed,
+                    order: &mut inferred_order,
                     occurrences: &mut inferred,
                     acceptances: &mut inferred_acceptances,
                 },
                 &mut workspace,
             )
             .unwrap();
-        assert_eq!(automatic.occurrences, occurrences);
+        for (position, id) in automatic.order.iter().enumerate() {
+            let expected = witnessed
+                .iter()
+                .position(|candidate| candidate == id)
+                .unwrap();
+            assert_eq!(automatic.occurrences[position], occurrences[expected]);
+        }
         assert_eq!(automatic.acceptances.len(), 4);
         path.check_execution(&inputs, &automatic, &mut workspace)
             .unwrap();
+        // Exercise the public constructor from only the immutable compiled
+        // snapshot and the three actual runtime capture prefixes. Neither the
+        // hand-written unfolding above nor its record order is supplied.
+        let mut generated = [hibana_epf::Unfold::Source; 7];
+        let mut selected = vec![
+            hibana_epf::RouteChoice {
+                span: [0, 0],
+                right: false
+            };
+            protocol.audit_choice_capacity(generated.len()).unwrap()
+        ];
+        workspace.resize(
+            protocol
+                .audit_workspace_len(&inputs, generated.len())
+                .unwrap(),
+            0,
+        );
+        let audit = protocol
+            .audit(
+                &inputs,
+                hibana_epf::AuditStorage {
+                    unfolding: &mut generated,
+                    choices: &mut selected,
+                    execution: hibana_epf::ExecutionStorage {
+                        session: 110,
+                        order: &mut inferred_order,
+                        occurrences: &mut inferred,
+                        acceptances: &mut inferred_acceptances,
+                    },
+                },
+                &mut workspace,
+            )
+            .unwrap();
+        assert_eq!(audit.execution.acceptances.len(), 4);
+        for (position, id) in audit.execution.order.iter().enumerate() {
+            let expected = witnessed
+                .iter()
+                .position(|candidate| candidate == id)
+                .unwrap();
+            assert_eq!(audit.execution.occurrences[position], occurrences[expected]);
+        }
         let aliased: Vec<_> = occurrences
             .iter()
             .map(|event| if *event == Some(2) { Some(1) } else { *event })
@@ -802,8 +856,8 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
             let first_poll = calls[0].first_poll().ts() as usize;
             drop(calls);
             let steps = [
-                hibana_epf::Unfold::Message,
-                hibana_epf::Unfold::Message,
+                hibana_epf::Unfold::Source,
+                hibana_epf::Unfold::Source,
                 hibana_epf::Unfold::Sequence([0, 1]),
             ];
             let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
@@ -854,12 +908,13 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                 order.len()
             ];
             workspace.resize(path.interpretation_workspace_len(&[capture]).unwrap(), 0);
+            let mut inferred_order = order.clone();
             let automatic = path
                 .interpret(
                     &[capture],
                     hibana_epf::ExecutionStorage {
                         session: 98,
-                        order: &order,
+                        order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut inferred_acceptances,
                     },
@@ -872,7 +927,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                     &[capture],
                     hibana_epf::ExecutionStorage {
                         session: 98,
-                        order: &order,
+                        order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut inferred_acceptances,
                     },
@@ -885,7 +940,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                     &[capture],
                     hibana_epf::ExecutionStorage {
                         session: 98,
-                        order: &order,
+                        order: &mut inferred_order,
                         occurrences: &mut inferred[..order.len() - 1],
                         acceptances: &mut inferred_acceptances,
                     },
@@ -898,7 +953,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                     &[capture],
                     hibana_epf::ExecutionStorage {
                         session: 98,
-                        order: &order,
+                        order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut [],
                     },
@@ -1008,7 +1063,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                     &[invalid],
                     hibana_epf::ExecutionStorage {
                         session: 98,
-                        order: &order,
+                        order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut inferred_acceptances,
                     },
@@ -1329,10 +1384,10 @@ fn a_pending_continuation_can_publish_after_the_other_view_reenters_its_roll() {
         .unwrap()
         .causal_key();
     let steps = [
-        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Once(0),
-        hibana_epf::Unfold::Message,
-        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Source,
+        hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Sequence([2, 3]),
         hibana_epf::Unfold::Alongside {
             retained,
@@ -1537,12 +1592,12 @@ fn an_old_send_keeps_one_call_while_another_view_finishes_reentry() {
     let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
     let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
     let steps = [
-        hibana_epf::Unfold::Message,
-        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Source,
+        hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Sequence([0, 1]),
         hibana_epf::Unfold::Once(2),
-        hibana_epf::Unfold::Message,
-        hibana_epf::Unfold::Message,
+        hibana_epf::Unfold::Source,
+        hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Sequence([4, 5]),
         hibana_epf::Unfold::Alongside {
             retained,
@@ -1733,12 +1788,12 @@ fn pending_siblings_can_share_the_reset_published_by_the_first_completed_send() 
             .check_routes(&[capture], &order, &mut workspace)
             .unwrap();
         let steps = [
-            hibana_epf::Unfold::Message,
-            hibana_epf::Unfold::Message,
+            hibana_epf::Unfold::Source,
+            hibana_epf::Unfold::Source,
             hibana_epf::Unfold::Parallel([0, 1]),
             hibana_epf::Unfold::Once(2),
             hibana_epf::Unfold::More([3, 2]),
-            hibana_epf::Unfold::Message,
+            hibana_epf::Unfold::Source,
             hibana_epf::Unfold::Sequence([4, 5]),
         ];
         let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
@@ -2084,7 +2139,7 @@ fn an_observed_send_poll_can_end_in_a_transport_error_without_a_commit() {
         assert_eq!(calls[0].polls().count(), 1);
         assert_eq!(calls[0].publication(), None);
         drop(calls);
-        let steps = [hibana_epf::Unfold::Message];
+        let steps = [hibana_epf::Unfold::Source];
         let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
         let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
         let mut actors = vec![0; unfolded.path_workspace_len().unwrap()];

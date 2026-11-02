@@ -1,6 +1,8 @@
 //! Check finite source unfoldings without enumerating a fixed catalogue of visits.
 use super::{Layout, Protocol};
 
+pub(super) mod generate;
+
 /// One postorder step of a proposed finite source unfolding.
 ///
 /// Child indices must precede this step. The source of every child is derived
@@ -8,8 +10,9 @@ use super::{Layout, Protocol};
 /// not instructions that authorize or schedule application operations.
 #[derive(Clone, Copy, Debug)]
 pub enum Unfold {
-    /// Keep the source message at this position.
-    Message,
+    /// Borrow this compiled subtree, taking one copy of each nested roll.
+    /// Its messages and constructor structure are read directly from `Protocol`.
+    Source,
     /// Preserve a source sequence.
     Sequence([usize; 2]),
     /// Preserve a parallel composition.
@@ -81,6 +84,7 @@ struct Region {
     rolled: bool,
 }
 
+#[derive(Clone, Copy)]
 enum Head {
     Message,
     Sequence([Region; 2]),
@@ -158,7 +162,7 @@ impl<'p> Protocol<'p> {
                 Ok(())
             };
             match (steps[index], head) {
-                (Unfold::Message, Head::Message) => {}
+                (Unfold::Source, _) => {}
                 (Unfold::Sequence(children), Head::Sequence(sources))
                 | (Unfold::Parallel(children), Head::Parallel(sources))
                 | (Unfold::Choice(children), Head::Choice(sources)) => {
@@ -228,7 +232,10 @@ impl<'p> Protocol<'p> {
         for (index, step) in steps.iter().enumerate() {
             let count = |child| rows[5 * child + 4];
             let events = match *step {
-                Unfold::Message => 1,
+                Unfold::Source => {
+                    let region = get(rows, index);
+                    region.end - region.start
+                }
                 Unfold::Once(body) => count(body),
                 Unfold::Sequence([a, b])
                 | Unfold::Parallel([a, b])
@@ -256,7 +263,7 @@ impl<'p> Protocol<'p> {
                     focus,
                     ..
                 } => {
-                    if subtree_kind(steps, rows, tail, focus).is_none() {
+                    if subtree_kind(*self, steps, rows, tail, focus).is_none() {
                         return Err(UnfoldingError::Step { index });
                     }
                     count(earlier)
@@ -362,7 +369,7 @@ impl Unfolded<'_, '_> {
                 return;
             }
             match self.steps[at] {
-                Unfold::Message => return,
+                Unfold::Source => return,
                 Unfold::Once(body) => at = body,
                 Unfold::Sequence([a, b])
                 | Unfold::Parallel([a, b])
@@ -438,6 +445,14 @@ impl Unfolded<'_, '_> {
     pub(super) fn copy_range(&self, mut at: usize, event: usize) -> Option<[usize; 2]> {
         loop {
             match self.steps[at] {
+                Unfold::Source => {
+                    return matches!(
+                        Layout::checked(self.protocol)
+                            .head(self.protocol.records, get(self.rows, at)),
+                        Some(Head::Roll(_))
+                    )
+                    .then_some([0, self.count(at)]);
+                }
                 Unfold::Once(_) | Unfold::Independent(_) => return Some([0, self.count(at)]),
                 Unfold::More([earlier, next]) => {
                     if event < self.count(earlier) {
@@ -466,7 +481,7 @@ impl Unfolded<'_, '_> {
         let mut at = self.steps.len() - 1;
         loop {
             match self.steps[at] {
-                Unfold::Message => return false,
+                Unfold::Source => return false,
                 Unfold::Once(body) => at = body,
                 Unfold::Sequence([a, b])
                 | Unfold::Parallel([a, b])
@@ -569,6 +584,16 @@ impl Unfolded<'_, '_> {
                 retained, earlier, ..
             } => match self.steps[earlier] {
                 Unfold::Sequence([focused, _]) => self.anchor(focused, retained),
+                Unfold::Source => {
+                    let layout = Layout::checked(self.protocol);
+                    let region = get(self.rows, earlier);
+                    let Head::Sequence([left, _]) = layout.head(self.protocol.records, region)?
+                    else {
+                        return None;
+                    };
+                    let scope = layout.retained(self.protocol.records, left, retained)?;
+                    Some([scope.start - region.start, scope.end - region.start])
+                }
                 _ => None,
             },
             Unfold::Alongside {
@@ -592,7 +617,7 @@ impl Unfolded<'_, '_> {
         loop {
             if get(self.rows, at) == target {
                 return match self.steps[at] {
-                    Unfold::Once(_) => Some([base, base + self.count(at)]),
+                    Unfold::Source | Unfold::Once(_) => Some([base, base + self.count(at)]),
                     Unfold::More([earlier, next]) => Some([
                         base + self.count(earlier),
                         base + self.count(earlier) + self.count(next),
@@ -617,6 +642,14 @@ impl Unfolded<'_, '_> {
                         return None;
                     }
                 }
+                Unfold::Source => {
+                    let region = get(self.rows, at);
+                    let scope = layout.retained(records, region, retained)?;
+                    return Some([
+                        base + scope.start - region.start,
+                        base + scope.end - region.start,
+                    ]);
+                }
                 Unfold::Once(body) => at = body,
                 Unfold::More([earlier, next]) => {
                     base += self.count(earlier);
@@ -629,20 +662,16 @@ impl Unfolded<'_, '_> {
 
     pub(super) fn parts(&self, span: [usize; 2]) -> Option<(NodeKind, usize)> {
         let root = self.steps.len() - 1;
-        let kind = subtree_kind(self.steps, self.rows, root, span)?;
+        let kind = subtree_kind(self.protocol, self.steps, self.rows, root, span)?;
         if matches!(kind, NodeKind::Message) {
             return Some((kind, span[1]));
         }
         let split = (span[0] + 1..span[1]).find(|&split| {
-            subtree_kind(self.steps, self.rows, root, [span[0], split]).is_some()
-                && subtree_kind(self.steps, self.rows, root, [split, span[1]]).is_some()
+            subtree_kind(self.protocol, self.steps, self.rows, root, [span[0], split]).is_some()
+                && subtree_kind(self.protocol, self.steps, self.rows, root, [split, span[1]])
+                    .is_some()
         })?;
         Some((kind, split))
-    }
-
-    pub(super) fn choice_scope(&self, proof: usize) -> u16 {
-        let layout = Layout::checked(self.protocol);
-        self.protocol.records[layout.scopes.start + get(self.rows, proof).first].causal_key()
     }
 
     pub(super) fn independent_between(&self, mut first: usize, mut second: usize) -> bool {
@@ -653,7 +682,7 @@ impl Unfolded<'_, '_> {
         loop {
             let count = |node| self.rows[5 * node + 4];
             match self.steps[at] {
-                Unfold::Message => return false,
+                Unfold::Source => return false,
                 Unfold::Once(body) => at = body,
                 Unfold::Sequence([a, b])
                 | Unfold::Parallel([a, b])
@@ -736,7 +765,7 @@ impl Unfolded<'_, '_> {
         loop {
             let count = |node| self.rows[5 * node + 4];
             match self.steps[at] {
-                Unfold::Message => return Some(get(self.rows, at).start as u16),
+                Unfold::Source => return Some((get(self.rows, at).start + event) as u16),
                 Unfold::Once(body) => at = body,
                 Unfold::Sequence([a, b])
                 | Unfold::Parallel([a, b])
@@ -798,7 +827,14 @@ impl Unfolded<'_, '_> {
         loop {
             let count = |node| self.rows[5 * node + 4];
             match self.steps[at] {
-                Unfold::Message => return false,
+                Unfold::Source => {
+                    return Layout::checked(self.protocol).source_before(
+                        self.protocol.records,
+                        get(self.rows, at),
+                        first,
+                        second,
+                    );
+                }
                 Unfold::Once(body) => at = body,
                 Unfold::Sequence([a, b])
                 | Unfold::More([a, b])
@@ -1018,6 +1054,78 @@ impl Layout {
         })
     }
 
+    fn source_kind(
+        &self,
+        records: &[hibana::runtime::tap::TapEvent],
+        mut region: Region,
+        mut span: [usize; 2],
+    ) -> Option<NodeKind> {
+        loop {
+            region = self.canonical(records, region);
+            if span[0] >= span[1] || span[1] > region.end - region.start {
+                return None;
+            }
+            let head = self.head(records, region)?;
+            match head {
+                Head::Roll(body) => region = body,
+                Head::Message => return (span == [0, 1]).then_some(NodeKind::Message),
+                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(children) => {
+                    if span == [0, region.end - region.start] {
+                        return Some(match head {
+                            Head::Sequence(_) => NodeKind::Sequence,
+                            Head::Parallel(_) => NodeKind::Parallel,
+                            Head::Choice(_) => NodeKind::Choice(
+                                records[self.scopes.start + region.first].causal_key(),
+                            ),
+                            Head::Message | Head::Roll(_) => unreachable!(),
+                        });
+                    }
+                    let split = children[0].end - children[0].start;
+                    if span[1] <= split {
+                        region = children[0];
+                    } else if span[0] >= split {
+                        span[0] -= split;
+                        span[1] -= split;
+                        region = children[1];
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn source_before(
+        &self,
+        records: &[hibana::runtime::tap::TapEvent],
+        mut region: Region,
+        mut first: usize,
+        mut second: usize,
+    ) -> bool {
+        loop {
+            region = self.canonical(records, region);
+            let Some(head) = self.head(records, region) else {
+                return false;
+            };
+            match head {
+                Head::Roll(body) => region = body,
+                Head::Message => return false,
+                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(children) => {
+                    let split = children[0].end - children[0].start;
+                    if second < split {
+                        region = children[0];
+                    } else if first >= split {
+                        first -= split;
+                        second -= split;
+                        region = children[1];
+                    } else {
+                        return matches!(head, Head::Sequence(_));
+                    }
+                }
+            }
+        }
+    }
+
     fn retained(
         &self,
         records: &[hibana::runtime::tap::TapEvent],
@@ -1049,10 +1157,11 @@ pub(super) enum NodeKind {
     Message,
     Sequence,
     Parallel,
-    Choice(usize),
+    Choice(u16),
 }
 
 fn subtree_kind(
+    protocol: Protocol<'_>,
     steps: &[Unfold],
     rows: &[usize],
     mut at: usize,
@@ -1065,19 +1174,34 @@ fn subtree_kind(
         }
         if span == [0, count(at)] {
             return Some(match steps[at] {
-                Unfold::Message => NodeKind::Message,
+                Unfold::Source => {
+                    return Layout::checked(protocol).source_kind(
+                        protocol.records,
+                        get(rows, at),
+                        span,
+                    );
+                }
                 Unfold::Once(body) => {
                     at = body;
                     continue;
                 }
                 Unfold::Sequence(_) | Unfold::More(_) | Unfold::After { .. } => NodeKind::Sequence,
                 Unfold::Parallel(_) | Unfold::Independent(_) => NodeKind::Parallel,
-                Unfold::Choice(_) => NodeKind::Choice(at),
+                Unfold::Choice(_) => NodeKind::Choice(
+                    protocol.records[Layout::checked(protocol).scopes.start + get(rows, at).first]
+                        .causal_key(),
+                ),
                 Unfold::Alongside { .. } | Unfold::Before { .. } => NodeKind::Sequence,
             });
         }
         match steps[at] {
-            Unfold::Message => return None,
+            Unfold::Source => {
+                return Layout::checked(protocol).source_kind(
+                    protocol.records,
+                    get(rows, at),
+                    span,
+                );
+            }
             Unfold::Once(body) => at = body,
             Unfold::Sequence([a, b])
             | Unfold::Parallel([a, b])

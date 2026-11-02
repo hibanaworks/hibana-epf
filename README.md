@@ -128,10 +128,15 @@ to a compiled operation establishes static membership only.
 Dynamic protocol auditing is under development. The source checker below
 connects complete captures to a proposed finite execution of the compiled
 protocol. The diagnostic VM observes and filters records; it does not perform
-that source check. Automatic unfolding/choice/order construction, general Rust/Lean
+that source check. Automatic unfolding/choice construction, general Rust/Lean
 correspondence and qualification of the combined consumer remain unfinished.
 Missing records, counter exhaustion or a truncated stream cannot support an
 audit. Application effects require their own correspondence to accepted requests.
+
+Source auditing is explicitly requested through the capture APIs below. Loading
+an observation or policy image does not start that search, and `Epf::run` does
+not perform it on every event. An image/tool entry that requests the complete
+dynamic audit is not implemented yet.
 
 `SCOPE_REENTRY` reports the scope actually reused by a progress commit, including
 the actor, logical view, session and full scope identifier. A roll record also
@@ -325,32 +330,75 @@ Success is a source interpretation compatible with the witnessed causal order
 and acceptance intervals under the transport contract. It does not establish
 authenticity, a recovered physical acceptance time, completion of a session or
 agreement with application effects. Other runs need their own witness.
-Construction of source unfoldings, selections and causal order, and general
-formal correspondence of the new Rust checks remain unfinished. The existing
-Lean claims below do not prove those components.
+General formal correspondence of the Rust checks remains unfinished. The
+existing Lean claims below do not prove the entire Rust implementation.
 
-`SourcePath::interpret(captures, storage, workspace)` constructs the record
-attribution and supported acceptance boundaries for an already checked source
-path and complete proposed record order. `ExecutionStorage` supplies writable
-output arrays; the returned `ExecutionWitness` borrows their used portions.
+`Protocol::audit(captures, storage, workspace)` constructs the unfolding,
+per-visit route selections, causal order, source attributions and supported
+acceptance intervals. Its only protocol input is the checked compiled snapshot.
+`AuditStorage` holds the output derivation, route choices and execution evidence;
+`audit_choice_capacity` and `audit_workspace_len` derive storage sizes from that
+capacity, the compiled source and the complete captures. The returned `Audit`
+borrows those outputs and the retained proof and actor workspace.
+
+The first candidate uses observed commit counts to guide common repeated
+bodies. Counts are a construction hint, never evidence of a visit. If it fails,
+the constructor enumerates source-typed derivation trees in increasing size,
+including independently repeated parallel bodies and retained-body insertion
+before, alongside and after a continuation. It searches all active route arms
+separately in each expansion. Every candidate still passes `check_execution`.
+An unchanged subtree is borrowed as `Unfold::Source`, denoting the established
+one-copy unfolding without constructing another AST. Four Lean claims check
+that this representation preserves event count, source identities, messages and
+sequence order.
+
+There is no fixed depth or visit horizon. The caller's proof capacity bounds
+this finite search. `AuditError::Exhausted` means no certificate was constructed
+within that capacity; it is not a verdict that the history or global is illegal.
+Worst-case search is exponential. Large-task throughput and consumer
+qualification must be measured separately.
+
+The host CLI accepts canonical 16-byte record files and an independently saved
+checkpoint for each producer:
+
+```text
+hibana-epf audit protocol.bin SESSION DERIVATION_CAPACITY producer.bin CHECKPOINT [producer.bin CHECKPOINT ...]
+```
+
+It exits unsuccessfully when no certificate is produced. Its JSON output names
+the checked run, record ordering, expanded occurrences, original source events
+and acceptance intervals. It does not certify session completion or application
+effects. Saving an EOF-derived count as a producer checkpoint is invalid.
+
+`SourcePath::interpret(captures, storage, workspace)` constructs a causal record
+order, record attribution and supported acceptance boundaries for an already
+checked source path. `ExecutionStorage` supplies writable output arrays,
+including one order slot per captured record; their initial contents are ignored.
+The returned `ExecutionWitness` borrows their used portions.
 Send polls, publications and FIFO receipts share one search variable. Roll
 reset attribution follows its exact next committed operation, and distinct
 calls cannot reuse an expanded event. The constructor searches the finite
-expanded domain and validates each finished candidate with `check_execution`.
+expanded domain and producer-order-preserving interleavings. A prefix whose
+custody already fails is discarded using the same custody walk as the complete
+check. Each finished candidate is validated with `check_execution`.
 It cannot substitute its own acceptance for that check.
 
 Acceptance is proposed after the first poll only for calls with completion
 evidence. This is an allowed interval interpretation, not a physical timestamp.
-Space is seven words per captured record plus custody checking space, without
+Space is eight words per captured record, one per producer, plus custody space, without
 a fixed depth or visit horizon. Worst-case search is exponential; no large-task
 throughput claim is established. Failure to interpret one supplied finite path
-does not reject the global or exclude another unfolding. Construction of the
-unfolding, branch selections and causal order remains unfinished.
+does not reject the global or exclude another unfolding. Use `Protocol::audit`
+when the unfolding and branch selections must also be constructed.
 
 Actual Endpoint fixtures check constructed attributions for three-runtime
 delegation, nested choices and predecessor violations. A separate synthetic
 test compares the constructor with all 9,362 assignments for 62 small sequence
 and parallel record words, including legal prefixes and impossible orderings.
+For a small request/reply exchange, the result is also compared with all twenty
+producer-preserving interleavings, both for a valid exchange and for an early
+reply that no ordering can legalize. A defect control restricts the constructor
+to grouping whole producers and must fail this comparison.
 The constructor's final validation is also removed in a defect control, which
 must fail the early-poll regression. These checks do not prove general search
 completeness or Rust/Lean refinement.
