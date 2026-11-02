@@ -31,6 +31,7 @@ private def plan : SourceOccurrenceCut source := {
   sameIssuance := rfl
   path := ⟨[], bindings⟩
   selected := by decide
+  separated := by decide
   guarded := by decide
   observed := fun _ => false
 }
@@ -91,6 +92,7 @@ private def orderedPlan : SourceOccurrenceCut orderedSource := {
   sameIssuance := rfl
   path := ⟨[], orderedBindings⟩
   selected := by decide
+  separated := by decide
   guarded := by decide
   observed := fun _ => false
 }

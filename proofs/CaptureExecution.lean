@@ -156,6 +156,68 @@ theorem receipt_before_publication_can_support_acceptance
     supportsAcceptance ⟨first, some published, some received⟩ received = true := by
   simp [supportsAcceptance, polled, later]
 
+theorem resumption_dependencies_read_only_commits
+    (plan : SourceOccurrenceCut source) (left right : SourcePoint → Bool)
+    (same : ∀ action, left (.committed action) = right (.committed action))
+    (before after : SourcePoint) :
+    plan.resumptionDepends left before after = plan.resumptionDepends right before after := by
+  cases before with
+  | accepted => rfl
+  | committed before =>
+    cases after with
+    | committed => rfl
+    | accepted after =>
+      cases actorAt : occurrenceActor? plan (.accepted after) with
+      | none => simp only [SourceOccurrenceCut.resumptionDepends, actorAt]
+      | some actor =>
+        simp only [SourceOccurrenceCut.resumptionDepends, actorAt]
+        apply congrArg (fun value => occurrenceActor? plan (.committed before) == some actor && value)
+        apply congrArg (fun predicate => (plan.unfolding.resumptions 0).any predicate)
+        funext scope
+        congr 1
+        apply congrArg (fun predicate => (occurrenceLocalDomain plan actor).any predicate)
+        funext point
+        cases point with
+        | accepted => rfl
+        | committed action => rw [same action]
+
+theorem resumption_queries_read_only_commits
+    (plan : SourceOccurrenceCut source) (left right : SourcePoint → Bool)
+    (same : ∀ action, left (.committed action) = right (.committed action))
+    (point : SourcePoint) :
+    ({ plan with observed := left } : SourceOccurrenceCut source).resumptionReady point =
+      ({ plan with observed := right } : SourceOccurrenceCut source).resumptionReady point := by
+  unfold SourceOccurrenceCut.resumptionReady
+  apply congrArg (fun predicate => (sourceVisitPoints plan.path.bindings).all predicate)
+  funext before
+  change (!plan.resumptionDepends left before point || left before) =
+    (!plan.resumptionDepends right before point || right before)
+  rw [resumption_dependencies_read_only_commits plan left right same before point]
+  cases before with
+  | accepted => rfl
+  | committed action => rw [same action]
+
+/-- Moving supported acceptances between poll and completion does not change
+poll admission when the committed prefix is unchanged. Acceptance does not
+activate a retained body. This justifies proposing the earliest boundary after
+a checked first poll without assuming that physical acceptance happened there. -/
+theorem admission_depends_on_the_committed_prefix
+    (plan : SourceOccurrenceCut source) (first second : List SourcePoint)
+    (same : ∀ action, first.contains (.committed action) = second.contains (.committed action))
+    (event : Nat) : admissionReady plan first event = admissionReady plan second event := by
+  have resumed := resumption_queries_read_only_commits plan
+    (fun point => first.contains point) (fun point => second.contains point) same (.accepted event)
+  dsimp only [admissionReady, occurrenceCut]
+  rw [resumed]
+  apply congrArg (fun value : Bool => value &&
+    ({ plan with observed := fun point => second.contains point } : SourceOccurrenceCut source).resumptionReady (.accepted event))
+  apply congrArg (fun value : Bool => (sourceVisitPoints plan.path.bindings).contains (.accepted event) && value)
+  apply congrArg (fun predicate => (sourceVisitPoints plan.path.bindings).all predicate)
+  funext before
+  cases before with
+  | accepted => rfl
+  | committed action => rw [same action]
+
 #print axioms checked_records_have_a_source_execution
 #print axioms a_poll_does_not_append_a_source_point
 #print axioms checking_append_preserves_the_exact_source_prefix
@@ -167,5 +229,8 @@ theorem receipt_before_publication_can_support_acceptance
 #print axioms supported_acceptance_is_before_publication
 #print axioms supported_acceptance_is_before_receipt
 #print axioms receipt_before_publication_can_support_acceptance
+#print axioms resumption_dependencies_read_only_commits
+#print axioms resumption_queries_read_only_commits
+#print axioms admission_depends_on_the_committed_prefix
 
 end Hibana.Epf.CaptureExecution

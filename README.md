@@ -365,14 +365,14 @@ observed completion, allowing receipt before sender publication. These are
 contracts for the evidence interpreter. They do not prove the Rust snapshot
 reader, occurrence matcher or whole checker implements those contracts.
 
-The selected core pin `569cdb0e` still has the older acceptance-triggered
-resumption model. The Rust source checker uses committed-body entry, as tested
-by the pending-continuation fixtures. The model was corrected in core's
-preparation commit `434678b`; that preparation has not completed whole-core
-qualification. Therefore the selected pin's generic Lean contracts must not be
-claimed as a refinement of the current Rust checker. Normalizing acceptance
-positions has been checked separately against the corrected model; updating
-the dependency and certifying the combined implementation remain required.
+The selected core pin `08d0439` includes committed-body resumption and
+independent visits of physically disjoint parallel rolls. The proof gate imports
+that exact Git dependency, including the normalization claims: moving supported
+acceptance boundaries leaves admission unchanged when the committed prefix is
+unchanged. The Rust source checker also uses committed-body entry, exercised by
+the pending-continuation fixtures. These claims do not prove general Rust/Lean
+refinement. This core preparation still needs whole-core qualification; an EPF
+gate pass alone does not establish that result.
 
 `Protocol::deliveries(captures, workspace)` connects successful receives across
 producer captures to send calls. Within each session/source stream it uses the
