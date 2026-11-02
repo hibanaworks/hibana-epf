@@ -1,7 +1,7 @@
 //! Construct source, route and execution witnesses from the compiled protocol.
 use super::{
-    Acceptance, ExecutionStorage, ExecutionWitness, InterpretationError, Layout, Protocol,
-    RouteChoice, SourcePath, Unfold, Unfolded,
+    ExecutionStorage, ExecutionWitness, InterpretationError, Layout, Protocol, RouteChoice,
+    SourcePath, Unfold, Unfolded,
     unfolding::{NodeKind, generate::Derivations},
 };
 use crate::Capture;
