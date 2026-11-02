@@ -144,6 +144,29 @@ fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
     );
     path.check_execution(&[capture], &witness, &mut workspace)
         .unwrap();
+    let mut inferred = vec![None; order.len()];
+    let mut inferred_acceptances = [];
+    workspace.resize(path.interpretation_workspace_len(&[capture]).unwrap(), 0);
+    let automatic = path
+        .interpret(
+            &[capture],
+            hibana_epf::ExecutionStorage {
+                session: 137,
+                order: &order,
+                occurrences: &mut inferred,
+                acceptances: &mut inferred_acceptances,
+            },
+            &mut workspace,
+        )
+        .unwrap();
+    for (position, record) in captured.iter().enumerate() {
+        if record.id() == tap::ENDPOINT_SEND {
+            assert_eq!(automatic.occurrences[position], occurrences[position]);
+        }
+    }
+    assert!(automatic.acceptances.is_empty());
+    path.check_execution(&[capture], &automatic, &mut workspace)
+        .unwrap();
     // Keep the complete ordinal sequence while replacing the reset that makes
     // the first change of arm legal with an irrelevant observation.
     let right = captured

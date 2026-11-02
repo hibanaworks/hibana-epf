@@ -288,7 +288,7 @@ impl SourcePath<'_, '_, '_> {
     }
 }
 
-fn relevant(record: TapEvent) -> bool {
+pub(super) fn relevant(record: TapEvent) -> bool {
     operation(record)
         || matches!(
             record.id(),
@@ -296,18 +296,22 @@ fn relevant(record: TapEvent) -> bool {
         )
 }
 
-fn operation(record: TapEvent) -> bool {
+pub(super) fn operation(record: TapEvent) -> bool {
     record.id() == tap::SEND_POLL || committed(record)
 }
 
-fn committed(record: TapEvent) -> bool {
+pub(super) fn committed(record: TapEvent) -> bool {
     matches!(
         record.id(),
         tap::ENDPOINT_SEND | tap::ENDPOINT_RECV | tap::ENDPOINT_SESSION
     )
 }
 
-fn operation_point(row: TapEvent, observed: TapEvent, event: usize) -> Option<SourcePoint> {
+pub(super) fn operation_point(
+    row: TapEvent,
+    observed: TapEvent,
+    event: usize,
+) -> Option<SourcePoint> {
     if !operation(observed) {
         return None;
     }

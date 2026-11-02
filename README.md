@@ -128,7 +128,7 @@ to a compiled operation establishes static membership only.
 Dynamic protocol auditing is under development. The source checker below
 connects complete captures to a proposed finite execution of the compiled
 protocol. The diagnostic VM observes and filters records; it does not perform
-that source check. Automatic witness construction, general Rust/Lean
+that source check. Automatic unfolding/choice/order construction, general Rust/Lean
 correspondence and qualification of the combined consumer remain unfinished.
 Missing records, counter exhaustion or a truncated stream cannot support an
 audit. Application effects require their own correspondence to accepted requests.
@@ -325,8 +325,35 @@ Success is a source interpretation compatible with the witnessed causal order
 and acceptance intervals under the transport contract. It does not establish
 authenticity, a recovered physical acceptance time, completion of a session or
 agreement with application effects. Other runs need their own witness.
-The witness builder and general formal correspondence of these new Rust source
-checks remain unfinished; the existing Lean claims below do not prove them.
+Construction of source unfoldings, selections and causal order, and general
+formal correspondence of the new Rust checks remain unfinished. The existing
+Lean claims below do not prove those components.
+
+`SourcePath::interpret(captures, storage, workspace)` constructs the record
+attribution and supported acceptance boundaries for an already checked source
+path and complete proposed record order. `ExecutionStorage` supplies writable
+output arrays; the returned `ExecutionWitness` borrows their used portions.
+Send polls, publications and FIFO receipts share one search variable. Roll
+reset attribution follows its exact next committed operation, and distinct
+calls cannot reuse an expanded event. The constructor searches the finite
+expanded domain and validates each finished candidate with `check_execution`.
+It cannot substitute its own acceptance for that check.
+
+Acceptance is proposed after the first poll only for calls with completion
+evidence. This is an allowed interval interpretation, not a physical timestamp.
+Space is seven words per captured record plus custody checking space, without
+a fixed depth or visit horizon. Worst-case search is exponential; no large-task
+throughput claim is established. Failure to interpret one supplied finite path
+does not reject the global or exclude another unfolding. Construction of the
+unfolding, branch selections and causal order remains unfinished.
+
+Actual Endpoint fixtures check constructed attributions for three-runtime
+delegation, nested choices and predecessor violations. A separate synthetic
+test compares the constructor with all 9,362 assignments for 62 small sequence
+and parallel record words, including legal prefixes and impossible orderings.
+The constructor's final validation is also removed in a defect control, which
+must fail the early-poll regression. These checks do not prove general search
+completeness or Rust/Lean refinement.
 
 `CaptureExecution.lean` interprets poll queries and source advances using the
 selected core's existing source-occurrence semantics. It proves that a checked
@@ -337,6 +364,15 @@ require completion evidence and place acceptance after its poll and before each
 observed completion, allowing receipt before sender publication. These are
 contracts for the evidence interpreter. They do not prove the Rust snapshot
 reader, occurrence matcher or whole checker implements those contracts.
+
+The selected core pin `569cdb0e` still has the older acceptance-triggered
+resumption model. The Rust source checker uses committed-body entry, as tested
+by the pending-continuation fixtures. The model was corrected in core's
+preparation commit `434678b`; that preparation has not completed whole-core
+qualification. Therefore the selected pin's generic Lean contracts must not be
+claimed as a refinement of the current Rust checker. Normalizing acceptance
+positions has been checked separately against the corrected model; updating
+the dependency and certifying the combined implementation remain required.
 
 `Protocol::deliveries(captures, workspace)` connects successful receives across
 producer captures to send calls. Within each session/source stream it uses the
