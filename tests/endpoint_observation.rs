@@ -20,10 +20,7 @@ struct LocalOnly;
 
 #[test]
 fn automatic_audit_uses_a_complete_burst_capture_instead_of_the_diagnostic_window() {
-    use hibana_epf::{
-        Acceptance, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId, RouteChoice,
-        Unfold,
-    };
+    use hibana_epf::Capture;
     let rows = Cell::new(Vec::new());
     let recorder = |event| {
         let mut captured = rows.take();
@@ -47,12 +44,24 @@ fn automatic_audit_uses_a_complete_burst_capture_instead_of_the_diagnostic_windo
     assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
     let checkpoint = rv.tap().checkpoint();
     let captured = rows.take();
-    let captures = [Capture::new(&captured, checkpoint).unwrap()];
     let window: Vec<_> = rv.tap().collect();
     assert!(Capture::new(&window, checkpoint).is_err());
     let snapshot: Vec<_> = tap::projected(&program).collect();
-    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
-    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    assert_eq!(audit_capture(&snapshot, &captured, checkpoint).unwrap(), 32);
+}
+
+fn audit_capture(
+    snapshot: &[TapEvent],
+    captured: &[TapEvent],
+    checkpoint: Option<u32>,
+) -> Result<usize, hibana_epf::AuditError> {
+    use hibana_epf::{
+        Acceptance, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId, RouteChoice,
+        Unfold,
+    };
+    let captures = [Capture::new(captured, checkpoint).unwrap()];
+    let mut workspace = vec![0; Protocol::workspace_len(snapshot).unwrap()];
+    let protocol = Protocol::new(snapshot, &mut workspace).unwrap();
     let capacity = 2 * captured.len() + 1;
     let mut unfolding = vec![Unfold::Source; capacity];
     let mut choices = vec![
@@ -84,23 +93,104 @@ fn automatic_audit_uses_a_complete_burst_capture_instead_of_the_diagnostic_windo
         protocol.audit_workspace_len(&captures, capacity).unwrap(),
         0,
     );
-    let audit = protocol
-        .audit(
-            &captures,
-            AuditStorage {
-                unfolding: &mut unfolding,
-                choices: &mut choices,
-                execution: ExecutionStorage {
-                    session: 1,
-                    order: &mut order,
-                    occurrences: &mut occurrences,
-                    acceptances: &mut acceptances,
-                },
+    let audit = protocol.audit(
+        &captures,
+        AuditStorage {
+            unfolding: &mut unfolding,
+            choices: &mut choices,
+            execution: ExecutionStorage {
+                session: 1,
+                order: &mut order,
+                occurrences: &mut occurrences,
+                acceptances: &mut acceptances,
             },
-            &mut workspace,
-        )
-        .unwrap();
-    assert_eq!(audit.path().unfolding().event_count(), 32);
+        },
+        &mut workspace,
+    )?;
+    Ok(audit.path().unfolding().event_count())
+}
+
+#[test]
+fn automatic_audit_checks_resolver_calls_from_outgoing_offers_in_each_visit() {
+    let rows = Cell::new(Vec::new());
+    let recorder = |event| {
+        let mut captured = rows.take();
+        captured.push(event);
+        rows.set(captured);
+    };
+    let right = Cell::new(false);
+    let global = g::route(
+        g::seq(g::send::<7, 7, Msg<1, ()>>(), g::send::<7, 7, Msg<3, ()>>()),
+        g::seq(g::send::<7, 7, Msg<2, ()>>(), g::send::<7, 7, Msg<3, ()>>()),
+    )
+    .resolve::<77>()
+    .roll();
+    let program = project::<7>(&global);
+    let mut slab = [0; 8192];
+    let mut storage = SessionKitStorage::uninit();
+    let rv = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+    rv.observe(&recorder);
+    rv.set_resolver(
+        &program,
+        ResolverRef::<77>::decision_state(&right, |right| {
+            Ok(if right.get() {
+                DecisionArm::Right
+            } else {
+                DecisionArm::Left
+            })
+        }),
+    )
+    .unwrap();
+    let mut endpoint = rv.enter(SessionId::new(1), &program).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let operation = core::pin::pin!(async {
+        endpoint.offer().await?.send::<Msg<1, ()>>(&()).await?;
+        endpoint.send::<Msg<3, ()>>(&()).await?;
+        right.set(true);
+        endpoint.offer().await?.send::<Msg<2, ()>>(&()).await?;
+        endpoint.send::<Msg<3, ()>>(&()).await?;
+        Ok::<_, hibana::EndpointError>(())
+    });
+    assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+    let captured = rows.take();
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|row| row.id() == tap::RESOLVER_AUDIT)
+            .count(),
+        2
+    );
+    assert_eq!(
+        audit_capture(&snapshot, &captured, rv.tap().checkpoint()).unwrap(),
+        8
+    );
+    // Keep a complete, correctly numbered prefix while deleting only the
+    // resolver evidence. Agreement between later commits cannot replace it.
+    let missing: Vec<TapEvent> = captured
+        .iter()
+        .filter(|row| row.id() != tap::RESOLVER_AUDIT)
+        .enumerate()
+        .map(|(ordinal, row)| {
+            let mut bytes: [u8; 16] = (*row).into();
+            bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+            bytes.into()
+        })
+        .collect();
+    let captures = [hibana_epf::Capture::new(&missing, Some(missing.len() as u32)).unwrap()];
+    let mut workspace = vec![0; hibana_epf::Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = hibana_epf::Protocol::new(&snapshot, &mut workspace).unwrap();
+    let order: Vec<_> = (0..missing.len())
+        .map(|ordinal| hibana_epf::RecordId {
+            producer: 0,
+            ordinal,
+        })
+        .collect();
+    workspace.resize(protocol.custody_workspace_len(&captures), 0);
+    assert!(matches!(
+        protocol.check_routes(&captures, &order, &mut workspace),
+        Err(hibana_epf::RouteHistoryError::Record { .. })
+    ));
 }
 
 #[test]
