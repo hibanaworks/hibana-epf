@@ -37,8 +37,8 @@ pub struct Audit<'p, 'a> {
 
 impl<'p, 'a> Audit<'p, 'a> {
     /// Source-derived path, including each selected dynamic route occurrence.
-    pub fn path(&self) -> SourcePath<'p, 'a, 'a> {
-        self.path
+    pub fn path(&self) -> &SourcePath<'p, 'a, 'a> {
+        &self.path
     }
 
     /// Checked producer order, source attribution and acceptance intervals.
