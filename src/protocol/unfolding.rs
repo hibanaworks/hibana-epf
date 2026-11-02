@@ -660,9 +660,14 @@ impl Unfolded<'_, '_> {
         }
     }
 
+    pub(super) fn kind(&self, span: [usize; 2]) -> Option<NodeKind> {
+        let root = self.steps.len() - 1;
+        subtree_kind(self.protocol, self.steps, self.rows, root, span)
+    }
+
     pub(super) fn parts(&self, span: [usize; 2]) -> Option<(NodeKind, usize)> {
         let root = self.steps.len() - 1;
-        let kind = subtree_kind(self.protocol, self.steps, self.rows, root, span)?;
+        let kind = self.kind(span)?;
         if matches!(kind, NodeKind::Message) {
             return Some((kind, span[1]));
         }

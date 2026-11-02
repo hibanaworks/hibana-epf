@@ -91,7 +91,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
             if choices[..index]
                 .iter()
                 .any(|prior| prior.span == choice.span)
-                || !matches!(self.parts(choice.span), Some((NodeKind::Choice(_), _)))
+                || !matches!(self.kind(choice.span), Some(NodeKind::Choice(_)))
             {
                 return Err(PathError::Choice { index });
             }
@@ -249,12 +249,13 @@ impl<'p, 'u> Unfolded<'p, 'u> {
 impl SourcePath<'_, '_, '_> {
     pub(super) fn choice_at(&self, event: usize, scope: u16) -> Option<bool> {
         self.choices.iter().find_map(|choice| {
-            let (kind, _) = self.source.parts(choice.span)?;
-            let NodeKind::Choice(found) = kind else {
+            if !(choice.span[0] <= event && event < choice.span[1]) {
+                return None;
+            }
+            let NodeKind::Choice(found) = self.source.kind(choice.span)? else {
                 return None;
             };
-            (choice.span[0] <= event && event < choice.span[1] && found == scope)
-                .then_some(choice.right)
+            (found == scope).then_some(choice.right)
         })
     }
 

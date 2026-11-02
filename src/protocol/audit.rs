@@ -308,11 +308,11 @@ fn route_preference(
     captures: &[Capture<'_>],
     session: u32,
 ) -> bool {
-    let Some((NodeKind::Choice(key), _)) = source.parts(span) else {
+    let Some(NodeKind::Choice(key)) = source.kind(span) else {
         return false;
     };
     let visit = earlier.iter().filter(|choice|
-        matches!(source.parts(choice.span), Some((NodeKind::Choice(prior), _)) if prior == key)
+        matches!(source.kind(choice.span), Some(NodeKind::Choice(prior)) if prior == key)
     ).count();
     let matches = |record: &&tap::TapEvent| {
         record.id() == tap::ROUTE_ARM_SELECTION
