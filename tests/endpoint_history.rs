@@ -28,13 +28,14 @@ struct Frame {
     len: u8,
 }
 
-// A single physical frame inbox. A send makes its frame available on
-// the first poll and reports acceptance on the next. Only copied frame
-// headers survive a poll; no outgoing payload pointer is retained.
+// A single physical frame inbox. Normally a send exposes its frame on the
+// first poll and reports acceptance on the next. A backpressured receiver's
+// frame is exposed only by the second poll. No payload pointer survives a poll.
 struct DelayedPublication {
     inbox: Cell<Result<Option<Frame>, TransportError>>,
     reader: Cell<Option<Waker>>,
     resource: Option<EndpointBinding>,
+    backpressured_receiver: Option<u8>,
 }
 
 impl Transport for DelayedPublication {
@@ -73,9 +74,16 @@ impl Transport for DelayedPublication {
             label[0],
             label[1],
         ]);
+        let backpressured = self.backpressured_receiver == Some(outgoing.target_role());
         if let Some(accepted) = tx.1.take() {
             assert_eq!(accepted, header);
-            return Poll::Ready(Ok(()));
+            if !backpressured {
+                return Poll::Ready(Ok(()));
+            }
+        } else if backpressured {
+            tx.1 = Some(header);
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         }
         match self.inbox.get() {
             Ok(None) => {
@@ -87,12 +95,16 @@ impl Transport for DelayedPublication {
                     bytes: copied,
                     len: bytes.len() as u8,
                 })));
-                tx.1 = Some(header);
                 if let Some(reader) = self.reader.take() {
                     reader.wake();
                 }
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                if backpressured {
+                    Poll::Ready(Ok(()))
+                } else {
+                    tx.1 = Some(header);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
             }
             Ok(Some(_)) => Poll::Ready(Err(TransportError::Capacity)),
             Err(error) => Poll::Ready(Err(error)),
@@ -164,6 +176,7 @@ fn a_real_receive_can_commit_before_sender_publication_is_observed() {
             DelayedPublication {
                 inbox: Cell::new(Ok(None)),
                 reader: Cell::new(None),
+                backpressured_receiver: None,
                 resource: None,
             },
         )
@@ -309,6 +322,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                 DelayedPublication {
                     inbox: Cell::new(Ok(None)),
                     reader: Cell::new(None),
+                    backpressured_receiver: None,
                     resource: None,
                 },
             )
@@ -402,6 +416,7 @@ fn repeated_source_events_have_distinct_calls_and_reject_broken_correspondence()
             DelayedPublication {
                 inbox: Cell::new(Ok(None)),
                 reader: Cell::new(None),
+                backpressured_receiver: None,
                 resource: None,
             },
         )
@@ -510,6 +525,7 @@ fn parallel_calls_keep_their_own_polls_when_publications_finish_in_reverse() {
             DelayedPublication {
                 inbox: Cell::new(Ok(None)),
                 reader: Cell::new(None),
+                backpressured_receiver: None,
                 resource: None,
             },
         )
@@ -569,6 +585,244 @@ fn parallel_calls_keep_their_own_polls_when_publications_finish_in_reverse() {
 }
 
 #[test]
+fn a_pending_continuation_can_publish_after_the_other_view_reenters_its_roll() {
+    type Tick = Msg<12, ()>;
+    type Tail = Msg<13, ()>;
+    type Loan = Msg<14, Endpoint<'static, 3>>;
+    let global = g::seq(
+        g::send::<3, 4, Tick>().roll(),
+        g::seq(g::send::<0, 2, Tail>(), g::send::<0, 1, Loan>()),
+    );
+    let p0 = project::<0>(&global);
+    let p1 = project::<1>(&global);
+    let p2 = project::<2>(&global);
+    let p3 = project::<3>(&global);
+    let p4 = project::<4>(&global);
+    let mut slab = [0; 32768];
+    let mut storage = SessionKitStorage::uninit();
+    let kit = storage
+        .init()
+        .rendezvous(
+            &mut slab,
+            DelayedPublication {
+                inbox: Cell::new(Ok(None)),
+                reader: Cell::new(None),
+                // SAFETY: this fresh fixture is the only physical resource.
+                resource: Some(unsafe { EndpointBinding::new() }),
+                backpressured_receiver: Some(2),
+            },
+        )
+        .unwrap();
+    let sid = SessionId::new(103);
+    let mut owner = kit.enter(sid, &p0).unwrap();
+    let mut worker = kit.enter(sid, &p1).unwrap();
+    let mut other = kit.enter(sid, &p2).unwrap();
+    let mut resource = kit.enter(sid, &p3).unwrap();
+    let mut service = kit.enter(sid, &p4).unwrap();
+    let mut records = kit.tap();
+    let mut captured: Vec<_> = records.by_ref().collect();
+    let mut cx = Context::from_waker(Waker::noop());
+    {
+        let mut sending = core::pin::pin!(resource.send::<Tick>(&()));
+        assert!(sending.as_mut().poll(&mut cx).is_pending());
+        {
+            let receiving = core::pin::pin!(service.recv::<Tick>());
+            assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        assert!(matches!(
+            sending.as_mut().poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+    captured.extend(records.by_ref());
+    {
+        // Tail has passed source admission, but its first transport poll
+        // exposes no frame. A separate logical view starts the next Tick.
+        let mut tail = core::pin::pin!(owner.send::<Tail>(&()));
+        assert!(tail.as_mut().poll(&mut cx).is_pending());
+        captured.extend(records.by_ref());
+        let mut tick = core::pin::pin!(resource.send::<Tick>(&()));
+        let started = tick.as_mut().poll(&mut cx);
+        captured.extend(records.by_ref());
+        assert!(started.is_pending(), "Tick reentry: {started:?}");
+        {
+            let receiving = core::pin::pin!(service.recv::<Tick>());
+            let received = receiving.poll(&mut cx);
+            captured.extend(records.by_ref());
+            assert!(
+                matches!(received, Poll::Ready(Ok(()))),
+                "Tick receipt: {received:?}"
+            );
+        }
+        let finished = tail.as_mut().poll(&mut cx);
+        captured.extend(records.by_ref());
+        assert!(
+            matches!(finished, Poll::Ready(Ok(()))),
+            "Tail publication: {finished:?}"
+        );
+        {
+            let receiving = core::pin::pin!(other.recv::<Tail>());
+            assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+        }
+        assert!(matches!(tick.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+    }
+    captured.extend(records.by_ref());
+    let publications: Vec<_> = captured
+        .iter()
+        .filter(|record| matches!(record.id(), tap::ENDPOINT_SEND | tap::ENDPOINT_RECV))
+        .map(|record| (record.arg1() as u16, record.causal_key() as u8))
+        .collect();
+    assert_eq!(
+        publications,
+        [(0, 2), (0, 1), (0, 2), (1, 1), (1, 2), (0, 1)]
+    );
+    let snapshot: Vec<_> = tap::projected(&p0).collect();
+    let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+    let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+    workspace.resize(protocol.send_call_workspace_len(capture), 0);
+    let calls: Vec<_> = protocol
+        .send_calls(capture, &mut workspace)
+        .unwrap()
+        .collect();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].first_poll().causal_key(), 3); // actor 0, view 3
+    assert_eq!(calls[1].first_poll().arg1() as u16, 1); // Tail
+    assert_eq!(calls[2].first_poll().arg1() as u16, 0); // second Tick
+    assert!(calls[1].first_poll().ts() < calls[2].first_poll().ts());
+    assert!(calls[1].publication().unwrap().ts() < calls[2].publication().unwrap().ts());
+    assert!(calls.iter().all(|call| call.polls().count() == 2));
+    drop(calls);
+    // The same resource still has a usable continuation and is moved once.
+    let mut lending = core::pin::pin!(owner.send::<Loan>(resource));
+    assert!(lending.as_mut().poll(&mut cx).is_pending());
+    let receiving = core::pin::pin!(worker.recv::<Loan>());
+    let Poll::Ready(Ok(borrowed)) = receiving.poll(&mut cx) else {
+        panic!("the resource continuation must remain transferable")
+    };
+    assert!(matches!(
+        lending.as_mut().poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    drop(borrowed);
+}
+
+#[test]
+fn pending_siblings_can_share_the_reset_published_by_the_first_completed_send() {
+    type Tick = Msg<12, ()>;
+    type Tail = Msg<13, ()>;
+    type Loan = Msg<14, Endpoint<'static, 3>>;
+    let global = g::seq(
+        g::par(g::send::<3, 4, Tick>(), g::send::<0, 2, Tail>()).roll(),
+        g::send::<0, 1, Loan>(),
+    );
+    let p0 = project::<0>(&global);
+    let p2 = project::<2>(&global);
+    let p3 = project::<3>(&global);
+    let p4 = project::<4>(&global);
+    for reverse in [false, true] {
+        let mut slab = [0; 32768];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                DelayedPublication {
+                    inbox: Cell::new(Ok(None)),
+                    reader: Cell::new(None),
+                    // SAFETY: every port reaches this one fresh physical resource.
+                    resource: Some(unsafe { EndpointBinding::new() }),
+                    backpressured_receiver: None,
+                },
+            )
+            .unwrap();
+        let sid = SessionId::new(104);
+        let mut owner = kit.enter(sid, &p0).unwrap();
+        let mut other = kit.enter(sid, &p2).unwrap();
+        let mut resource = kit.enter(sid, &p3).unwrap();
+        let mut service = kit.enter(sid, &p4).unwrap();
+        let mut records = kit.tap();
+        let mut captured: Vec<_> = records.by_ref().collect();
+        let mut cx = Context::from_waker(Waker::noop());
+        for visit in 0..2 {
+            let mut tick = core::pin::pin!(resource.send::<Tick>(&()));
+            assert!(tick.as_mut().poll(&mut cx).is_pending());
+            {
+                let receiving = core::pin::pin!(service.recv::<Tick>());
+                assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+            }
+            captured.extend(records.by_ref());
+            if visit == 0 {
+                assert!(matches!(tick.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+            }
+            {
+                let mut tail = core::pin::pin!(owner.send::<Tail>(&()));
+                assert!(tail.as_mut().poll(&mut cx).is_pending());
+                {
+                    let receiving = core::pin::pin!(other.recv::<Tail>());
+                    assert!(matches!(receiving.poll(&mut cx), Poll::Ready(Ok(()))));
+                }
+                if visit != 0 && reverse {
+                    assert!(matches!(tick.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+                }
+                assert!(matches!(tail.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+            }
+            if visit != 0 && !reverse {
+                assert!(matches!(tick.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+            }
+            captured.extend(records.by_ref());
+        }
+        let snapshot: Vec<_> = tap::projected(&p0).collect();
+        let mut workspace = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut workspace).unwrap();
+        let capture = Capture::new(&captured, records.checkpoint()).unwrap();
+        workspace.resize(protocol.send_call_workspace_len(capture), 0);
+        let calls: Vec<_> = protocol
+            .send_calls(capture, &mut workspace)
+            .unwrap()
+            .collect();
+        assert_eq!(calls.len(), 4);
+        assert!(calls.iter().all(|call| call.polls().count() == 2));
+        assert!(calls.iter().all(|call| call.publication().is_some()));
+        let waiting = &calls[if reverse { 3 } else { 2 }];
+        let polls: Vec<_> = waiting.polls().collect();
+        assert_ne!(polls[0].arg1() >> 16, u32::from(u16::MAX));
+        assert_eq!(polls[1].arg1() >> 16, u32::from(u16::MAX));
+        let reset = captured
+            .iter()
+            .position(|record| {
+                record.id() == tap::SCOPE_REENTRY
+                    && record.causal_key() >> 8 == 0
+                    && polls[0].ts() < record.ts()
+                    && record.ts() < polls[1].ts()
+            })
+            .unwrap();
+        drop(calls);
+        for mutation in 0..5 {
+            let mut changed = captured.clone();
+            let mut bytes = <[u8; 16]>::from(changed[reset]);
+            match mutation {
+                0 => bytes[4..6].copy_from_slice(&tap::LANE_ACQUIRE.to_be_bytes()),
+                1 => bytes[8..12].copy_from_slice(&105u32.to_be_bytes()),
+                2 => bytes[6] = 7,
+                3 => bytes[7] = 4,
+                4 => bytes[14..16].copy_from_slice(&u16::MAX.to_be_bytes()),
+                _ => unreachable!(),
+            }
+            changed[reset] = TapEvent::from(bytes);
+            let capture = Capture::new(&changed, records.checkpoint()).unwrap();
+            assert!(
+                matches!(
+                    protocol.send_calls(capture, &mut workspace),
+                    Err(HistoryError::Record { .. })
+                ),
+                "reverse={reverse}, mutation={mutation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn conditional_resource_holders_keep_their_own_call_before_loan_publication() {
     type Loan = Msg<7, Endpoint<'static, 3>>;
     type Skip = Msg<8, ()>;
@@ -596,6 +850,7 @@ fn conditional_resource_holders_keep_their_own_call_before_loan_publication() {
                 DelayedPublication {
                     inbox: Cell::new(Ok(None)),
                     reader: Cell::new(None),
+                    backpressured_receiver: None,
                     // SAFETY: all ports reach this one fresh physical fixture.
                     resource: Some(unsafe { EndpointBinding::new() }),
                 },
@@ -744,6 +999,7 @@ fn an_observed_send_poll_can_end_in_a_transport_error_without_a_commit() {
                 DelayedPublication {
                     inbox: Cell::new(Err(error)),
                     reader: Cell::new(None),
+                    backpressured_receiver: None,
                     resource: None,
                 },
             )
@@ -800,6 +1056,7 @@ fn learning_a_resolved_choice_is_distinct_from_invoking_its_resolver() {
                 DelayedPublication {
                     inbox: Cell::new(Ok(None)),
                     reader: Cell::new(None),
+                    backpressured_receiver: None,
                     resource: None,
                 },
             )

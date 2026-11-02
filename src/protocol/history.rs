@@ -51,19 +51,24 @@ impl<'a> SendCall<'a> {
 }
 
 impl Protocol<'_> {
-    /// Workspace words for `send_calls`: three per capture record, one per
-    /// source scope marker and one membership bit per immutable actor decision.
+    /// Workspace words for `send_calls`: four per capture record, two per
+    /// source event, one per scope marker and one bit per actor decision.
     pub fn send_call_workspace_len(&self, capture: Capture<'_>) -> usize {
         let layout = Layout::checked(*self);
-        3 * capture.records().len() + layout.scopes.len() + layout.actor_words()
+        4 * capture.records().len()
+            + 2 * layout.sources.len()
+            + layout.scopes.len()
+            + layout.actor_words()
     }
 
     /// Recover this producer's send boundaries in first-poll order.
     ///
     /// All Endpoint records are checked against the supplied compiled source:
     /// source identity, direction, logical view, lane and possible actor. A
-    /// prepared reset must name an enclosing compiled roll. Repeated polls of
-    /// one operation retain their prepared scope. A transport publication needs
+    /// prepared reset must name an enclosing compiled roll. A changed preparation
+    /// needs an intervening observed roll reset covering that event, on the same
+    /// actor and run. The preparation is rechecked on each poll; it is not a call
+    /// identity or a visit number. A transport publication needs
     /// earlier polls and consumes them once. Local unit actions create no call.
     ///
     /// The capture may include several runs of the same compiled protocol. Its
@@ -75,9 +80,10 @@ impl Protocol<'_> {
     ///
     /// This checks the entire input before yielding any calls. Storage is
     /// derived from record and decision counts; no allocator is used. Building
-    /// links takes O((N + M) log(N + M) + A D), for N capture records, M scope
-    /// markers, A observed actors and D decisions. The returned iterator borrows
-    /// the link storage.
+    /// links takes O((N + M) log(N + M) + N log(E + 1) + A D), for N capture
+    /// records, E source events, M scope markers, A observed actors and D decisions.
+    /// The returned iterator borrows the link storage. Reset records are checked
+    /// for static membership; their dynamic eligibility still requires replay.
     pub fn send_calls<'a: 'w, 'w>(
         &self,
         capture: Capture<'a>,
@@ -96,6 +102,8 @@ impl Protocol<'_> {
         let (next, rest) = workspace[..required].split_at_mut(count);
         let (ends, rest) = rest.split_at_mut(count);
         let (order, rest) = rest.split_at_mut(count);
+        let (resets, rest) = rest.split_at_mut(count);
+        let (cover, rest) = rest.split_at_mut(2 * layout.sources.len());
         let (rolls, actors) = rest.split_at_mut(layout.scopes.len());
         let mut markers = 0;
         for index in layout.scopes.clone() {
@@ -153,12 +161,7 @@ impl Protocol<'_> {
                     }
                 }
                 let start = match active {
-                    Some(start) => {
-                        if record.arg1() != records[start].arg1() {
-                            return Err(HistoryError::Record { index });
-                        }
-                        start
-                    }
+                    Some(start) => start,
                     None => {
                         active = Some(index);
                         // Capture ordinals cannot reach usize::MAX. Reserve it
@@ -180,6 +183,66 @@ impl Protocol<'_> {
             }
         }
         self.check_call_links(capture, (next, ends), order)?;
+        // Index only observed resets. A range update records the latest reset
+        // covering each source event; it grants no Endpoint permission.
+        cover.fill(0);
+        let mut indexed = 0;
+        for (index, record) in records.iter().enumerate() {
+            if record.id() == tap::SEND_POLL
+                || (record.id() == tap::SCOPE_REENTRY && record.arg1() >> 29 == 1)
+            {
+                order[indexed] = index;
+                indexed += 1;
+            }
+        }
+        let sorted = &mut order[..indexed];
+        sorted.sort_unstable_by_key(|&index| {
+            let record = records[index];
+            (record.causal_key() >> 8, record.arg0(), index)
+        });
+        actor = None;
+        for &index in sorted.iter() {
+            let record = records[index];
+            if record.id() == tap::SEND_POLL {
+                resets[index] = last_reset(cover, records, index);
+            } else {
+                let current_actor = (record.causal_key() >> 8) as u8;
+                if actor != Some(current_actor) {
+                    layout.select_actor(self.records, current_actor, actors);
+                    actor = Some(current_actor);
+                }
+                let reset = (record.arg1() >> 16) as u16;
+                let at = rolls.partition_point(|&index| self.records[index].causal_key() < reset);
+                let Some([start, end]) = rolls.get(at..at + 2) else {
+                    return Err(HistoryError::Record { index });
+                };
+                let start = self.records[*start];
+                let end = self.records[*end];
+                let event = usize::from(record.arg1() as u16);
+                if start.causal_key() != reset
+                    || end.causal_key() != reset
+                    || event < start.arg0() as usize
+                    || event >= end.arg0() as usize
+                    || !layout.reset_actor_matches(self.records, record, actors)
+                {
+                    return Err(HistoryError::Record { index });
+                }
+                mark_reset(cover, start.arg0() as usize..end.arg0() as usize, index + 1);
+            }
+        }
+        for (start, &end) in ends.iter().enumerate() {
+            if end == 0 {
+                continue;
+            }
+            let mut before = start;
+            while let Some(after) = next[before].checked_sub(1) {
+                let after = start + after;
+                if records[before].arg1() != records[after].arg1() && resets[after] <= before + 1 {
+                    return Err(HistoryError::Record { index: after });
+                }
+                before = after;
+            }
+        }
         let next: &'w [usize] = next;
         let ends: &'w [usize] = ends;
         Ok(records
@@ -236,7 +299,7 @@ impl Protocol<'_> {
                 if poll.id() != tap::SEND_POLL
                     || poll.causal_key() != first.causal_key()
                     || poll.arg0() != first.arg0()
-                    || poll.arg1() != first.arg1()
+                    || poll.arg1() as u16 != first.arg1() as u16
                     || !mark_once(seen, index)
                 {
                     return Err(HistoryError::Record { index });
@@ -315,6 +378,43 @@ fn mark_once(seen: &mut [usize], index: usize) -> bool {
     true
 }
 
+fn mark_reset(cover: &mut [usize], range: core::ops::Range<usize>, record: usize) {
+    let events = cover.len() / 2;
+    let (mut left, mut right) = (range.start + events, range.end + events);
+    while left < right {
+        if left % 2 != 0 {
+            cover[left] = record;
+            left += 1;
+        }
+        if right % 2 != 0 {
+            right -= 1;
+            cover[right] = record;
+        }
+        left /= 2;
+        right /= 2;
+    }
+}
+
+fn last_reset(cover: &[usize], records: &[TapEvent], index: usize) -> usize {
+    let query = records[index];
+    let mut at = cover.len() / 2 + usize::from(query.arg1() as u16);
+    let mut found = 0;
+    while at != 0 {
+        if let Some(reset) = cover[at].checked_sub(1) {
+            let candidate = records[reset];
+            // Earlier actor/run groups may retain nodes. Their observations
+            // never justify a change in this group's prepared send.
+            if candidate.causal_key() >> 8 == query.causal_key() >> 8
+                && candidate.arg0() == query.arg0()
+            {
+                found = found.max(reset + 1);
+            }
+        }
+        at /= 2;
+    }
+    found
+}
+
 fn is_operation(record: TapEvent) -> bool {
     matches!(
         record.id(),
@@ -337,6 +437,31 @@ fn key(record: TapEvent) -> (u8, u32, u8, u16) {
 }
 
 impl Layout {
+    fn reset_actor_matches(
+        &self,
+        snapshot: &[TapEvent],
+        reset: TapEvent,
+        candidates: &[usize],
+    ) -> bool {
+        let event = usize::from(reset.arg1() as u16);
+        let source = snapshot[self.sources.start + event];
+        let view = reset.causal_key() as u8;
+        let from = (source.arg0() >> 24) as u8;
+        let to = (source.arg0() >> 16) as u8;
+        let reference = if self.bindings.is_empty() {
+            u32::from(view)
+        } else {
+            let binding = snapshot[self.bindings.start + event];
+            if view == from {
+                binding.arg0()
+            } else {
+                binding.arg1()
+            }
+        };
+        (view == from || view == to)
+            && contains_actor(reference, reset.causal_key() >> 8, candidates)
+    }
+
     fn checked(protocol: Protocol<'_>) -> Self {
         match Self::read(protocol.records) {
             Ok(layout) => layout,
@@ -498,5 +623,61 @@ mod tests {
             protocol.check_call_links(capture, (&[0; 4], &[3, 4, 0, 0]), &mut work),
             Err(HistoryError::Record { index: 1 })
         ));
+    }
+
+    #[test]
+    fn reset_range_index_matches_linear_updates_across_producer_groups() {
+        // Synthetic intervals exercise the index itself. Actual compiled scope
+        // and Endpoint records are checked by the integration tests.
+        for events in 1..=7 {
+            let mut records = Vec::new();
+            for (actor, sid) in [(1u8, 2u32), (1, 1), (0, 2), (0, 1)] {
+                for start in 0..events {
+                    for end in start + 1..=events {
+                        for (id, detail) in core::iter::once((
+                            tap::SCOPE_REENTRY,
+                            ((start as u32) << 16) | end as u32,
+                        ))
+                        .chain((0..events).map(|event| (tap::SEND_POLL, event as u32)))
+                        {
+                            let mut bytes = [0; 16];
+                            bytes[..4].copy_from_slice(&(records.len() as u32).to_be_bytes());
+                            bytes[4..6].copy_from_slice(&id.to_be_bytes());
+                            bytes[6] = actor;
+                            bytes[8..12].copy_from_slice(&sid.to_be_bytes());
+                            bytes[12..16].copy_from_slice(&detail.to_be_bytes());
+                            records.push(TapEvent::from(bytes));
+                        }
+                    }
+                }
+            }
+            let mut sorted: Vec<_> = (0..records.len()).collect();
+            sorted.sort_unstable_by_key(|&index| {
+                let record = records[index];
+                (record.causal_key() >> 8, record.arg0(), index)
+            });
+            let mut cover = vec![0; 2 * events];
+            let mut expected = vec![0; events];
+            let mut group = None;
+            for index in sorted {
+                let record = records[index];
+                let current = (record.causal_key() >> 8, record.arg0());
+                if group != Some(current) {
+                    expected.fill(0);
+                    group = Some(current);
+                }
+                if record.id() == tap::SCOPE_REENTRY {
+                    let start = (record.arg1() >> 16) as usize;
+                    let end = usize::from(record.arg1() as u16);
+                    mark_reset(&mut cover, start..end, index + 1);
+                    expected[start..end].fill(index + 1);
+                } else {
+                    assert_eq!(
+                        last_reset(&cover, &records, index),
+                        expected[record.arg1() as usize]
+                    );
+                }
+            }
+        }
     }
 }

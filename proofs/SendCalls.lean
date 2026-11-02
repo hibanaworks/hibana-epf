@@ -72,4 +72,49 @@ theorem word_and_bit_coordinates_are_injective
 #print axioms an_already_seen_publication_position_is_rejected
 #print axioms word_and_bit_coordinates_are_injective
 
+/-- An observed roll-reset claim; validation must additionally establish its
+membership in the compiled source. This is history, not execution authority. -/
+structure ResetClaim where
+  actor : Nat
+  session : Nat
+  start : Nat
+  stop : Nat
+  ordinal : Nat
+
+def resetBetween (resets : List ResetClaim) (actor session source before after : Nat) : Bool :=
+  resets.any fun reset => decide (
+    reset.actor = actor ∧ reset.session = session ∧
+    reset.start ≤ source ∧ source < reset.stop ∧
+    before < reset.ordinal ∧ reset.ordinal < after)
+
+theorem a_changed_poll_requires_its_reset
+    (checked : resetBetween resets actor session source before after = true) :
+    ∃ reset ∈ resets, reset.actor = actor ∧ reset.session = session ∧
+      reset.start ≤ source ∧ source < reset.stop ∧
+      before < reset.ordinal ∧ reset.ordinal < after := by
+  obtain ⟨reset, present, checked⟩ := List.any_eq_true.mp checked
+  exact ⟨reset, present, of_decide_eq_true checked⟩
+
+theorem unrelated_resets_cannot_explain_a_change
+    (unrelated : ∀ reset ∈ resets,
+      reset.actor ≠ actor ∨ reset.session ≠ session ∨ source < reset.start ∨
+      reset.stop ≤ source ∨ reset.ordinal ≤ before ∨ after ≤ reset.ordinal) :
+    resetBetween resets actor session source before after = false := by
+  cases checked : resetBetween resets actor session source before after with
+  | false => rfl
+  | true =>
+    obtain ⟨reset, present, sameActor, sameSession, start, stop, first, last⟩ :=
+      a_changed_poll_requires_its_reset checked
+    have outside := unrelated reset present
+    rcases outside with otherActor | otherSession | beforeStart | afterStop | earlier | later
+    · exact False.elim (otherActor sameActor)
+    · exact False.elim (otherSession sameSession)
+    · omega
+    · omega
+    · omega
+    · omega
+
+#print axioms a_changed_poll_requires_its_reset
+#print axioms unrelated_resets_cannot_explain_a_change
+
 end Hibana.Epf.SendCalls

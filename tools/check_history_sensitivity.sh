@@ -7,7 +7,7 @@ mkdir -p "$out"
 cargo +stable test --locked --test capture > "$out/positive.log" 2>&1
 cargo +stable test --locked --lib --features std protocol::history::tests \
   > "$out/positive-links.log" 2>&1
-for mutation in Length Ordinals CallOverlap CallCoverage; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -29,6 +29,14 @@ for mutation in Length Ordinals CallOverlap CallCoverage; do
       perl -0pi -e 's/if required != present \{/if wire_publication \&\& required != present {/g == 1 or die "missing poll coverage check\n"' \
         "$source/src/protocol/history.rs"
       ;;
+    CallPreparation)
+      perl -0pi -e 's/poll\.arg1\(\) as u16 != first\.arg1\(\) as u16/poll.arg1() != first.arg1()/g == 1 or die "missing per-poll preparation check\n"' \
+        "$source/src/protocol/history.rs"
+      ;;
+    ResetEvidence)
+      perl -0pi -e 's/resets\[after\] <= before \+ 1/false/g == 1 or die "missing reset correspondence check\n"' \
+        "$source/src/protocol/history.rs"
+      ;;
   esac
   git -C "$source" diff --binary > "$out/$mutation-mutation.patch"
   status=0
@@ -43,22 +51,26 @@ for mutation in Length Ordinals CallOverlap CallCoverage; do
       CallCoverage) cargo +stable test --locked --lib --features std \
         protocol::history::tests::link_checker_rejects_lost_polls_cycles_and_reused_publications \
         -- --exact ;;
+      CallPreparation|ResetEvidence) cargo +stable test --locked --test endpoint_history \
+        pending_siblings_can_share_the_reset_published_by_the_first_completed_send \
+        -- --exact ;;
     esac
   ) > "$out/$mutation.log" 2>&1 || status=$?
   test "$status" = 101
   case "$mutation" in
     Length|Ordinals) grep -Fq 'test result: FAILED. 3 passed; 1 failed;' "$out/$mutation.log" ;;
-    CallOverlap|CallCoverage) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
+    CallOverlap|CallCoverage|CallPreparation|ResetEvidence) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
   esac
   case "$mutation" in
     Length) name=deleting_any_record_including_the_last_is_incomplete ;;
     Ordinals) name=duplicate_reordered_and_saturated_ordinals_cannot_replace_missing_records ;;
     CallOverlap) name=protocol::history::tests::link_checker_rejects_overlapping_calls_with_complete_unique_coverage ;;
     CallCoverage) name=protocol::history::tests::link_checker_rejects_lost_polls_cycles_and_reused_publications ;;
+    CallPreparation|ResetEvidence) name=pending_siblings_can_share_the_reset_published_by_the_first_completed_send ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"
   find "$source/target" -type f -perm -100 -exec shasum -a 256 -- {} + > "$out/$mutation-binaries.sha256"
   printf 'mutation=%s\nexit=%s\n' "$mutation" "$status" > "$out/$mutation-result.txt"
   rm -r -- "$source"
 done
-echo "History sensitivity: omitted length, ordinal, call interval and poll coverage checks fail their regression tests"
+echo "History sensitivity: omitted prefix/link/reset checks and restored preparation immutability fail their regressions"

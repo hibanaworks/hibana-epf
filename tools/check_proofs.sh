@@ -37,8 +37,8 @@ bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/lean.log
 lean proofs/Capture.lean 2>&1 | tee "$out/capture-lean.log"
 bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/capture-lean.log" 4
 lean proofs/SendCalls.lean 2>&1 | tee "$out/send-calls-lean.log"
-bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/send-calls-lean.log" 5
+bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/send-calls-lean.log" 7
 bash "$core/.github/scripts/check_smt2.sh" "$PWD/proofs/SendBits.smt2" | tee "$out/send-bits-smt.log"
 shasum -a 256 --check "$out/source.sha256" > "$out/source-check.log"
 (cd "$core" && shasum -a 256 --check "$out/core-source.sha256") > "$out/core-source-check.log"
-echo "Observation proofs: ten source boundaries, four complete-prefix and five record-position claims; 32/64-bit masks checked"
+echo "Observation proofs: ten source boundaries, four complete-prefix, five record-position and two reset-correspondence claims; 32/64-bit masks checked"

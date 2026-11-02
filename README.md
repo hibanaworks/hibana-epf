@@ -221,6 +221,16 @@ Repeated polls of one pending future form one call. A later roll execution of
 the same source event forms another. Failed or unfinished calls retain no
 publication, and a receive can occur before publication.
 
+Preparation belongs to each poll. If another view commits a roll reentry while
+a send is pending, the next poll can require a different reset. EPF requires an
+intervening reset record on the same actor and session, covering that source
+event. Resets on another actor, another session or another source interval do
+not justify the change. This checks observed correspondence, not whether the
+reset itself was enabled. A range index checks these intervals without scanning
+each pending call's whole history. Workspace uses `4N + 2E + M + ceil(D / W)`
+words for N capture records, E source events, M scope markers, D immutable actor
+decisions and machine word width W; it is caller-owned audit scratch space.
+
 Before yielding calls, the reader checks source identity, logical view, direction,
 lane, possible actor and enclosing prepared roll. It then checks the generated
 links separately: every poll occurs once, every transport publication occurs
@@ -235,10 +245,16 @@ Route/roll replay and cross-producer delivery remain unfinished.
 Actual Endpoint tests include interleaved parallel calls finishing in reverse,
 two rolled executions of one source event, both resolved arms, transport faults
 and conditional resource holders using the resource before loan publication.
-Nine record mutations and eight malformed-link cases exercise rejection.
-Two defect controls independently remove interval or poll-coverage checks and
-must fail their named regressions. `SendCalls.lean` proves five general facts
-about successful record-position marking and word/bit coordinates; the SMT
+Pending continuations and both completion orders of rolled parallel views are
+also driven through actual Endpoint operations. Nineteen record mutations and
+eight malformed-link cases exercise rejection. The range index is compared
+with direct interval updates for odd and even event counts and interleaved
+actor/session groups. Four call-link defect controls remove interval,
+poll-coverage or reset-evidence checks or restore the invalid preparation-immutability condition;
+each must fail its named regression. `SendCalls.lean` proves five general facts
+about successful record-position marking and word/bit coordinates, plus two
+claims requiring a reset from the same actor/session, inside the poll interval
+and covering the source event. The SMT
 checks cover 32- and 64-bit masks with a truncated-index negative control.
 These models specify those checks, not a refinement proof of the whole Rust
 link constructor or dynamic source replay.

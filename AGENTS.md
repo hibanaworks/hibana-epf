@@ -29,6 +29,8 @@ sender publication can follow receipt and later transfers.
 `SEND_POLL` records admission before an actual transport poll, including polls
 that return Pending or an error. Repeated polls can belong to one operation.
 Do not convert these records into frame acceptances, commits or roll visits.
+The prepared reset can change between polls after another view commits a
+reentry. Preserve each poll's preparation; do not make it part of call identity.
 
 Require evidence that uniquely connects those boundaries. A missing prefix,
 ring overwrite, missing final record, ambiguous occurrence, exhausted counter
