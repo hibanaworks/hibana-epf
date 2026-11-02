@@ -271,6 +271,37 @@ source-execution check must cover those obligations before these stages can be
 combined into the final audit entry point. A witnessed order establishes
 compatibility with that order, not a unique distributed execution time.
 
+`Protocol::unfolding` checks a finite source-unfolding witness against the
+compiled source. Its postorder steps preserve sequence, parallel composition,
+both choice arms, repeated and independently unfolded rolls, and resumption
+before, alongside or after the continuation. Source regions are derived from
+the compiled root. A shared proof step must refer to the same source region;
+an insertion must name an actual subtree. No catalogue of fixed visit counts
+limits the witness. The checker retains five words per proof step and reads
+expanded origins and source order without constructing an expanded tree.
+
+`Unfolded::select` checks a choice for each active expanded route and derives
+physical actors from the original resource bindings and selected transfers.
+It compares them with the compiled conditional bindings under those same
+choices. Separate visits can choose different arms. Parallel transfer/use
+conflicts, overlapping physical actors in independent visits, unselected
+resumption anchors and changed entry owners are rejected. Temporary storage
+is derived from expanded event, initial binding and compiled choice counts.
+
+`SourcePath::check_word` checks every prefix of a proposed source word.
+Acceptance, sender publication, receiver commit and a local action are
+different points. It checks source order, uniqueness, wire prerequisites and
+outgoing-continuation prerequisites activated by a committed resumed body.
+An incoming continuation already accepted by its sender does not acquire a
+new outgoing prerequisite. Reusing a proof DAG in two visits does not share
+their dynamic entry history.
+
+These source checks do not yet connect that word to captured observations.
+In particular, a supplied acceptance point is not evidence that a transport
+accepted a frame, and a `SEND_POLL` cannot be substituted for acceptance.
+The capture-to-word correspondence and its formal validation remain unfinished.
+The existing Lean claims below do not prove these new Rust source checkers.
+
 `Protocol::deliveries(captures, workspace)` connects successful receives across
 producer captures to send calls. Within each session/source stream it uses the
 transport's affine FIFO contract, with one producer per side. Several producers

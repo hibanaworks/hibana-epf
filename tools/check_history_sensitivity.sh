@@ -9,7 +9,8 @@ cargo +stable test --locked --lib --features std protocol::history::tests \
   > "$out/positive-links.log" 2>&1
 cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage; do
+cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -55,6 +56,18 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
       perl -0pi -e 's/receives\.get\(sends\.len\(\)\)/receives.get(receives.len())/g == 1 or die "missing receive coverage check\n"' \
         "$source/src/protocol/delivery.rs"
       ;;
+    SourceOrder)
+      perl -0pi -e 's/source\.before\(event, point\.event\(\)\)/false/g == 1 or die "missing source-order check\n"' \
+        "$source/src/protocol/word.rs"
+      ;;
+    ResumptionAdmission)
+      perl -0pi -e 's/let resumption = matches!\(point, SourcePoint::Accepted\(_\)\)/let resumption = false/g == 1 or die "missing resumption prerequisite\n"' \
+        "$source/src/protocol/word.rs"
+      ;;
+    InvocationContext)
+      perl -0pi -e 's/InsertPart::Earlier\(event\)/if earlier == next { InsertPart::Resumed(event) } else { InsertPart::Earlier(event) }/g == 1 or die "missing constructor-child identity\n"' \
+        "$source/src/protocol/unfolding.rs"
+      ;;
   esac
   git -C "$source" diff --binary > "$out/$mutation-mutation.patch"
   status=0
@@ -76,12 +89,18 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         protocol::delivery::tests::the_order_certificate_must_preserve_both_producer_and_delivery_edges -- --exact ;;
       DeliveryAmbiguity|DeliveryCoverage) cargo +stable test --locked --lib --features std \
         protocol::delivery::tests::missing_reused_or_unordered_producer_evidence_cannot_supply_a_receive -- --exact ;;
+      SourceOrder) cargo +stable test --locked --test source_word \
+        later_publication_cannot_hide_an_acceptance_before_its_source_predecessor -- --exact ;;
+      ResumptionAdmission) cargo +stable test --locked --test source_word \
+        only_a_committed_resumed_body_delays_the_outgoing_continuation -- --exact ;;
+      InvocationContext) cargo +stable test --locked --test source_word \
+        reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations -- --exact ;;
     esac
   ) > "$out/$mutation.log" 2>&1 || status=$?
   test "$status" = 101
   case "$mutation" in
     Length|Ordinals) grep -Fq 'test result: FAILED. 3 passed; 1 failed;' "$out/$mutation.log" ;;
-    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
+    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
   esac
   case "$mutation" in
     Length) name=deleting_any_record_including_the_last_is_incomplete ;;
@@ -91,10 +110,13 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     CallPreparation|ResetEvidence) name=pending_siblings_can_share_the_reset_published_by_the_first_completed_send ;;
     DeliveryProducerOrder|DeliveryEdgeOrder) name=protocol::delivery::tests::the_order_certificate_must_preserve_both_producer_and_delivery_edges ;;
     DeliveryAmbiguity|DeliveryCoverage) name=protocol::delivery::tests::missing_reused_or_unordered_producer_evidence_cannot_supply_a_receive ;;
+    SourceOrder) name=later_publication_cannot_hide_an_acceptance_before_its_source_predecessor ;;
+    ResumptionAdmission) name=only_a_committed_resumed_body_delays_the_outgoing_continuation ;;
+    InvocationContext) name=reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"
   find "$source/target" -type f -perm -100 -exec shasum -a 256 -- {} + > "$out/$mutation-binaries.sha256"
   printf 'mutation=%s\nexit=%s\n' "$mutation" "$status" > "$out/$mutation-result.txt"
   rm -r -- "$source"
 done
-echo "History sensitivity: ten prefix, call, reset and delivery defects fail their regressions"
+echo "History sensitivity: thirteen prefix, call, delivery and source-execution defects fail their regressions"
