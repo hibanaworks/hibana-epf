@@ -74,7 +74,10 @@ pub(crate) fn seed(
                 Some(append(Unfold::Source, &mut output, steps)?)
             }
             (0, Head::Message) => Some(append(Unfold::Source, &mut output, steps)?),
-            (0, Head::Sequence(children) | Head::Parallel(children) | Head::Choice(children)) => {
+            (
+                0,
+                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(_, children),
+            ) => {
                 frames[5 * depth + 4] = 1;
                 let child = depth + 1;
                 if child >= capacity {
@@ -90,7 +93,10 @@ pub(crate) fn seed(
                 depth = child;
                 continue;
             }
-            (1, Head::Sequence(children) | Head::Parallel(children) | Head::Choice(children)) => {
+            (
+                1,
+                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(_, children),
+            ) => {
                 first[depth] = returned.take()?;
                 frames[5 * depth + 4] = 2;
                 let child = depth + 1;
@@ -107,13 +113,13 @@ pub(crate) fn seed(
                 depth = child;
                 continue;
             }
-            (2, Head::Sequence(_) | Head::Parallel(_) | Head::Choice(_)) => {
+            (2, Head::Sequence(_) | Head::Parallel(_) | Head::Choice(_, _)) => {
                 let children = [first[depth], returned.take()?];
                 Some(append(
                     match head {
                         Head::Sequence(_) => Unfold::Sequence(children),
                         Head::Parallel(_) => Unfold::Parallel(children),
-                        Head::Choice(_) => Unfold::Choice(children),
+                        Head::Choice(_, _) => Unfold::Choice(children),
                         Head::Message | Head::Roll(_) => unreachable!(),
                     },
                     &mut output,
@@ -315,7 +321,7 @@ fn configuration(
             }
             None
         }
-        Head::Parallel(sources) | Head::Choice(sources) => {
+        Head::Parallel(sources) | Head::Choice(_, sources) => {
             if rank >= partitions {
                 return None;
             }

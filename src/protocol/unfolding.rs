@@ -89,7 +89,7 @@ enum Head {
     Message,
     Sequence([Region; 2]),
     Parallel([Region; 2]),
-    Choice([Region; 2]),
+    Choice(u16, [Region; 2]),
     Roll(Region),
 }
 
@@ -165,7 +165,7 @@ impl<'p> Protocol<'p> {
                 (Unfold::Source, _) => {}
                 (Unfold::Sequence(children), Head::Sequence(sources))
                 | (Unfold::Parallel(children), Head::Parallel(sources))
-                | (Unfold::Choice(children), Head::Choice(sources)) => {
+                | (Unfold::Choice(children), Head::Choice(_, sources)) => {
                     assign(children[0], sources[0])?;
                     assign(children[1], sources[1])?;
                 }
@@ -1043,7 +1043,7 @@ impl Layout {
                         },
                     ];
                     Some(if row.causal_key() >> 13 == 0 {
-                        Head::Choice(children)
+                        Head::Choice(row.causal_key(), children)
                     } else {
                         Head::Parallel(children)
                     })
@@ -1076,7 +1076,6 @@ impl Layout {
         mut event: usize,
     ) -> Option<(NodeKind, bool)> {
         loop {
-            region = self.canonical(records, region);
             if span[0] >= span[1] || span[1] > region.end - region.start {
                 return None;
             }
@@ -1084,14 +1083,12 @@ impl Layout {
             match head {
                 Head::Roll(body) => region = body,
                 Head::Message => return (span == [0, 1]).then_some((NodeKind::Message, false)),
-                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(children) => {
+                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(_, children) => {
                     if span == [0, region.end - region.start] {
                         let kind = match head {
                             Head::Sequence(_) => NodeKind::Sequence,
                             Head::Parallel(_) => NodeKind::Parallel,
-                            Head::Choice(_) => NodeKind::Choice(
-                                records[self.scopes.start + region.first].causal_key(),
-                            ),
+                            Head::Choice(key, _) => NodeKind::Choice(key),
                             Head::Message | Head::Roll(_) => unreachable!(),
                         };
                         return Some((kind, event < children[0].end - children[0].start));
@@ -1120,14 +1117,13 @@ impl Layout {
         mut second: usize,
     ) -> bool {
         loop {
-            region = self.canonical(records, region);
             let Some(head) = self.head(records, region) else {
                 return false;
             };
             match head {
                 Head::Roll(body) => region = body,
                 Head::Message => return false,
-                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(children) => {
+                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(_, children) => {
                     let split = children[0].end - children[0].start;
                     if second < split {
                         region = children[0];
