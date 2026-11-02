@@ -117,4 +117,50 @@ theorem unrelated_resets_cannot_explain_a_change
 #print axioms a_changed_poll_requires_its_reset
 #print axioms unrelated_resets_cannot_explain_a_change
 
+/-- Exact fixed-width masks, for every word width, including Rust's 32- and
+64-bit targets. The library definition is `1 <<< index`. -/
+theorem mask_is_nonzero (inside : index < width) :
+    BitVec.twoPow width index ≠ 0 := by
+  intro zero
+  have bit := congrArg (fun value : BitVec width => value.getLsbD index) zero
+  simp [inside] at bit
+
+theorem marking_sets_the_mask (value mask : BitVec width) :
+    (value ||| mask) &&& mask = mask := by
+  apply BitVec.eq_of_getLsbD_eq
+  intro bit _
+  simp only [BitVec.getLsbD_and, BitVec.getLsbD_or]
+  cases value.getLsbD bit <;> cases mask.getLsbD bit <;> rfl
+
+theorem marking_keeps_other_bits (value mask : BitVec width) (bit : Nat)
+    (unmarked : mask.getLsbD bit = false) :
+    (value ||| mask).getLsbD bit = value.getLsbD bit := by
+  simp only [BitVec.getLsbD_or, unmarked, Bool.or_false]
+
+theorem masks_are_injective (firstInside : first < width)
+    (same : BitVec.twoPow width first = BitVec.twoPow width second) : first = second := by
+  have bit := congrArg (fun value : BitVec width => value.getLsbD first) same
+  simpa [BitVec.getLsbD_twoPow, firstInside, eq_comm] using bit.symm
+
+theorem different_masks_are_disjoint (different : first ≠ second) :
+    BitVec.twoPow width first &&& BitVec.twoPow width second = 0 := by
+  apply BitVec.eq_of_getLsbD_eq
+  intro bit _
+  by_cases same : first = bit
+  · subst bit
+    simp [BitVec.getLsbD_twoPow, Ne.symm different]
+  · simp [BitVec.getLsbD_twoPow, same]
+
+theorem truncating_an_index_loses_its_bit (wide : 8 < width) :
+    BitVec.twoPow width (8 % 8) &&& BitVec.twoPow width 8 = 0 ∧
+      BitVec.twoPow width 8 ≠ 0 := by
+  exact ⟨different_masks_are_disjoint (by decide), mask_is_nonzero wide⟩
+
+#print axioms mask_is_nonzero
+#print axioms marking_sets_the_mask
+#print axioms marking_keeps_other_bits
+#print axioms masks_are_injective
+#print axioms different_masks_are_disjoint
+#print axioms truncating_an_index_loses_its_bit
+
 end Hibana.Epf.SendCalls

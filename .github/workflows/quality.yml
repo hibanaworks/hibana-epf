@@ -50,8 +50,6 @@ jobs:
           "$epf_elan_tmp/elan-init" -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           "$HOME/.elan/bin/elan" toolchain install "$toolchain"
-      - name: Install the bit-vector checker
-        run: brew install z3
       - name: Check execution, no_std, Miri, and source observation proofs
         run: sh tools/check.sh
       - uses: actions/upload-artifact@v7

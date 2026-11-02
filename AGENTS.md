@@ -51,6 +51,12 @@ repeated message contracts. Check both rejection of illegal histories and
 acceptance of legal concurrent histories, including delayed parent reentry.
 Keep conditional model results separate from completed consumer qualification.
 
+Keep one proof source for each property. Prefer kernel-checked Lean claims and
+actual Endpoint/EPF conformance over a second handwritten SMT model. Retain Z3
+only for an obligation those checks do not cover, and state that obligation.
+Generate any necessary SMT input from its checked specification during the
+check; do not commit generated solver inputs or results.
+
 Preserve unrelated dirty files. Replace obsolete architecture when necessary,
 without compatibility modes, speculative wrappers or silent fallbacks. Do not
 claim a diagnostic VM provides dynamic protocol replay. Qualify the selected

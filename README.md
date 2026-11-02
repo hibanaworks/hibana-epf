@@ -277,8 +277,9 @@ poll-coverage or reset-evidence checks or restore the invalid preparation-immuta
 each must fail its named regression. `SendCalls.lean` proves five general facts
 about successful record-position marking and word/bit coordinates, plus two
 claims requiring a reset from the same actor/session, inside the poll interval
-and covering the source event. The SMT
-checks cover 32- and 64-bit masks with a truncated-index negative control.
+and covering the source event. Six exact `BitVec` claims prove mask presence,
+preservation, distinctness and a truncated-index counterexample for every word
+width, including 32 and 64 bits.
 These models specify those checks, not a refinement proof of the whole Rust
 link constructor or dynamic source replay.
 
@@ -292,4 +293,4 @@ The checks include actual Endpoint choices and roll reentry, live pipe output
 before EOF, partial-record rejection, image replacement, resolver behavior,
 Clippy, no_std builds and strict-provenance Miri. They require Rust stable, the
 Miri toolchain recorded in `tools/miri-toolchain`, `thumbv6m-none-eabi`, Lean
-selected by the core dependency, and Z3.
+selected by the core dependency.

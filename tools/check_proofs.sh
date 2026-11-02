@@ -17,10 +17,10 @@ git rev-parse HEAD > "$out/epf-revision.txt"
 git diff --binary HEAD > "$out/epf-source.patch"
 printf '%s\n' "$selected" > "$out/core-revision.txt"
 shasum -a 256 proofs/CommitObservations.lean proofs/Capture.lean proofs/SendCalls.lean \
-  proofs/DeliveryOrder.lean proofs/SendBits.smt2 tools/check_proofs.sh > "$out/source.sha256"
+  proofs/DeliveryOrder.lean tools/check_proofs.sh > "$out/source.sha256"
 cp proofs/CommitObservations.lean "$out/CommitObservations.lean"
 cp proofs/Capture.lean "$out/Capture.lean"
-cp proofs/SendCalls.lean proofs/SendBits.smt2 "$out/"
+cp proofs/SendCalls.lean "$out/"
 cp proofs/DeliveryOrder.lean "$out/"
 (
   cd "$core"
@@ -29,7 +29,6 @@ cp proofs/DeliveryOrder.lean "$out/"
 export CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
 export ELAN_TOOLCHAIN="$(cat "$core/proofs/lean/lean-toolchain")"
 lean --version > "$out/lean-version.txt"
-z3 --version > "$out/z3-version.txt"
 bash "$core/.github/scripts/lib/lean_audit_tool.sh" build-serial \
   "$core/proofs/lean" --native Hibana.SourceOccurrenceTrace
 LEAN_PATH="$core/proofs/lean/.lake/build/lib/lean" \
@@ -38,10 +37,9 @@ bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/lean.log
 lean proofs/Capture.lean 2>&1 | tee "$out/capture-lean.log"
 bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/capture-lean.log" 4
 lean proofs/SendCalls.lean 2>&1 | tee "$out/send-calls-lean.log"
-bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/send-calls-lean.log" 7
+bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/send-calls-lean.log" 13
 lean proofs/DeliveryOrder.lean 2>&1 | tee "$out/delivery-order-lean.log"
 bash "$core/.github/scripts/lib/supplemental_proofs_tool.sh" lean "$out/delivery-order-lean.log" 5
-bash "$core/.github/scripts/check_smt2.sh" "$PWD/proofs/SendBits.smt2" | tee "$out/send-bits-smt.log"
 shasum -a 256 --check "$out/source.sha256" > "$out/source-check.log"
 (cd "$core" && shasum -a 256 --check "$out/core-source.sha256") > "$out/core-source-check.log"
-echo "Observation proofs: ten source boundaries, four complete-prefix, seven send/reset and five causal-order claims; 32/64-bit masks checked"
+echo "Observation proofs: ten source boundaries, four complete-prefix, thirteen send/reset/word and five causal-order claims"
