@@ -253,36 +253,3 @@ fn selected(record: TapEvent, key: u16, bounds: &Scope) -> Option<u8> {
     let event = u32::from(record.arg1() as u16);
     (bounds.start <= event && event < bounds.end).then(|| u8::from(event >= bounds.split.unwrap()))
 }
-
-impl Layout {
-    fn scope(&self, records: &[TapEvent], key: u16) -> Option<Scope> {
-        let mut first = None;
-        let mut split = None;
-        let mut last = None;
-        for index in self.scopes.clone() {
-            let row = records[index];
-            if row.causal_key() != key {
-                continue;
-            }
-            // Route scopes record enter/exit for each arm. Their second
-            // marker is the left arm's exit, hence the branch boundary.
-            if key >> 13 == 0 && first.is_some() && split.is_none() {
-                split = Some(row.arg0());
-            }
-            first.get_or_insert(index);
-            if row.arg1() & 3 == 1 {
-                split = Some(row.arg0());
-            }
-            last = Some(index);
-        }
-        let first = first?;
-        let last = last?;
-        Some(Scope {
-            start: records[first].arg0(),
-            split,
-            end: records[last].arg0(),
-            first,
-            last,
-        })
-    }
-}

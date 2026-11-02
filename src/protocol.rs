@@ -6,10 +6,12 @@ mod custody;
 mod delivery;
 mod history;
 mod routes;
+mod unfolding;
 pub use custody::CustodyError;
 pub use delivery::{Delivery, DeliveryError, RecordId};
 pub use history::{HistoryError, SendCall};
 pub use routes::RouteHistoryError;
+pub use unfolding::{Unfold, Unfolded, UnfoldingError};
 
 /// A complete, structurally checked snapshot from `tap::projected`.
 ///
@@ -507,5 +509,38 @@ fn contains_actor(reference: u32, actor: u16, candidates: &[usize]) -> bool {
     } else {
         let index = reference as usize - 256;
         candidates[index / usize::BITS as usize] & (1 << (index % usize::BITS as usize)) != 0
+    }
+}
+
+impl Layout {
+    fn scope(&self, records: &[TapEvent], key: u16) -> Option<Scope> {
+        let mut first = None;
+        let mut split = None;
+        let mut last = None;
+        for index in self.scopes.clone() {
+            let row = records[index];
+            if row.causal_key() != key {
+                continue;
+            }
+            // Route scopes record enter/exit for each arm. Their second
+            // marker is the left arm's exit, hence the branch boundary.
+            if key >> 13 == 0 && first.is_some() && split.is_none() {
+                split = Some(row.arg0());
+            }
+            first.get_or_insert(index);
+            if row.arg1() & 3 == 1 {
+                split = Some(row.arg0());
+            }
+            last = Some(index);
+        }
+        let first = first?;
+        let last = last?;
+        Some(Scope {
+            start: records[first].arg0(),
+            split,
+            end: records[last].arg0(),
+            first,
+            last,
+        })
     }
 }
