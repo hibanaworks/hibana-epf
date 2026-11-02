@@ -169,11 +169,16 @@ impl Protocol<'_> {
                     }
                 }
             }
-            for choice in &self.records[layout.choices.clone()] {
-                let key = choice.causal_key();
-                let bounds = layout
-                    .scope(self.records, key)
-                    .expect("checked choice has a source scope");
+        }
+        // The compiled bounds do not change with the observed record. Resolve
+        // them once per choice while checking the same record/choice pairs.
+        for choice in &self.records[layout.choices.clone()] {
+            let key = choice.causal_key();
+            let bounds = layout
+                .scope(self.records, key)
+                .expect("checked choice has a source scope");
+            for (position, &id) in order.iter().enumerate() {
+                let current = observed(id);
                 let Some(arm) = selected(current, key, &bounds) else {
                     continue;
                 };
