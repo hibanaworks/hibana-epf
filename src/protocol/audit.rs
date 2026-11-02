@@ -18,11 +18,33 @@ pub struct AuditStorage<'a> {
 }
 
 /// A checked interpretation, borrowing its source and all evidence outputs.
+///
+/// It can only be constructed by the checker, rather than by pairing a valid
+/// path with an unchecked proposed execution.
+///
+/// ```compile_fail
+/// use hibana_epf::{Audit, ExecutionWitness, SourcePath};
+/// fn forge<'p, 'a>(path: SourcePath<'p, 'a, 'a>, execution: ExecutionWitness<'a>)
+///     -> Audit<'p, 'a>
+/// {
+///     Audit { path, execution }
+/// }
+/// ```
 pub struct Audit<'p, 'a> {
+    path: SourcePath<'p, 'a, 'a>,
+    execution: ExecutionWitness<'a>,
+}
+
+impl<'p, 'a> Audit<'p, 'a> {
     /// Source-derived path, including each selected dynamic route occurrence.
-    pub path: SourcePath<'p, 'a, 'a>,
+    pub fn path(&self) -> SourcePath<'p, 'a, 'a> {
+        self.path
+    }
+
     /// Checked producer order, source attribution and acceptance intervals.
-    pub execution: ExecutionWitness<'a>,
+    pub fn execution(&self) -> &ExecutionWitness<'a> {
+        &self.execution
+    }
 }
 
 /// Failure to construct a certificate; exhaustion never means an illegal global.

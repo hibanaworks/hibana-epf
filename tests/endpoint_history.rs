@@ -561,13 +561,16 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
                 &mut workspace,
             )
             .unwrap();
-        assert_eq!(audit.execution.acceptances.len(), 4);
-        for (position, id) in audit.execution.order.iter().enumerate() {
+        assert_eq!(audit.execution().acceptances.len(), 4);
+        for (position, id) in audit.execution().order.iter().enumerate() {
             let expected = witnessed
                 .iter()
                 .position(|candidate| candidate == id)
                 .unwrap();
-            assert_eq!(audit.execution.occurrences[position], occurrences[expected]);
+            assert_eq!(
+                audit.execution().occurrences[position],
+                occurrences[expected]
+            );
         }
         let aliased: Vec<_> = occurrences
             .iter()

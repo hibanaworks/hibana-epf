@@ -74,7 +74,7 @@ fn check(
         },
         &mut scratch,
     )?;
-    Ok(audit.path.unfolding().event_count())
+    Ok(audit.path().unfolding().event_count())
 }
 
 #[test]

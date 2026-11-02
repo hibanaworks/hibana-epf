@@ -144,14 +144,14 @@ fn audit(args: Vec<String>) -> Result<(), String> {
             &mut workspace,
         )
         .map_err(|e| format!("no dynamic audit certificate: {e:?}"))?;
-    let source = checked.path.unfolding();
+    let source = checked.path().unfolding();
     let mut output = io::BufWriter::new(io::stdout().lock());
     write!(output, "{{\"kind\":\"source_interpretation\",\"session\":{session},\"expanded_events\":{},\"order\":[", source.event_count()).map_err(|e| e.to_string())?;
     for (index, (id, occurrence)) in checked
-        .execution
+        .execution()
         .order
         .iter()
-        .zip(checked.execution.occurrences)
+        .zip(checked.execution().occurrences)
         .enumerate()
     {
         if index != 0 {
@@ -176,7 +176,7 @@ fn audit(args: Vec<String>) -> Result<(), String> {
         write!(output, "}}").map_err(|e| e.to_string())?;
     }
     write!(output, "],\"acceptances\":[").map_err(|e| e.to_string())?;
-    for (index, acceptance) in checked.execution.acceptances.iter().enumerate() {
+    for (index, acceptance) in checked.execution().acceptances.iter().enumerate() {
         if index != 0 {
             write!(output, ",").map_err(|e| e.to_string())?;
         }
