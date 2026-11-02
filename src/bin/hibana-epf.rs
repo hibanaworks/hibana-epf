@@ -56,18 +56,16 @@ fn audit(args: Vec<String>) -> Result<(), String> {
         Acceptance, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId, RouteChoice,
         Unfold,
     };
-    if args.len() < 5 || (args.len() - 3) % 2 != 0 {
+    if args.len() < 5 || !(args.len() - 3).is_multiple_of(2) {
         return Err("usage: hibana-epf audit PROTOCOL.bin SESSION DERIVATION_CAPACITY CAPTURE.bin CHECKPOINT [CAPTURE.bin CHECKPOINT ...]".into());
     }
     let records = |path: &str| -> Result<Vec<TapEvent>, String> {
         let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-        if bytes.len() % 16 != 0 {
+        let (chunks, trailing) = bytes.as_chunks::<16>();
+        if !trailing.is_empty() {
             return Err(format!("{path}: incomplete 16-byte record"));
         }
-        Ok(bytes
-            .chunks_exact(16)
-            .map(|row| TapEvent::from(<[u8; 16]>::try_from(row).unwrap()))
-            .collect())
+        Ok(chunks.iter().copied().map(TapEvent::from).collect())
     };
     let compiled = records(&args[0])?;
     let session = args[1].parse::<u32>().map_err(|_| "invalid session")?;
@@ -75,7 +73,9 @@ fn audit(args: Vec<String>) -> Result<(), String> {
         .parse::<usize>()
         .map_err(|_| "invalid derivation capacity")?;
     let inputs: Vec<_> = args[3..]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let checkpoint = pair[1]
                 .parse::<u32>()
