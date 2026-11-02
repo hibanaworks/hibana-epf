@@ -43,12 +43,12 @@ def collapseInsertion (start added event : Nat) : Nat :=
 theorem collapse_before_cut (start added event cut : Nat) (h : cut ≤ start) :
     collapseInsertion start added event < cut ↔ event < cut := by
   unfold collapseInsertion
-  split <;> omega
+  split <;> constructor <;> intro bound <;> omega
 
 theorem collapse_after_cut (start added event cut : Nat) (h : start < cut) :
     collapseInsertion start added event < cut ↔ event < cut + added := by
   unfold collapseInsertion
-  split <;> omega
+  split <;> constructor <;> intro bound <;> omega
 
 /-- The boundary search used after structural event classification. -/
 def splitSearch (cut first last : Nat) : Nat :=
