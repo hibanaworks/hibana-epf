@@ -328,6 +328,16 @@ agreement with application effects. Other runs need their own witness.
 The witness builder and general formal correspondence of these new Rust source
 checks remain unfinished; the existing Lean claims below do not prove them.
 
+`CaptureExecution.lean` interprets poll queries and source advances using the
+selected core's existing source-occurrence semantics. It proves that a checked
+record list has a source execution, preserves the exact source prefix at every
+append, and retains each advance's resumption check. Polling does not append a
+source point; repeating a poll cannot duplicate acceptance. Its interval rules
+require completion evidence and place acceptance after its poll and before each
+observed completion, allowing receipt before sender publication. These are
+contracts for the evidence interpreter. They do not prove the Rust snapshot
+reader, occurrence matcher or whole checker implements those contracts.
+
 `Protocol::deliveries(captures, workspace)` connects successful receives across
 producer captures to send calls. Within each session/source stream it uses the
 transport's affine FIFO contract, with one producer per side. Several producers
