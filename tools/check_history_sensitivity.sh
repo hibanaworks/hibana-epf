@@ -61,7 +61,7 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         "$source/src/protocol/word.rs"
       ;;
     ResumptionAdmission)
-      perl -0pi -e 's/let resumption = matches!\(point, SourcePoint::Accepted\(_\)\)/let resumption = false/g == 1 or die "missing resumption prerequisite\n"' \
+      perl -0pi -e 's/let resumption = can_resume/let resumption = false/g == 1 or die "missing resumption prerequisite\n"' \
         "$source/src/protocol/word.rs"
       ;;
     InvocationContext)
