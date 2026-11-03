@@ -15,7 +15,11 @@ concurrency:
 jobs:
   validate:
     runs-on: macos-15
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [native, miri-unit, miri-integration]
+    timeout-minutes: ${{ matrix.stage == 'miri-unit' && 45 || 30 }}
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust and embedded target
@@ -24,6 +28,7 @@ jobs:
           rustup target add thumbv6m-none-eabi --toolchain stable
           rustup toolchain install "$(cat tools/miri-toolchain)" --profile minimal --component miri --component rust-src
       - name: Install the selected core's Lean compiler
+        if: matrix.stage == 'native'
         shell: bash
         run: |
           set -euo pipefail
@@ -50,12 +55,17 @@ jobs:
           "$epf_elan_tmp/elan-init" -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           "$HOME/.elan/bin/elan" toolchain install "$toolchain"
-      - name: Check execution, no_std, Miri, and source observation proofs
-        run: sh tools/check.sh
+      - name: Check the selected validation stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          sh tools/check.sh "${{ matrix.stage }}" 2>&1 | tee "target/validation-${{ matrix.stage }}.log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: commit-observation-proof
+          name: epf-${{ matrix.stage }}
           path: |
+            target/validation-${{ matrix.stage }}.log
             target/commit-observation-proof/
             target/history-sensitivity/
