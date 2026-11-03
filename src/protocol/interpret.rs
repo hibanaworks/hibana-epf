@@ -40,7 +40,8 @@ pub enum InterpretationError {
 }
 
 impl SourcePath<'_, '_, '_> {
-    /// Eight words per captured record, one per producer, plus custody space.
+    /// Eight words per captured record, one per producer, custody space and
+    /// readiness-query selection space derived from this source unfolding.
     /// There is no fixed source-depth, visit-count or search-step capacity.
     pub fn interpretation_workspace_len(
         &self,
@@ -61,6 +62,7 @@ impl SourcePath<'_, '_, '_> {
                     .checked_mul(8)?
                     .checked_add(captures.len())?
                     .checked_add(n)
+                    .and_then(|n| n.checked_add(self.query_workspace_len()?))
             })
             .ok_or(InterpretationError::Overflow)
     }
@@ -321,9 +323,6 @@ impl SourcePath<'_, '_, '_> {
                         return false;
                     };
                     let row = protocol.records[layout.sources.start + usize::from(origin)];
-                    if self.actors(event).is_none() {
-                        return false;
-                    }
                     if execution::operation(observed(order[variable]))
                         && variables[..depth].iter().any(|&prior| {
                             execution::operation(observed(order[prior]))
@@ -340,8 +339,11 @@ impl SourcePath<'_, '_, '_> {
                         let actor = (record.causal_key() >> 8) as u8;
                         if execution::operation(record) {
                             return origin == record.arg1() as u16
-                                && execution::operation_point(row, record, event)
-                                    .is_some_and(|point| self.point_actor(point) == Some(actor));
+                                && (record.id() == tap::SEND_POLL
+                                    || execution::operation_point(row, record, event)
+                                        .is_some_and(|point| {
+                                            self.point_actor(point) == Some(actor)
+                                        }));
                         }
                         let key = (record.arg1() >> 16) as u16;
                         if record.id() == tap::SCOPE_REENTRY && key >> 13 == 1 {
@@ -352,18 +354,24 @@ impl SourcePath<'_, '_, '_> {
                         } else {
                             record.arg1() as u16
                         };
-                        self.choice_at(event, key).is_some_and(|right| {
+                        let choice = if record.id() == tap::RESOLVER_AUDIT {
+                            source.route_at(event, key).map(|(_, right)| right)
+                        } else {
+                            self.choice_at(event, key)
+                        };
+                        choice.is_some_and(|right| {
                             (arm == u16::from(right)
                                 || record.id() == tap::RESOLVER_AUDIT && arm == 255)
                                 && (record.id() != tap::SCOPE_REENTRY
                                     || source.reentered(event, key))
-                                && [
-                                    SourcePoint::Local(event),
-                                    SourcePoint::Accepted(event),
-                                    SourcePoint::Received(event),
-                                ]
-                                .into_iter()
-                                .any(|point| self.point_actor(point) == Some(actor))
+                                && (record.id() == tap::RESOLVER_AUDIT
+                                    || [
+                                        SourcePoint::Local(event),
+                                        SourcePoint::Accepted(event),
+                                        SourcePoint::Received(event),
+                                    ]
+                                    .into_iter()
+                                    .any(|point| self.point_actor(point) == Some(actor)))
                         })
                     })
                 });

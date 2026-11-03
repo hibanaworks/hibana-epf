@@ -26,7 +26,8 @@ pub struct ExecutionWitness<'a> {
     /// Every capture record once, preserving producer ordinals and deliveries.
     pub order: &'a [RecordId],
     /// Expanded source event for each ordered operation or control record of
-    /// this session. Other observations, including other sessions, use None.
+    /// this session. Uncommitted attempts can name an unselected arm, checked
+    /// against the committed prefix. Other observations use None.
     pub occurrences: &'a [Option<usize>],
     /// Acceptance boundaries in nondecreasing `before` order.
     pub acceptances: &'a [Acceptance],
@@ -75,7 +76,10 @@ impl SourcePath<'_, '_, '_> {
             .checked_add(witness.acceptances.len())
             .and_then(|n| n.checked_mul(2))
             .ok_or(ExecutionError::Overflow)?;
-        custody.checked_add(points).ok_or(ExecutionError::Overflow)
+        custody
+            .checked_add(points)
+            .and_then(|n| n.checked_add(self.query_workspace_len()?))
+            .ok_or(ExecutionError::Overflow)
     }
 
     /// Check the named session's operation history against this source path.
@@ -83,6 +87,9 @@ impl SourcePath<'_, '_, '_> {
     /// Reuses checked call and FIFO links, exact source/actor assignments and
     /// route evidence. Every poll is an admission query at its own boundary;
     /// it does not append acceptance or advance the reconstructed source word.
+    /// An uncommitted query can use another checked selection of this same
+    /// unfolding only if every earlier committed point keeps its actor and
+    /// prerequisites. A withdrawn attempt does not permanently select an arm.
     /// Completed wire halves require one supported acceptance after a poll and
     /// no later than either completion. Open calls remain admission queries.
     ///
@@ -114,7 +121,8 @@ impl SourcePath<'_, '_, '_> {
         let source = self.unfolding();
         let protocol = source.protocol();
         let custody_words = protocol.custody_workspace_len(captures);
-        let (scratch, word) = workspace[..required].split_at_mut(custody_words);
+        let (scratch, rest) = workspace[..required].split_at_mut(custody_words);
+        let (word, query) = rest.split_at_mut(2 * (order.len() + witness.acceptances.len()));
         let links = protocol
             .checked_custody(captures, order, scratch)
             .map_err(|error| ExecutionError::History(RouteHistoryError::Custody(error)))?;
@@ -133,7 +141,11 @@ impl SourcePath<'_, '_, '_> {
                 }
                 continue;
             }
-            let Some(event) = event.filter(|&event| self.actors(event).is_some()) else {
+            let Some(event) = event.filter(|&event| {
+                source.origin(event).is_some()
+                    && (matches!(record.id(), tap::SEND_POLL | tap::RESOLVER_AUDIT)
+                        || self.actors(event).is_some())
+            }) else {
                 return Err(ExecutionError::Record { position });
             };
             let origin = source.origin(event).unwrap();
@@ -142,7 +154,9 @@ impl SourcePath<'_, '_, '_> {
             let point = operation_point(row, record, event);
             if operation(record) {
                 if origin != record.arg1() as u16
-                    || point.is_none_or(|point| self.point_actor(point) != Some(actor))
+                    || point.is_none_or(|point| {
+                        record.id() != tap::SEND_POLL && self.point_actor(point) != Some(actor)
+                    })
                 {
                     return Err(ExecutionError::Record { position });
                 }
@@ -181,7 +195,12 @@ impl SourcePath<'_, '_, '_> {
                         return Err(ExecutionError::Record { position });
                     }
                 } else {
-                    let Some(right) = self.choice_at(event, scope) else {
+                    let right = if record.id() == tap::RESOLVER_AUDIT {
+                        source.route_at(event, scope).map(|(_, right)| right)
+                    } else {
+                        self.choice_at(event, scope)
+                    };
+                    let Some(right) = right else {
                         return Err(ExecutionError::Record { position });
                     };
                     let arm = if record.id() == tap::RESOLVER_AUDIT {
@@ -196,6 +215,40 @@ impl SourcePath<'_, '_, '_> {
                     if record.id() == tap::SCOPE_REENTRY && !source.reentered(event, scope) {
                         return Err(ExecutionError::Record { position });
                     }
+                }
+            }
+        }
+        // A committed selection already fixes this actor's knowledge, even if
+        // its Endpoint commit observation appears later in the complete order.
+        // Expanded spans distinguish a fresh roll visit from that earlier one.
+        for (position, &id) in order.iter().enumerate() {
+            let audit = observed(id);
+            if audit.id() != tap::RESOLVER_AUDIT
+                || audit.arg0() != witness.session
+                || audit.causal_key() as u8 == 255
+            {
+                continue;
+            }
+            let scope = (audit.arg1() >> 16) as u16;
+            let (visit, right) = source
+                .route_at(witness.occurrences[position].unwrap(), scope)
+                .unwrap();
+            for (at, &prior) in order[..position].iter().enumerate() {
+                let prior = observed(prior);
+                if prior.arg0() != audit.arg0()
+                    || prior.causal_key() >> 8 != audit.causal_key() >> 8
+                    || !(committed(prior)
+                        || prior.id() == tap::ROUTE_ARM_SELECTION
+                            && prior.arg1() >> 16 == u32::from(scope))
+                {
+                    continue;
+                }
+                if let Some((span, arm)) =
+                    witness.occurrences[at].and_then(|event| source.route_at(event, scope))
+                    && span == visit
+                    && arm != right
+                {
+                    return Err(ExecutionError::Record { position });
                 }
             }
         }
@@ -230,6 +283,61 @@ impl SourcePath<'_, '_, '_> {
                 return Err(invalid());
             }
         }
+        // A resolver result is an attempt, not a permanent selection. A later
+        // poll by that controller must nevertheless agree with its latest
+        // observed decision in this concrete visit, unless committed knowledge
+        // already determines the arm. Passive views need no resolver callback.
+        for (position, &id) in order.iter().enumerate() {
+            let poll = observed(id);
+            if poll.id() != tap::SEND_POLL || poll.arg0() != witness.session {
+                continue;
+            }
+            let event = witness.occurrences[position].unwrap();
+            for choice in &protocol.records[layout.choices.clone()] {
+                let scope = choice.causal_key();
+                if choice.arg1() == 0 || choice.arg0() != u32::from(poll.causal_key() as u8) {
+                    continue;
+                }
+                let Some((visit, right)) = source.route_at(event, scope) else {
+                    continue;
+                };
+                let same_actor = |prior: TapEvent| {
+                    prior.arg0() == poll.arg0() && prior.causal_key() >> 8 == poll.causal_key() >> 8
+                };
+                let in_visit = |at: usize| {
+                    witness.occurrences[at].is_some_and(|event| {
+                        source
+                            .route_at(event, scope)
+                            .is_some_and(|(span, _)| span == visit)
+                    })
+                };
+                if order[..position].iter().enumerate().any(|(at, &prior)| {
+                    let prior = observed(prior);
+                    same_actor(prior)
+                        && in_visit(at)
+                        && (committed(prior)
+                            || prior.id() == tap::ROUTE_ARM_SELECTION
+                                && prior.arg1() >> 16 == u32::from(scope))
+                }) {
+                    continue;
+                }
+                if let Some((at, audit)) = order[..position]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(at, &id)| (at, observed(id)))
+                    .find(|(_, prior)| {
+                        same_actor(*prior)
+                            && prior.id() == tap::RESOLVER_AUDIT
+                            && prior.arg1() >> 16 == u32::from(scope)
+                    })
+                    && in_visit(at)
+                    && audit.causal_key() as u8 != u8::from(right)
+                {
+                    return Err(ExecutionError::Record { position });
+                }
+            }
+        }
         let mut used = 0;
         let mut accepted = 0;
         for position in 0..=order.len() {
@@ -260,8 +368,16 @@ impl SourcePath<'_, '_, '_> {
                 protocol.records[layout.sources.start + usize::from(source.origin(event).unwrap())];
             if let Some(point) = operation_point(row, record, event) {
                 if record.id() == tap::SEND_POLL {
-                    if let Some(prior) = self.missing(points(&word[..used]), point) {
-                        return Err(ExecutionError::Admission { record: id, prior });
+                    if !self.query_ready(
+                        points(&word[..used]),
+                        point,
+                        (record.causal_key() >> 8) as u8,
+                        query,
+                    ) {
+                        if let Some(prior) = self.missing(points(&word[..used]), point) {
+                            return Err(ExecutionError::Admission { record: id, prior });
+                        }
+                        return Err(ExecutionError::Record { position });
                     }
                 } else {
                     self.check_next(points(&word[..used]), point, used / 2)
@@ -277,10 +393,9 @@ impl SourcePath<'_, '_, '_> {
                     SourcePoint::Received(event),
                 ]
                 .into_iter()
-                .find(|&point| self.point_actor(point) == Some(actor))
-                .ok_or(ExecutionError::Record { position })?;
-                if let Some(prior) = self.missing(points(&word[..used]), candidate) {
-                    return Err(ExecutionError::Admission { record: id, prior });
+                .any(|point| self.query_ready(points(&word[..used]), point, actor, query));
+                if !candidate {
+                    return Err(ExecutionError::Record { position });
                 }
             }
         }

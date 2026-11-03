@@ -52,7 +52,6 @@ pub enum PathError {
 pub struct SourcePath<'p, 'u, 'w> {
     source: Unfolded<'p, 'u>,
     actors: &'w [usize],
-    choices: &'w [RouteChoice],
 }
 
 impl<'p, 'u> Unfolded<'p, 'u> {
@@ -77,7 +76,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
     /// or Endpoint is created by this retrospective computation.
     pub fn select<'w>(
         &self,
-        choices: &'w [RouteChoice],
+        choices: &[RouteChoice],
         workspace: &'w mut [usize],
     ) -> Result<SourcePath<'p, 'u, 'w>, PathError> {
         let required = self.path_workspace_len()?;
@@ -96,6 +95,40 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                 return Err(PathError::Choice { index });
             }
         }
+        let mut used = 0;
+        let path =
+            self.select_by(
+                |span, _, _| {
+                    let choice = choices.iter().find(|choice| choice.span == span).ok_or(
+                        PathError::Choice {
+                            index: choices.len(),
+                        },
+                    )?;
+                    used += 1;
+                    Ok(choice.right)
+                },
+                workspace,
+            )?;
+        if used != choices.len() {
+            return Err(PathError::Choice {
+                index: choices.len(),
+            });
+        }
+        Ok(path)
+    }
+
+    pub(super) fn select_by<'w>(
+        &self,
+        mut choose: impl FnMut([usize; 2], u16, usize) -> Result<bool, PathError>,
+        workspace: &'w mut [usize],
+    ) -> Result<SourcePath<'p, 'u, 'w>, PathError> {
+        let required = self.path_workspace_len()?;
+        if workspace.len() < required {
+            return Err(PathError::Workspace {
+                required,
+                actual: workspace.len(),
+            });
+        }
         let protocol = self.protocol();
         let records = protocol.records;
         let layout = Layout::checked(protocol);
@@ -110,7 +143,6 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         }
         stack[..2].copy_from_slice(&[0, count]);
         let mut depth = 2;
-        let mut used = 0;
         while depth != 0 {
             depth -= 2;
             let span = [stack[depth], stack[depth + 1]];
@@ -166,20 +198,13 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                     }
                 }
                 NodeKind::Choice(scope) => {
-                    let (index, choice) = choices
-                        .iter()
-                        .enumerate()
-                        .find(|(_, choice)| choice.span == span)
-                        .ok_or(PathError::Choice {
-                            index: choices.len(),
-                        })?;
+                    let right = choose(span, scope, split)?;
                     let ordinal = records[layout.choices.clone()]
                         .iter()
                         .position(|row| row.causal_key() == scope)
-                        .ok_or(PathError::Choice { index })?;
-                    selected[ordinal] = 1 + usize::from(choice.right);
-                    used += 1;
-                    stack[depth..depth + 2].copy_from_slice(&if choice.right {
+                        .ok_or(PathError::Choice { index: 0 })?;
+                    selected[ordinal] = 1 + usize::from(right);
+                    stack[depth..depth + 2].copy_from_slice(&if right {
                         [split, span[1]]
                     } else {
                         [span[0], split]
@@ -191,11 +216,6 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                     depth += 4;
                 }
             }
-        }
-        if used != choices.len() {
-            return Err(PathError::Choice {
-                index: choices.len(),
-            });
         }
         for first in 0..count {
             if actors[first] == usize::MAX {
@@ -239,7 +259,6 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         let path = SourcePath {
             source: *self,
             actors,
-            choices,
         };
         path.check_entries()?;
         Ok(path)
@@ -248,15 +267,16 @@ impl<'p, 'u> Unfolded<'p, 'u> {
 
 impl SourcePath<'_, '_, '_> {
     pub(super) fn choice_at(&self, event: usize, scope: u16) -> Option<bool> {
-        self.choices.iter().find_map(|choice| {
-            if !(choice.span[0] <= event && event < choice.span[1]) {
-                return None;
-            }
-            let NodeKind::Choice(found) = self.source.kind(choice.span)? else {
-                return None;
-            };
-            (found == scope).then_some(choice.right)
-        })
+        let (span, _) = self.source.route_at(event, scope)?;
+        self.selection(span)
+    }
+
+    pub(super) fn selection(&self, span: [usize; 2]) -> Option<bool> {
+        let (_, split) = self.source.parts(span)?;
+        self.actors[span[0]..span[1]]
+            .iter()
+            .position(|&actor| actor != usize::MAX)
+            .map(|index| span[0] + index >= split)
     }
 
     fn check_entries(&self) -> Result<(), PathError> {
@@ -370,6 +390,32 @@ impl SourcePath<'_, '_, '_> {
     /// The same source witness, without changing or copying its expansion.
     pub fn unfolding(&self) -> Unfolded<'_, '_> {
         self.source
+    }
+}
+
+impl Unfolded<'_, '_> {
+    /// The concrete visit containing this event, including unselected arms.
+    pub(super) fn route_at(&self, event: usize, scope: u16) -> Option<([usize; 2], bool)> {
+        if event >= self.event_count() {
+            return None;
+        }
+        let mut span = [0, self.event_count()];
+        loop {
+            let (kind, split) = self.parts(span)?;
+            if let NodeKind::Choice(found) = kind
+                && found == scope
+            {
+                return Some((span, event >= split));
+            }
+            if matches!(kind, NodeKind::Message) {
+                return None;
+            }
+            span = if event < split {
+                [span[0], split]
+            } else {
+                [split, span[1]]
+            };
+        }
     }
 }
 

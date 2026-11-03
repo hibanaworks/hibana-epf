@@ -408,8 +408,10 @@ It cannot substitute its own acceptance for that check.
 
 Acceptance is proposed after the first poll only for calls with completion
 evidence. This is an allowed interval interpretation, not a physical timestamp.
-Space is eight words per captured record, one per producer, plus custody space, without
-a fixed depth or visit horizon. Worst-case search is exponential; no large-task
+Space is eight words per captured record, one per producer, custody space and
+query-selection scratch (four words per expanded event, plus the source's
+initial bindings and choices), without a fixed depth or visit horizon.
+Worst-case search is exponential; no large-task
 throughput claim is established. Failure to interpret one supplied finite path
 does not reject the global or exclude another unfolding. Use `Protocol::audit`
 when the unfolding and branch selections must also be constructed.
@@ -426,17 +428,29 @@ The constructor's final validation is also removed in a defect control, which
 must fail the early-poll regression. These checks do not prove general search
 completeness or Rust/Lean refinement.
 
-`CaptureExecution.lean` interprets poll queries and source advances using the
-selected core's existing source-occurrence semantics. It proves that a checked
+The selected path governs source advances. A withdrawn send or resolver attempt
+can query another checked selection of the same unfolding, provided every
+earlier committed operation retains its actor and prerequisites. An attempt
+does not freeze an arm or create a source point. A completed finite operation
+cannot supply another query, and a controller's poll must agree with its latest
+observed resolver decision in that visit unless committed knowledge already
+determines the arm. This remains retrospective evidence checking, not another
+application permission service.
+
+`CaptureExecution.lean` interprets these per-query selections and source advances
+using the selected core's existing source-occurrence semantics. It proves that a checked
 record list has a source execution, preserves the exact source prefix at every
 append, and retains each advance's resumption check. Polling does not append a
-source point; repeating a poll cannot duplicate acceptance. Its interval rules
+source point; repeating a poll cannot duplicate acceptance. Queries preserve
+the committed prefix and cannot reuse a published finite operation. Concrete
+opposite-arm examples accept two uncommitted attempts and reject a branch
+change after publication. Its interval rules
 require completion evidence and place acceptance after its poll and before each
 observed completion, allowing receipt before sender publication. These are
 contracts for the evidence interpreter. They do not prove the Rust snapshot
 reader, occurrence matcher or whole checker implements those contracts.
 
-The selected core pin `08d0439` includes committed-body resumption and
+The selected core pin `9b8a3b3` includes committed-body resumption and
 independent visits of physically disjoint parallel rolls. The proof gate imports
 that exact Git dependency, including the normalization claims: moving supported
 acceptance boundaries leaves admission unchanged when the committed prefix is

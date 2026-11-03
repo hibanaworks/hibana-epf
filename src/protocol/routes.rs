@@ -214,14 +214,9 @@ impl Protocol<'_> {
                         }
                     }
                     if prior.id() == tap::SEND_POLL {
-                        let prepared = (prior.arg1() >> 16) as u16;
-                        if prepared != u16::MAX
-                            && self
-                                .scope(prepared)
-                                .is_some_and(|outer| contains(&outer, &bounds))
-                        {
-                            continue;
-                        }
+                        // An attempt can be cancelled before acceptance. Only
+                        // committed knowledge constrains a later attempt.
+                        continue;
                     }
                     if let Some(earlier) = selected(prior, key, &bounds) {
                         if earlier != arm {

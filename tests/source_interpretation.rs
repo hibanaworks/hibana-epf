@@ -21,6 +21,95 @@ fn record(ordinal: usize, id: u16, view: u8, detail: u32) -> TapEvent {
 }
 
 #[test]
+fn a_committed_route_selection_cannot_name_an_unselected_query_occurrence() {
+    use hibana_epf::RouteChoice;
+    let global = g::route(
+        g::send::<7, 8, g::Msg<1, ()>>(),
+        g::send::<7, 8, g::Msg<2, ()>>(),
+    )
+    .resolve::<77>();
+    let snapshot: Vec<_> = tap::projected(&project::<7>(&global)).collect();
+    let scope = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 0)
+        .unwrap()
+        .causal_key();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let steps = [Unfold::Source, Unfold::Source, Unfold::Choice([0, 1])];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut actors = vec![0; source.path_workspace_len().unwrap()];
+    let path = source
+        .select(
+            &[RouteChoice {
+                span: [0, 2],
+                right: false,
+            }],
+            &mut actors,
+        )
+        .unwrap();
+    // Synthetic complete controls: an uncommitted resolver query followed by
+    // the committed Left selection. Only the query may use another path.
+    let records = [
+        record(0, tap::RESOLVER_AUDIT, 0, u32::from(scope) << 16 | 77),
+        record(1, tap::ROUTE_ARM_SELECTION, 2, u32::from(scope) << 16),
+    ];
+    let captures = [Capture::new(&records, Some(2)).unwrap()];
+    let order = [
+        RecordId {
+            producer: 0,
+            ordinal: 0,
+        },
+        RecordId {
+            producer: 0,
+            ordinal: 1,
+        },
+    ];
+    for (selection, accepted) in [(0, true), (1, false)] {
+        let occurrences = [Some(0), Some(selection)];
+        let witness = ExecutionWitness {
+            session: 1,
+            order: &order,
+            occurrences: &occurrences,
+            acceptances: &[],
+        };
+        let mut workspace = vec![0; path.execution_workspace_len(&captures, &witness).unwrap()];
+        assert_eq!(
+            path.check_execution(&captures, &witness, &mut workspace)
+                .is_ok(),
+            accepted
+        );
+    }
+    let records = [
+        records[0],
+        records[1],
+        record(2, tap::RESOLVER_AUDIT, 1, u32::from(scope) << 16 | 77),
+    ];
+    let captures = [Capture::new(&records, Some(3)).unwrap()];
+    let order = [
+        order[0],
+        order[1],
+        RecordId {
+            producer: 0,
+            ordinal: 2,
+        },
+    ];
+    let occurrences = [Some(0), Some(0), Some(1)];
+    let witness = ExecutionWitness {
+        session: 1,
+        order: &order,
+        occurrences: &occurrences,
+        acceptances: &[],
+    };
+    let mut workspace = vec![0; path.execution_workspace_len(&captures, &witness).unwrap()];
+    assert!(
+        path.check_execution(&captures, &witness, &mut workspace)
+            .is_err()
+    );
+}
+
+#[test]
 fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
     let sequential = g::seq(
         g::send::<7, 7, g::Msg<1, ()>>(),

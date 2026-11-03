@@ -94,6 +94,9 @@ impl<'p> Protocol<'p> {
             .checked_mul(8)
             .and_then(|n| n.checked_add(captures.len()))
             .and_then(|n| n.checked_add(self.custody_words(captures)?))
+            .and_then(|n| n.checked_add(events.checked_mul(4)?))
+            .and_then(|n| n.checked_add(layout.initial.len()))
+            .and_then(|n| n.checked_add(layout.choices.len()))
             .ok_or(AuditError::Overflow)?;
         derivation_capacity
             .checked_mul(13)

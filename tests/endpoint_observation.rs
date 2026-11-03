@@ -998,3 +998,331 @@ fn live_endpoint_choices_and_roll_commits_reach_epf_without_losing_observation_f
             .all(|pair| pair[0].ts() + 1 == pair[1].ts())
     );
 }
+
+struct PendingAudit<'a> {
+    cancelled: &'a Cell<usize>,
+}
+
+impl Transport for PendingAudit<'_> {
+    type Tx<'a>
+        = ()
+    where
+        Self: 'a;
+    type Rx<'a>
+        = ()
+    where
+        Self: 'a;
+
+    fn open(&self, _: PortOpen) -> ((), ()) {
+        ((), ())
+    }
+
+    fn poll_send(
+        &self,
+        _: &mut (),
+        _: Outgoing<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Result<(), TransportError>> {
+        Poll::Pending
+    }
+
+    fn cancel_send(&self, _: &mut ()) {
+        self.cancelled.set(self.cancelled.get() + 1);
+    }
+
+    fn poll_recv<'a>(
+        &'a self,
+        _: &'a mut (),
+        _: &mut Context<'_>,
+    ) -> Poll<Result<ReceivedFrame<'a>, TransportError>> {
+        Poll::Pending
+    }
+
+    fn requeue(&self, _: &mut ()) -> Result<(), TransportError> {
+        panic!("this transport has received no frame")
+    }
+}
+
+#[test]
+fn cancelled_resolved_send_keeps_its_decision_without_claiming_a_commit() {
+    for right in [false, true] {
+        let rows = Cell::new(Vec::new());
+        let recorder = |event| {
+            let mut captured = rows.take();
+            captured.push(event);
+            rows.set(captured);
+        };
+        let cancelled = Cell::new(0);
+        let global =
+            g::route(g::send::<7, 8, Msg<1, ()>>(), g::send::<7, 8, Msg<2, ()>>()).resolve::<77>();
+        let program = project::<7>(&global);
+        let mut slab = [0; 16384];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                PendingAudit {
+                    cancelled: &cancelled,
+                },
+            )
+            .unwrap();
+        kit.observe(&recorder);
+        kit.set_resolver(
+            &program,
+            ResolverRef::<77>::decision_state(&right, |right| {
+                Ok(if *right {
+                    DecisionArm::Right
+                } else {
+                    DecisionArm::Left
+                })
+            }),
+        )
+        .unwrap();
+        let mut endpoint = kit.enter(SessionId::new(1), &program).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut sending = core::pin::pin!(async {
+                if right {
+                    endpoint.send::<Msg<2, ()>>(&()).await
+                } else {
+                    endpoint.send::<Msg<1, ()>>(&()).await
+                }
+            });
+            assert!(matches!(sending.as_mut().poll(&mut cx), Poll::Pending));
+        }
+        assert_eq!(cancelled.get(), 1);
+        let captured = rows.take();
+        let checkpoint = kit.tap().checkpoint();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|row| row.id() == tap::RESOLVER_AUDIT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|row| row.id() == tap::SEND_POLL)
+                .count(),
+            1
+        );
+        assert!(!captured.iter().any(|row| matches!(
+            row.id(),
+            tap::ENDPOINT_SEND | tap::ENDPOINT_RECV | tap::ROUTE_ARM_SELECTION | tap::SCOPE_REENTRY
+        )));
+        let snapshot: Vec<_> = tap::projected(&program).collect();
+        let checked = audit_capture(&snapshot, &captured, checkpoint);
+        assert!(checked.is_ok(), "right={right}: {checked:?}; {captured:?}");
+        let mut invalid = captured.clone();
+        let decision = invalid
+            .iter_mut()
+            .find(|row| row.id() == tap::RESOLVER_AUDIT)
+            .unwrap();
+        let mut bytes: [u8; 16] = (*decision).into();
+        bytes[7] ^= 1;
+        *decision = bytes.into();
+        let checked = audit_capture(&snapshot, &invalid, checkpoint);
+        assert!(checked.is_err(), "right={right}: {checked:?}; {invalid:?}");
+    }
+}
+
+#[test]
+fn cancelled_offer_records_a_decision_without_consuming_the_source_operation() {
+    for right in [false, true] {
+        let rows = Cell::new(Vec::new());
+        let recorder = |event| {
+            let mut captured = rows.take();
+            captured.push(event);
+            rows.set(captured);
+        };
+        let global =
+            g::route(g::send::<7, 7, Msg<1, ()>>(), g::send::<7, 7, Msg<2, ()>>()).resolve::<77>();
+        let program = project::<7>(&global);
+        let mut slab = [0; 16384];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+        kit.observe(&recorder);
+        kit.set_resolver(
+            &program,
+            ResolverRef::<77>::decision_state(&right, |right| {
+                Ok(if *right {
+                    DecisionArm::Right
+                } else {
+                    DecisionArm::Left
+                })
+            }),
+        )
+        .unwrap();
+        let mut endpoint = kit.enter(SessionId::new(1), &program).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let mut offering = core::pin::pin!(endpoint.offer());
+            let Poll::Ready(Ok(branch)) = offering.as_mut().poll(&mut cx) else {
+                panic!("the local preview is ready");
+            };
+            assert_eq!(branch.label(), if right { 2 } else { 1 });
+            drop(branch);
+        }
+        let captured = rows.take();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|row| row.id() == tap::RESOLVER_AUDIT)
+                .count(),
+            1
+        );
+        assert!(!captured.iter().any(|row| matches!(
+            row.id(),
+            tap::ENDPOINT_SEND | tap::ENDPOINT_RECV | tap::ROUTE_ARM_SELECTION | tap::SCOPE_REENTRY
+        )));
+        let snapshot: Vec<_> = tap::projected(&program).collect();
+        let checked = audit_capture(&snapshot, &captured, kit.tap().checkpoint());
+        assert!(checked.is_ok(), "right={right}: {checked:?}; {captured:?}");
+        let operation = core::pin::pin!(async {
+            if right {
+                endpoint.send::<Msg<2, ()>>(&()).await
+            } else {
+                endpoint.send::<Msg<1, ()>>(&()).await
+            }
+        });
+        assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+        let mut completed = captured.clone();
+        completed.extend(rows.take());
+        assert!(audit_capture(&snapshot, &completed, kit.tap().checkpoint()).is_ok());
+        // Replaying an old callback after the finite operation completed is
+        // not a fresh readiness query. There is no enclosing roll here.
+        let audit = captured
+            .iter()
+            .find(|row| row.id() == tap::RESOLVER_AUDIT)
+            .unwrap();
+        let mut bytes: [u8; 16] = (*audit).into();
+        bytes[..4].copy_from_slice(&(completed.len() as u32).to_be_bytes());
+        completed.push(bytes.into());
+        assert!(audit_capture(&snapshot, &completed, Some(completed.len() as u32)).is_err());
+    }
+}
+
+#[test]
+fn cancelled_resolved_send_can_retry_the_other_arm_before_any_commit() {
+    for first_right in [false, true] {
+        let rows = Cell::new(Vec::new());
+        let recorder = |event| {
+            let mut captured = rows.take();
+            captured.push(event);
+            rows.set(captured);
+        };
+        let right = Cell::new(first_right);
+        let cancelled = Cell::new(0);
+        let global =
+            g::route(g::send::<7, 8, Msg<1, ()>>(), g::send::<7, 8, Msg<2, ()>>()).resolve::<77>();
+        let program = project::<7>(&global);
+        let mut slab = [0; 16384];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                PendingAudit {
+                    cancelled: &cancelled,
+                },
+            )
+            .unwrap();
+        kit.observe(&recorder);
+        kit.set_resolver(
+            &program,
+            ResolverRef::<77>::decision_state(&right, |right| {
+                Ok(if right.get() {
+                    DecisionArm::Right
+                } else {
+                    DecisionArm::Left
+                })
+            }),
+        )
+        .unwrap();
+        let mut endpoint = kit.enter(SessionId::new(1), &program).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+        for arm in [first_right, !first_right] {
+            right.set(arm);
+            let mut sending = core::pin::pin!(async {
+                if arm {
+                    endpoint.send::<Msg<2, ()>>(&()).await
+                } else {
+                    endpoint.send::<Msg<1, ()>>(&()).await
+                }
+            });
+            let result = sending.as_mut().poll(&mut cx);
+            assert!(
+                matches!(result, Poll::Pending),
+                "first_right={first_right} arm={arm}: {result:?}"
+            );
+        }
+        assert_eq!(cancelled.get(), 2);
+        let captured = rows.take();
+        let decisions: Vec<_> = captured
+            .iter()
+            .filter(|row| row.id() == tap::RESOLVER_AUDIT)
+            .map(|row| row.causal_key() as u8)
+            .collect();
+        assert_eq!(decisions, [u8::from(first_right), u8::from(!first_right)]);
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|row| row.id() == tap::SEND_POLL)
+                .count(),
+            2
+        );
+        assert!(!captured.iter().any(|row| matches!(
+            row.id(),
+            tap::ENDPOINT_SEND | tap::ENDPOINT_RECV | tap::ROUTE_ARM_SELECTION | tap::SCOPE_REENTRY
+        )));
+        let snapshot: Vec<_> = tap::projected(&program).collect();
+        let checked = audit_capture(&snapshot, &captured, kit.tap().checkpoint());
+        assert!(
+            checked.is_ok(),
+            "first_right={first_right}: {checked:?}; {captured:?}"
+        );
+        // Changing either real callback result must not be repaired by choosing
+        // another path for the corresponding, already observed poll.
+        for decision in [0, 1] {
+            let mut invalid = captured.clone();
+            let audit = invalid
+                .iter_mut()
+                .filter(|row| row.id() == tap::RESOLVER_AUDIT)
+                .nth(decision)
+                .unwrap();
+            let mut bytes: [u8; 16] = (*audit).into();
+            bytes[7] ^= 1;
+            *audit = bytes.into();
+            assert!(audit_capture(&snapshot, &invalid, kit.tap().checkpoint()).is_err());
+        }
+        // A synthetic mutation commits the first attempt before the opposite
+        // query. That prefix fixes the branch; it is not another cancelled run.
+        let first_poll = captured
+            .iter()
+            .find(|row| row.id() == tap::SEND_POLL)
+            .unwrap();
+        let mut bytes: [u8; 16] = (*first_poll).into();
+        bytes[4..6].copy_from_slice(&tap::ENDPOINT_SEND.to_be_bytes());
+        bytes[7] = 1;
+        bytes[12..].copy_from_slice(&(7 << 24 | u32::from(first_right)).to_be_bytes());
+        let mut committed = captured.clone();
+        let after_poll = committed
+            .iter()
+            .position(|row| row.id() == tap::SEND_POLL)
+            .unwrap()
+            + 1;
+        committed.insert(after_poll, bytes.into());
+        for (ordinal, record) in committed.iter_mut().enumerate() {
+            let mut bytes: [u8; 16] = (*record).into();
+            bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+            *record = bytes.into();
+        }
+        assert!(audit_capture(&snapshot, &committed, Some(committed.len() as u32)).is_err());
+        // Even without the opposite poll, the completed prefix precludes a
+        // resolver invocation attributed to the other, unselected arm.
+        committed.pop();
+        assert!(audit_capture(&snapshot, &committed, Some(committed.len() as u32)).is_err());
+    }
+}

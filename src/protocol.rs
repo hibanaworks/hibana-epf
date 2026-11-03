@@ -9,6 +9,7 @@ mod execution;
 mod history;
 mod interpret;
 mod path;
+mod query;
 mod routes;
 mod unfolding;
 mod word;

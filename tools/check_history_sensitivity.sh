@@ -10,7 +10,7 @@ cargo +stable test --locked --lib --features std protocol::history::tests \
 cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished CommittedSelection; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -69,8 +69,20 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         "$source/src/protocol/unfolding.rs"
       ;;
     PollAdmission)
-      perl -0pi -e 's/if let Some\(prior\) = self\.missing\(points\(&word\[\.\.used\]\), point\)/if let Some(prior) = None::<SourcePoint>/g == 1 or die "missing per-poll admission query\n"' \
+      perl -0pi -e 's/if !self\.query_ready\(/if false \&\& !self.query_ready(/g == 1 or die "missing per-poll admission query\n"' \
         "$source/src/protocol/execution.rs"
+      ;;
+    QuerySelection)
+      perl -0pi -e 's/if compatible \&\& available\(\&path\)/if false \&\& compatible \&\& available(\&path)/g == 1 or die "missing checked query selection\n"' "$source/src/protocol/query.rs"
+      ;;
+    QueryDecision)
+      perl -0pi -e 's/\&\& audit\.causal_key\(\) as u8 != u8::from\(right\)/\&\& false \&\& audit.causal_key() as u8 != u8::from(right)/g == 1 or die "missing query decision correspondence\n"' "$source/src/protocol/execution.rs"
+      ;;
+    QueryFinished)
+      perl -0pi -e 's/\&\& !history\.clone\(\)\.any\(\|prior\| prior == finish\)/\&\& (!history.clone().any(|prior| prior == finish) || true)/g == 1 or die "missing unfinished query check\n"' "$source/src/protocol/query.rs"
+      ;;
+    CommittedSelection)
+      perl -0pi -e 's/\|\| self\.actors\(event\)\.is_some\(\)/|| true/g == 1 or die "missing committed selection membership\n"' "$source/src/protocol/execution.rs"
       ;;
     AcceptanceEvidence)
       perl -0pi -e 's/if !completed \{/if false \&\& !completed {/g == 1 or die "missing completion evidence check\n"' \
@@ -153,12 +165,18 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
       InsertionPrune) cargo +stable test --locked --lib protocol::word::tests::prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset -- --exact ;;
       ResolverEvidence) cargo +stable test --locked --test endpoint_observation \
         automatic_audit_checks_resolver_calls_from_outgoing_offers_in_each_visit -- --exact ;;
+      QuerySelection|QueryDecision) cargo +stable test --locked --test endpoint_observation \
+        cancelled_resolved_send_can_retry_the_other_arm_before_any_commit -- --exact ;;
+      QueryFinished) cargo +stable test --locked --test endpoint_observation \
+        cancelled_offer_records_a_decision_without_consuming_the_source_operation -- --exact ;;
+      CommittedSelection) cargo +stable test --locked --test source_interpretation \
+        a_committed_route_selection_cannot_name_an_unselected_query_occurrence -- --exact ;;
     esac
   ) > "$out/$mutation.log" 2>&1 || status=$?
   test "$status" = 101
   case "$mutation" in
     Length|Ordinals) grep -Fq 'test result: FAILED. 3 passed; 1 failed;' "$out/$mutation.log" ;;
-    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*|Split*|ResolverEvidence|ScopeLookup|HeadPrefix|BranchDemand|TypedArmSeed|InsertionPrune) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
+    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*|Split*|ResolverEvidence|ScopeLookup|HeadPrefix|BranchDemand|TypedArmSeed|InsertionPrune|Query*|CommittedSelection) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
   esac
   case "$mutation" in
     Length) name=deleting_any_record_including_the_last_is_incomplete ;;
@@ -181,10 +199,13 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     TypedArmSeed) name=protocol::audit::tests::typed_operations_seed_distinct_branch_visits_before_later_offer_evidence ;;
     InsertionPrune) name=protocol::word::tests::prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset ;;
     ResolverEvidence) name=automatic_audit_checks_resolver_calls_from_outgoing_offers_in_each_visit ;;
+    QuerySelection|QueryDecision) name=cancelled_resolved_send_can_retry_the_other_arm_before_any_commit ;;
+    QueryFinished) name=cancelled_offer_records_a_decision_without_consuming_the_source_operation ;;
+    CommittedSelection) name=a_committed_route_selection_cannot_name_an_unselected_query_occurrence ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"
   find "$source/target" -type f -perm -100 -exec shasum -a 256 -- {} + > "$out/$mutation-binaries.sha256"
   printf 'mutation=%s\nexit=%s\n' "$mutation" "$status" > "$out/$mutation-result.txt"
   rm -r -- "$source"
 done
-echo "History sensitivity: twenty-five prefix, call, delivery, source-execution, index, construction and resolver-evidence defects fail their regressions"
+echo "History sensitivity: twenty-nine prefix, call, delivery, source-execution, index, construction, resolver-evidence and cancelled-query defects fail their regressions"
