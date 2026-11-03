@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: quality-${{ github.ref }}
+  group: epf-source
   cancel-in-progress: true
 
 jobs:
@@ -31,16 +31,21 @@ jobs:
     needs: plan
     runs-on: macos-15
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     timeout-minutes: ${{ matrix.stage == 'miri-unit' && 45 || 30 }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust and embedded target
+      - name: Install the stable compiler
+        run: rustup toolchain install stable --profile minimal
+      - name: Install native checks and the embedded target
+        if: matrix.stage == 'native'
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup component add rustfmt clippy --toolchain stable
           rustup target add thumbv6m-none-eabi --toolchain stable
-          rustup toolchain install "$(cat tools/miri-toolchain)" --profile minimal --component miri --component rust-src
+      - name: Install the pinned memory checker
+        if: matrix.stage != 'native'
+        run: rustup toolchain install "$(cat tools/miri-toolchain)" --profile minimal --component miri --component rust-src
       - name: Install the selected core's Lean compiler
         if: matrix.stage == 'native'
         shell: bash
@@ -68,7 +73,7 @@ jobs:
           tar -xzf "$epf_elan_tmp/elan.tar.gz" -C "$epf_elan_tmp"
           "$epf_elan_tmp/elan-init" -y --default-toolchain none
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          "$HOME/.elan/bin/elan" toolchain install "$toolchain"
+          "$HOME/.elan/bin/elan" run --install "$toolchain" lean --version
       - name: Check the selected validation stage
         shell: bash
         run: |
