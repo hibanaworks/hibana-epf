@@ -13,12 +13,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  plan:
+    runs-on: macos-15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Assign every actual integration target
+        id: plan
+        run: |
+          set -euo pipefail
+          printf 'matrix=%s\n' "$(sh tools/check.sh plan)" >> "$GITHUB_OUTPUT"
+
   validate:
+    needs: plan
     runs-on: macos-15
     strategy:
       fail-fast: false
-      matrix:
-        stage: [native, miri-unit, miri-integration]
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     timeout-minutes: ${{ matrix.stage == 'miri-unit' && 45 || 30 }}
     steps:
       - uses: actions/checkout@v7
@@ -60,7 +74,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target
-          sh tools/check.sh "${{ matrix.stage }}" 2>&1 | tee "target/validation-${{ matrix.stage }}.log"
+          core_manifest="$(cargo +stable metadata --locked --format-version 1 | jq -er '[.packages[] | select(.name == "hibana") | .manifest_path] | if length == 1 then .[0] else error("expected exactly one core") end')"
+          bash "$(dirname "$core_manifest")/.github/scripts/lib/resource_guard.sh" \
+            sh tools/check.sh "${{ matrix.stage }}" 2>&1 | tee "target/validation-${{ matrix.stage }}.log"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -69,3 +85,16 @@ jobs:
             target/validation-${{ matrix.stage }}.log
             target/commit-observation-proof/
             target/history-sensitivity/
+
+  required:
+    name: epf-contract
+    if: always()
+    needs: [plan, validate]
+    runs-on: macos-15
+    steps:
+      - name: Require the complete validation matrix
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: >-
+          printf '%s\n' "$RESULTS" |
+          jq -e 'keys == ["plan", "validate"] and all(.[]; .result == "success")'

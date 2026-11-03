@@ -13,11 +13,16 @@ default = []
 std = []
 
 [dependencies]
-hibana = { git = "https://github.com/hibanaworks/hibana", rev = "e22c0b9e6a97997ab43e733890487950465c9251", version = "=0.10.0", default-features = false }
+hibana = { git = "https://github.com/hibanaworks/hibana", rev = "8ed7fbe3fc3f23abc8fff906f839872f69e9babc", version = "=0.10.0", default-features = false }
 
 [[bin]]
 name = "hibana-epf"
 path = "src/bin/hibana-epf.rs"
+required-features = ["std"]
+
+[[test]]
+name = "tap_input"
+path = "tests/tap_input.rs"
 required-features = ["std"]
 
 [lints.rust]

@@ -518,3 +518,11 @@ before EOF, partial-record rejection, image replacement, resolver behavior,
 Clippy, no_std builds and strict-provenance Miri. They require Rust stable, the
 Miri toolchain recorded in `tools/miri-toolchain`, `thumbv6m-none-eabi`, Lean
 selected by the core dependency.
+
+CI obtains its complete assignment from `tools/check.sh plan`. Every actual
+default-feature integration target has its own required Miri job, alongside native and
+unit-Miri checks. The `std` CLI/process tests declare their required feature in
+Cargo and run natively. Miri jobs require nonempty passing test reports.
+The same target selection runs locally; `miri-integration`
+runs their union. Missing, skipped, cancelled and unsuccessful jobs fail the
+final result. The host check scripts also require `jq`.

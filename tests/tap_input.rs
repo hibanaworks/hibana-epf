@@ -1,5 +1,3 @@
-#![cfg(feature = "std")]
-
 use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Write},
