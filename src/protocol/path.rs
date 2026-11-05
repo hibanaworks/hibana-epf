@@ -427,8 +427,14 @@ mod tests;
 
 impl SourcePath<'_, '_, '_> {
     pub(super) fn choice_at(&self, event: usize, scope: u16) -> Option<bool> {
-        let (span, _) = self.route_at(event, scope)?;
-        self.selection(span)
+        let (span, right) = self.route_at(event, scope)?;
+        if self.actors(event).is_some() {
+            // A live occurrence already identifies the selected arm of this
+            // checked choice visit. Do not scan its inactive sibling again.
+            Some(right)
+        } else {
+            self.selection(span)
+        }
     }
 
     pub(super) fn selection(&self, span: [usize; 2]) -> Option<bool> {
@@ -564,26 +570,45 @@ impl SourcePath<'_, '_, '_> {
 impl SourcePath<'_, '_, '_> {
     /// The concrete visit containing this event, including unselected arms.
     pub(super) fn route_at(&self, event: usize, scope: u16) -> Option<([usize; 2], bool)> {
-        if event >= self.source.event_count() {
+        let count = self.source.event_count();
+        if event >= count || count < 2 {
             return None;
         }
-        let mut span = [0, self.source.event_count()];
-        loop {
-            let (kind, split) = self.source.indexed_parts(span, self.index)?;
-            if let NodeKind::Choice(found) = kind
-                && found == scope
-            {
-                return Some((span, event >= split));
+        // A binary leaf's parent is one of its two adjacent split boundaries.
+        // Both adjacent boundaries are ancestors, so their parent chains cover
+        // every enclosing choice. Keep the outermost matching visit, as in a
+        // descent from the root, including repeated scope IDs.
+        let mut found = None;
+        for mut node in [event.checked_sub(1), (event < count - 1).then_some(event)]
+            .into_iter()
+            .flatten()
+        {
+            loop {
+                let row = &self.index[3 * node..3 * node + 3];
+                if row[2] == usize::from(scope) + 2 {
+                    found = Some((node, row[1]));
+                }
+                if row[0] == usize::MAX {
+                    break;
+                }
+                node = row[0];
             }
-            if matches!(kind, NodeKind::Message) {
-                return None;
-            }
-            span = if event < split {
-                [span[0], split]
-            } else {
-                [split, span[1]]
-            };
         }
+        let (node, end) = found?;
+        let mut start = 0;
+        let mut child = node;
+        loop {
+            let parent = self.index[3 * child];
+            if parent == usize::MAX {
+                break;
+            }
+            if child > parent {
+                start = parent + 1;
+                break;
+            }
+            child = parent;
+        }
+        Some(([start, end], event > node))
     }
 }
 

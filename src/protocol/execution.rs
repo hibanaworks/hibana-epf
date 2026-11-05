@@ -373,7 +373,9 @@ impl SourcePath<'_, '_, '_> {
                         (record.causal_key() >> 8) as u8,
                         query,
                     ) {
-                        if let Some(prior) = self.missing(points(&word[..used]), point) {
+                        if let Some(prior) = self.missing(points(&word[..used]), point, |prior| {
+                            points(&word[..used]).any(|entry| entry == prior)
+                        }) {
                             return Err(ExecutionError::Admission { record: id, prior });
                         }
                         return Err(ExecutionError::Record { position });

@@ -73,7 +73,9 @@ impl SourcePath<'_, '_, '_> {
         if let Some(earlier) = history.clone().position(|prior| prior == point) {
             return Err(WordError::Duplicate { index, earlier });
         }
-        if let Some(prior) = self.missing(history, point) {
+        if let Some(prior) = self.missing(history.clone(), point, |prior| {
+            history.clone().any(|entry| entry == prior)
+        }) {
             return Err(WordError::Predecessor { index, prior });
         }
         Ok(())
@@ -85,17 +87,16 @@ impl SourcePath<'_, '_, '_> {
         &self,
         history: impl Clone + Iterator<Item = SourcePoint>,
         point: SourcePoint,
+        contains: impl Fn(SourcePoint) -> bool,
     ) -> Option<SourcePoint> {
-        let contains = |prior| history.clone().any(|entry| entry == prior);
         if let SourcePoint::Sent(event) | SourcePoint::Received(event) = point
             && !contains(SourcePoint::Accepted(event))
         {
             return Some(SourcePoint::Accepted(event));
         }
-        let source = self.unfolding();
         let target_actor = self.point_actor(point);
-        let can_resume = matches!(point, SourcePoint::Accepted(_)) && source.has_insertions();
-        for event in 0..source.event_count() {
+        let required = self.prerequisite(history.clone(), point);
+        for event in 0..self.unfolding().event_count() {
             for prior in [
                 SourcePoint::Local(event),
                 SourcePoint::Sent(event),
@@ -107,29 +108,41 @@ impl SourcePath<'_, '_, '_> {
                 if Some(actor) != target_actor || contains(prior) {
                     continue;
                 }
-                let ordered = match point {
-                    SourcePoint::Sent(_) => false,
-                    _ if event == point.event() => matches!(
-                        (prior, point),
-                        (SourcePoint::Sent(_), SourcePoint::Received(_))
-                    ),
-                    _ => source.before(event, point.event()),
-                };
-                if ordered {
-                    return Some(prior);
-                }
-                let resumption = can_resume
-                    && history.clone().any(|entry| {
-                        !matches!(entry, SourcePoint::Accepted(_))
-                            && self.point_actor(entry) == Some(actor)
-                            && source.same_resumption(event, point.event(), entry.event())
-                    });
-                if resumption {
+                if required(prior, actor) {
                     return Some(prior);
                 }
             }
         }
         None
+    }
+
+    // The same prerequisite predicate is used by complete-path checking and
+    // partial-choice search. Its resumption inputs are committed history,
+    // whose actors every compatible alternative must preserve.
+    pub(super) fn prerequisite(
+        &self,
+        history: impl Clone + Iterator<Item = SourcePoint>,
+        point: SourcePoint,
+    ) -> impl Fn(SourcePoint, u8) -> bool {
+        let source = self.unfolding();
+        let can_resume = matches!(point, SourcePoint::Accepted(_)) && source.has_insertions();
+        move |prior, actor| {
+            let ordered = match point {
+                SourcePoint::Sent(_) => false,
+                _ if prior.event() == point.event() => matches!(
+                    (prior, point),
+                    (SourcePoint::Sent(_), SourcePoint::Received(_))
+                ),
+                _ => source.before(prior.event(), point.event()),
+            };
+            ordered
+                || can_resume
+                    && history.clone().any(|entry| {
+                        !matches!(entry, SourcePoint::Accepted(_))
+                            && self.point_actor(entry) == Some(actor)
+                            && source.same_resumption(prior.event(), point.event(), entry.event())
+                    })
+        }
     }
 
     pub(super) fn point_actor(&self, point: SourcePoint) -> Option<u8> {

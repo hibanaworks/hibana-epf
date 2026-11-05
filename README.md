@@ -330,7 +330,22 @@ their dynamic entry history.
 Readiness queries reject an impossible logical operation kind or a mismatched
 terminal actor binding before searching alternative choices. Conditional actor
 bindings still undergo selection and prefix checking. This pruning does not
-change the source domain; the remaining choice search can be exponential.
+change the source domain. Necessary source conditions are propagated before
+choice enumeration: seq/par require both children, while a route needs one
+arm containing every demanded occurrence and no missing fixed-actor
+predecessor. Conditional holders still require full selection and execution
+checking. Point membership and demand prefix counts are derived once from the
+same committed word; they never authorize an operation. The query uses one
+additional caller-owned word per expanded event for its binary domains and
+four point-presence bits, reusing selection scratch for the traversal and
+demand counts. The remaining conditional choice search can be exponential.
+Enclosing routes are located through the existing binary-parent index; a live
+occurrence already identifies its selected arm without scanning siblings.
+Native comparisons use complete choice enumeration on fixed parallel,
+conditional-delegation and retained-reentry sources. They compare every point
+and actor probe for all valid subsets of two canonical wire-half orders;
+this is a finite comparison, not all interleavings or a general Rust refinement
+proof. Route lookup is also compared with uncached structural descent.
 
 `SourcePath::check_execution(captures, witness, workspace)` connects the complete
 captures to that selected path for one named session. The witness supplies an

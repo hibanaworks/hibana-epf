@@ -100,6 +100,7 @@ fn completed_points_reject_without_searching_unrelated_choices() {
 
 // The unfactored prerequisite rule, kept only as a comparison for the optimized
 // check. It deliberately evaluates resumption even for already present points.
+#[cfg(not(miri))]
 fn reference(
     path: SourcePath<'_, '_, '_>,
     history: &[SourcePoint],
@@ -221,7 +222,8 @@ fn prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset() {
                 );
                 for &point in &points {
                     assert_eq!(
-                        path.missing(history.iter().copied(), point),
+                        path.missing(history.iter().copied(), point, |prior| history
+                            .contains(&prior)),
                         reference(path, &history, point),
                         "{insertion:?} {initial} {bits} {point:?}"
                     );

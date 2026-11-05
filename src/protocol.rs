@@ -182,6 +182,12 @@ impl Layout {
             .checked_add(usize::from(self.max_role) + 1)
     }
 
+    fn query_words(&self, events: usize) -> Option<usize> {
+        events
+            .checked_mul(3)?
+            .checked_add(self.path_scratch_words(events)?)
+    }
+
     fn binary_words(events: usize) -> Option<usize> {
         events.saturating_sub(1).checked_mul(3)
     }

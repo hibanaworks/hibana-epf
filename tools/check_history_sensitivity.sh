@@ -12,7 +12,7 @@ cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
 mutation_count=0
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary BoundaryIndex ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished QueryCompletedSearch QueryStaticKind QueryStaticActor CommittedSelection; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary BoundaryIndex ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished QueryCompletedSearch QueryStaticKind QueryStaticActor QueryDomain QueryDemand CommittedSelection; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -59,11 +59,11 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         "$source/src/protocol/delivery.rs"
       ;;
     SourceOrder)
-      perl -0pi -e 's/source\.before\(event, point\.event\(\)\)/false/g == 1 or die "missing source-order check\n"' \
+      perl -0pi -e 's/source\.before\(prior\.event\(\), point\.event\(\)\)/false/g == 1 or die "missing source-order check\n"' \
         "$source/src/protocol/word.rs"
       ;;
     ResumptionAdmission)
-      perl -0pi -e 's/let resumption = can_resume/let resumption = false/g == 1 or die "missing resumption prerequisite\n"' \
+      perl -0pi -e 's/\|\| can_resume/|| false/g == 1 or die "missing resumption prerequisite\n"' \
         "$source/src/protocol/word.rs"
       ;;
     InvocationContext)
@@ -92,6 +92,12 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     QueryStaticActor)
       perl -0pi -e 's/if binding < 256 \&\& binding != u32::from\(actor\)/if false \&\& binding < 256 \&\& binding != u32::from(actor)/g == 1 or die "missing static actor check\n"' "$source/src/protocol/query.rs"
       ;;
+    QueryDomain)
+      perl -0pi -e 's/binding == u32::from\(actor\)/false \&\& binding == u32::from(actor)/g == 1 or die "missing fixed-actor source constraint\n"' "$source/src/protocol/query.rs"
+      ;;
+    QueryDemand)
+      perl -0pi -e 's/mask \&= 1;/mask \&= 2;/g == 1 or die "missing demanded left arm\n"' "$source/src/protocol/query.rs"
+      ;;
     CommittedSelection)
       perl -0pi -e 's/\|\| self\.actors\(event\)\.is_some\(\)/|| true/g == 1 or die "missing committed selection membership\n"' "$source/src/protocol/execution.rs"
       ;;
@@ -116,7 +122,7 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         "$source/src/protocol/unfolding.rs"
       ;;
     BoundaryIndex)
-      perl -0pi -e 's/node = row\[0\];/return None;/g == 1 or die "missing indexed parent traversal\n"' \
+      perl -0pi -e 's/(fn indexed_parts\(.*?)(node = row\[0\];)/${1}return None;/s == 1 or die "missing indexed parent traversal\n"' \
         "$source/src/protocol/path.rs"
       ;;
     ScopeLookup)
@@ -190,6 +196,10 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         protocol::word::tests::completed_points_reject_without_searching_unrelated_choices -- --exact ;;
       QueryStaticKind|QueryStaticActor) cargo +stable test --locked --lib \
         protocol::word::tests::impossible_directions_and_fixed_actors_reject_before_choice_search -- --exact ;;
+      QueryDomain) cargo +stable test --locked --lib \
+        protocol::query::tests::a_missing_prefix_receive_skips_every_unrelated_suffix_choice -- --exact ;;
+      QueryDemand) cargo +stable test --locked --lib \
+        protocol::query::tests::prefix_pruning_matches_complete_choice_search_for_both_parallel_subtrees -- --exact ;;
       CommittedSelection) cargo +stable test --locked --test source_interpretation \
         a_committed_route_selection_cannot_name_an_unselected_query_occurrence -- --exact ;;
     esac
@@ -225,6 +235,8 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     QueryFinished) name=cancelled_offer_records_a_decision_without_consuming_the_source_operation ;;
     QueryCompletedSearch) name=protocol::word::tests::completed_points_reject_without_searching_unrelated_choices ;;
     QueryStaticKind|QueryStaticActor) name=protocol::word::tests::impossible_directions_and_fixed_actors_reject_before_choice_search ;;
+    QueryDomain) name=protocol::query::tests::a_missing_prefix_receive_skips_every_unrelated_suffix_choice ;;
+    QueryDemand) name=protocol::query::tests::prefix_pruning_matches_complete_choice_search_for_both_parallel_subtrees ;;
     CommittedSelection) name=a_committed_route_selection_cannot_name_an_unselected_query_occurrence ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"

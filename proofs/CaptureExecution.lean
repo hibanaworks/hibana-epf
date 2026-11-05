@@ -36,6 +36,16 @@ theorem a_different_actor_cannot_match_a_terminal_reference
   rw [terminal_actor_reference_is_choice_independent columns selected reference fixed]
   simpa using different
 
+/-- Later selected bindings cannot change an action already reconstructed
+from the source prefix. This is not a claim about arbitrary Rust code. -/
+theorem a_decoded_prefix_action_survives_a_binding_extension
+    (earlier later : List (Nat × Binding)) (id : ActionId) (action : Action)
+    (decoded : action? earlier id = some action) :
+    action? (earlier ++ later) id = some action := by
+  cases found : earlier.find? (fun row => row.1 == id.event) with
+  | none => simp [action?, found] at decoded
+  | some row => simpa [action?, List.find?_append, found] using decoded
+
 /-- A readiness query uses another checked selection of the same unfolding,
 not another source, visit expansion or initial resource issuance. -/
 structure Query (plan : SourceOccurrenceCut source) where
@@ -196,6 +206,33 @@ theorem an_unobserved_predecessor_rejects_admission
     change history.contains prior = false at missing
     simp only [depends, Bool.not_true, Bool.false_or, missing] at priorDone
     contradiction
+
+/-- A query-compatible completion cannot repair a missing, fixed prefix
+predecessor by changing unrelated later choices. The binding-prefix and actor
+premises are checked by selection; the Rust pruning is also compared with
+complete choice enumeration, rather than assumed to refine this theorem. -/
+theorem a_missing_fixed_prefix_predecessor_rejects_every_binding_extension
+    (plan : SourceOccurrenceCut source) (history : List SourcePoint)
+    (earlier later : List (Nat × Binding)) (id : ActionId)
+    (prior target : Action) (event : Nat)
+    (extension : plan.path.bindings = earlier ++ later)
+    (decoded : action? earlier id = some prior)
+    (targetAt : action? plan.path.bindings ⟨event, .send⟩ = some target)
+    (sameActor : prior.actor = target.actor)
+    (different : id.event ≠ event)
+    (ordered : plan.expanded.before id.event event = true)
+    (missing : history.contains (.committed id) = false) :
+    admissionReady plan history event = false := by
+  have priorAt : action? plan.path.bindings id = some prior := by
+    rw [extension]
+    exact a_decoded_prefix_action_survives_a_binding_extension earlier later id prior decoded
+  apply an_unobserved_predecessor_rejects_admission plan history event
+    (prior := .committed id)
+  · apply canonical_visit_contains_exactly_its_committed_actions.mpr
+    exact canonical_visit_actions_are_exactly_decodable.mpr (by simp [priorAt])
+  · change precedes plan.expanded plan.path.bindings id ⟨event, .send⟩ = true
+    simp [precedes, priorAt, targetAt, sameActor, different, ordered]
+  · exact missing
 
 /-- Completion evidence for one already matched call. These positions are in a
 proposed causal order, rather than a shared physical clock. -/

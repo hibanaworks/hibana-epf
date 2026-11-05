@@ -120,6 +120,15 @@ theorem binary_boundary_storage_is_exact (source : Source) (start : Nat) :
   rw [binary_boundaries_fill_every_internal_slot]
   exact List.length_range'
 
+/-- A live occurrence in a checked selected arm already identifies that arm;
+searching its inactive sibling cannot add information. -/
+theorem a_live_occurrence_identifies_its_selected_arm
+    (start split stop event : Nat) (right : Bool)
+    (inside : if right then split ≤ event ∧ event < stop
+      else start ≤ event ∧ event < split) :
+    decide (split ≤ event) = right := by
+  cases right <;> simp_all <;> omega
+
 /-- Independent proof children form cuts in proof-leaf order. Insertion can
 permute source positions without splitting these proof-order intervals. -/
 def separatedByCut (cuts : Nat → Nat → Nat → Prop) (first second : Nat) : Prop :=

@@ -84,10 +84,7 @@ impl<'p> Protocol<'p> {
         let layout = Layout::checked(*self);
         let events = self.audit_choice_capacity(derivation_capacity)?;
         let parts = Layout::path_index_words(events).ok_or(AuditError::Overflow)?;
-        let query = events
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(layout.path_scratch_words(events)?))
-            .ok_or(AuditError::Overflow)?;
+        let query = layout.query_words(events).ok_or(AuditError::Overflow)?;
         // Also ensure every insertion interval's enumeration is representable.
         events
             .checked_mul(events.checked_add(1).ok_or(AuditError::Overflow)?)
