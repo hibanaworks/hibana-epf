@@ -164,8 +164,18 @@ impl SourcePath<'_, '_, '_> {
                 }
                 self.prepare_predecessors(captures, occurrences, scratch)?;
             } else {
+                // Diagnostics carry no source step or custody change. Consume
+                // ready diagnostics canonically, while retaining every record
+                // and every ordering of the source-relevant observations.
+                let diagnostic = (0..captures.len()).find(|&producer| {
+                    captures[producer]
+                        .records()
+                        .get(used[producer])
+                        .is_some_and(|&record| !execution::relevant(record))
+                });
                 let candidate = (next[depth]..captures.len())
                     .filter(|&producer| used[producer] < captures[producer].records().len())
+                    .filter(|&producer| diagnostic.is_none_or(|eager| producer == eager))
                     .find(|&producer| {
                         let index = captures[..producer]
                             .iter()
