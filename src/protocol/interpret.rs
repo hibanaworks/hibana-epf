@@ -482,11 +482,30 @@ impl SourcePath<'_, '_, '_> {
             match self.check_execution(captures, &trial, scratch) {
                 Ok(()) => break,
                 Err(
-                    ExecutionError::Record { .. }
+                    error @ (ExecutionError::Record { .. }
                     | ExecutionError::Source { .. }
-                    | ExecutionError::Admission { .. },
+                    | ExecutionError::Admission { .. }),
                 ) => {
-                    if variables.is_empty() {
+                    let position = match error {
+                        ExecutionError::Record { position } => position,
+                        ExecutionError::Source { record, .. }
+                        | ExecutionError::Admission { record, .. } => order
+                            .iter()
+                            .position(|&id| id == record)
+                            .expect("execution rejection names an observed record"),
+                        _ => unreachable!("only occurrence-dependent rejections are retried"),
+                    };
+                    // A failure at this boundary reads only the prefix's
+                    // occurrence classes. Include forward aliases (a reset
+                    // can name its following commit), then skip assignments
+                    // of later variables that cannot repair this prefix.
+                    depth = classes[..=position]
+                        .iter()
+                        .copied()
+                        .filter(|&class| class != usize::MAX)
+                        .max()
+                        .map_or(0, |last| variables.partition_point(|&v| v <= last));
+                    if depth == 0 {
                         return Err(InterpretationError::NoInterpretation);
                     }
                     depth -= 1;
