@@ -470,6 +470,7 @@ fn production_policy_image_preserves_the_largest_resolver_identifier() {
     assert_eq!(zero.decide(), Ok(DecisionArm::Left));
 }
 
+#[cfg(not(miri))]
 #[test]
 fn target_encoding_preserves_every_u16_resolver_identifier() {
     for policy_id in 0..=u16::MAX {

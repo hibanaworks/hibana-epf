@@ -54,6 +54,7 @@ fn reference(
     None
 }
 
+#[cfg(not(miri))]
 #[test]
 fn prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset() {
     let global = g::seq(

@@ -138,6 +138,17 @@ Request source auditing explicitly through `Protocol::audit` or the host CLI's
 search, and `Epf::run` does not perform it on every event. The diagnostic VM
 observes and filters records; retain a complete, unfiltered capture for auditing.
 
+Native tests exhaust the declared small graph, source-point subset, attribution,
+resolver-identifier and unfolding-equivalence populations. These semantic
+enumerations are native-only; repeating their complete Cartesian products in
+Miri adds interpreter cost to an already checked semantic population. Miri runs
+the remaining unit and integration fixtures, including VM storage and loaded
+resolver lifetimes, real Endpoint histories, Pending/cancellation, complete
+capture checks and malformed source/workspace boundaries. No native candidate
+or assertion is removed, and no test is marked ignored to obtain a passing run.
+The memory checks do not claim exhaustive Miri coverage of the native semantic
+populations. Lean model claims and concrete Rust memory checks remain distinct.
+
 `SCOPE_REENTRY` reports the scope actually reused by a progress commit, including
 the actor, logical view, session and full scope identifier. A roll record also
 names its entry source event; a route-only record names its selected arm. EPF

@@ -504,6 +504,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(miri))]
     #[test]
     fn causal_sort_matches_independent_reachability_for_all_small_graphs() {
         for count in 0usize..=4 {

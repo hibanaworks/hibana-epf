@@ -63,6 +63,7 @@ fn compiled_scope_nesting_preserves_sequence_parallel_and_choice() {
     );
 }
 
+#[cfg(not(miri))]
 #[test]
 fn original_scope_identity_distinguishes_nested_rolls_with_equal_event_bounds() {
     type M = g::Msg<7, ()>;
@@ -398,6 +399,7 @@ fn malformed_or_unreachable_proof_steps_never_publish_a_checked_unfolding() {
     }
 }
 
+#[cfg(not(miri))]
 #[test]
 fn a_compiled_subtree_matches_explicit_first_copies_without_copying_its_ast() {
     let global = g::seq(

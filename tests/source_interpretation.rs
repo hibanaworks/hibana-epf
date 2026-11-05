@@ -109,6 +109,7 @@ fn a_committed_route_selection_cannot_name_an_unselected_query_occurrence() {
     );
 }
 
+#[cfg(not(miri))]
 #[test]
 fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
     let sequential = g::seq(
