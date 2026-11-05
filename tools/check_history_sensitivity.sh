@@ -192,7 +192,8 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     SourceOrder) name=later_publication_cannot_hide_an_acceptance_before_its_source_predecessor ;;
     ResumptionAdmission) name=only_a_committed_resumed_body_delays_the_outgoing_continuation ;;
     InvocationContext) name=reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations ;;
-    PollAdmission|ConstructorValidation) name=source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame ;;
+    PollAdmission) name=source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame ;;
+    ConstructorValidation) name=a_committed_route_selection_cannot_name_an_unselected_query_occurrence ;;
     AcceptanceEvidence) name=an_observed_send_poll_can_end_in_a_transport_error_without_a_commit ;;
     ConstructorOrder) name=causal_order_search_matches_every_interleaving_and_rejects_an_early_reply ;;
     SplitInsertion|SplitBoundary) name=protocol::unfolding::tests::structural_splits_match_full_cut_enumeration_across_all_unfolding_constructors ;;
