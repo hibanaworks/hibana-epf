@@ -2,8 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root="$PWD"
-out="$root/target/history-sensitivity"
-mkdir -p "$out"
+mkdir -p "$root/target/history-sensitivity"
+out="$(mktemp -d "$root/target/history-sensitivity/run.XXXXXXXX")"
+printf 'Sensitivity evidence: %s\n' "$out"
 cargo +stable test --locked --test capture > "$out/positive.log" 2>&1
 cargo +stable test --locked --lib --features std protocol::history::tests \
   > "$out/positive-links.log" 2>&1

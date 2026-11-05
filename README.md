@@ -125,18 +125,18 @@ EPF reports actual endpoint, resolver, transport and lane observations. A staged
 transport frame is distinct from a committed receive. Matching a label and lane
 to a compiled operation establishes static membership only.
 
-Dynamic protocol auditing is under development. The source checker below
-connects complete captures to a proposed finite execution of the compiled
-protocol. The diagnostic VM observes and filters records; it does not perform
-that source check. Automatic unfolding/choice construction, general Rust/Lean
-correspondence and qualification of the combined consumer remain unfinished.
-Missing records, counter exhaustion or a truncated stream cannot support an
-audit. Application effects require their own correspondence to accepted requests.
+`Protocol::audit` constructs and checks a finite source execution from complete
+captures and the executable's compiled protocol. It derives the unfolding,
+per-visit choices, causal order, operation occurrences and supported acceptance
+intervals. General Rust/Lean correspondence and qualification of the combined
+consumer remain separate obligations. Missing records, counter exhaustion or a
+truncated stream cannot support an audit. Application effects require their own
+correspondence to accepted requests.
 
-Source auditing is explicitly requested through the capture APIs below. Loading
-an observation or policy image does not start that search, and `Epf::run` does
-not perform it on every event. An image/tool entry that requests the complete
-dynamic audit is not implemented yet.
+Request source auditing explicitly through `Protocol::audit` or the host CLI's
+`audit` command. Loading an observation or policy image does not start that
+search, and `Epf::run` does not perform it on every event. The diagnostic VM
+observes and filters records; retain a complete, unfiltered capture for auditing.
 
 `SCOPE_REENTRY` reports the scope actually reused by a progress commit, including
 the actor, logical view, session and full scope identifier. A roll record also
@@ -189,7 +189,11 @@ evidence from before the frame can become available to a receiver.
 These ten claims specify the observation boundary; they do not establish
 general Rust-to-source trace refinement. The local gate imports the model from
 the exact core selected in Cargo metadata, checks its revision and source
-hashes, and audits the Lean axioms. Install that core's `proofs/lean/lean-toolchain`
+hashes, and audits every compiled local theorem and axiom, including private
+and unprinted declarations. Each module is compiled once; Lean inspects the
+actual declarations and their axiom dependencies rather than counting printed
+reports.
+Install that core's `proofs/lean/lean-toolchain`
 with elan before running the gate. CI installs the same compiler.
 
 Local operation rows alone omit control structure. A single
@@ -450,21 +454,14 @@ observed completion, allowing receipt before sender publication. These are
 contracts for the evidence interpreter. They do not prove the Rust snapshot
 reader, occurrence matcher or whole checker implements those contracts.
 
-The selected core pin `9b8a3b3` includes committed-body resumption and
+The selected core dependency supplies committed-body resumption and
 independent visits of physically disjoint parallel rolls. The proof gate imports
-that exact Git dependency, including the normalization claims: moving supported
+that exact Git revision, including the normalization claims: moving supported
 acceptance boundaries leaves admission unchanged when the committed prefix is
 unchanged. The Rust source checker also uses committed-body entry, exercised by
 the pending-continuation fixtures. These claims do not prove general Rust/Lean
 refinement. This core preparation still needs whole-core qualification; an EPF
 gate pass alone does not establish that result.
-
-The local gate passed at EPF `395e801` with core `08d0439`: 93 native tests,
-88 strict-provenance Miri tests, 46 audited Lean claims and all 16 history defect
-controls, plus Clippy, doctests and no_std/thumbv6m builds. Input source hashes
-matched after the gate. Peak memory across the guarded process tree was
-688,160,768 bytes. These are mechanism checks, not application-effect or
-whole-core qualification.
 
 `Protocol::deliveries(captures, workspace)` connects successful receives across
 producer captures to send calls. Within each session/source stream it uses the

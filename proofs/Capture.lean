@@ -64,9 +64,4 @@ theorem one_prefix_cannot_match_two_checkpoints
     (Bool.and_eq_true_iff.mp second).1
   exact firstCount.symm.trans secondCount
 
-#print axioms a_checked_prefix_contains_every_ordinal
-#print axioms every_exact_prefix_passes
-#print axioms a_missing_suffix_cannot_match_the_saved_checkpoint
-#print axioms one_prefix_cannot_match_two_checkpoints
-
 end Hibana.Epf.Capture

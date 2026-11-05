@@ -123,15 +123,4 @@ theorem sending_before_that_predecessor_fails_the_source_check :
 theorem delayed_publication_can_hide_an_early_send_in_the_commit_projection :
     endpointCommits authorizedSend = endpointCommits earlySend := rfl
 
-#print axioms endpoint_projection_preserves_append
-#print axioms acceptance_enables_both_completion_sides
-#print axioms a_receipt_needs_acceptance
-#print axioms receiver_before_publication_has_a_source_execution
-#print axioms publication_before_receiver_has_a_source_execution
-#print axioms a_legal_endpoint_projection_can_start_with_receipt
-#print axioms omitting_acceptance_has_the_same_endpoint_projection
-#print axioms a_send_after_its_source_predecessor_has_a_complete_execution
-#print axioms sending_before_that_predecessor_fails_the_source_check
-#print axioms delayed_publication_can_hide_an_early_send_in_the_commit_projection
-
 end Hibana.Epf

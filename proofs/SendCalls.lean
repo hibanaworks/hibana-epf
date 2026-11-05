@@ -66,12 +66,6 @@ theorem word_and_bit_coordinates_are_injective
     _ = second % width + width * (second / width) := by rw [sameWord, sameBit]
     _ = second := Nat.mod_add_div second width
 
-#print axioms checked_marks_preserve_unique_positions
-#print axioms checked_marks_keep_exactly_the_input_and_prior_positions
-#print axioms a_successful_prefix_check_never_reuses_a_record_position
-#print axioms an_already_seen_publication_position_is_rejected
-#print axioms word_and_bit_coordinates_are_injective
-
 /-- An observed roll-reset claim; validation must additionally establish its
 membership in the compiled source. This is history, not execution authority. -/
 structure ResetClaim where
@@ -114,9 +108,6 @@ theorem unrelated_resets_cannot_explain_a_change
     · omega
     · omega
 
-#print axioms a_changed_poll_requires_its_reset
-#print axioms unrelated_resets_cannot_explain_a_change
-
 /-- Exact fixed-width masks, for every word width, including Rust's 32- and
 64-bit targets. The library definition is `1 <<< index`. -/
 theorem mask_is_nonzero (inside : index < width) :
@@ -155,12 +146,5 @@ theorem truncating_an_index_loses_its_bit (wide : 8 < width) :
     BitVec.twoPow width (8 % 8) &&& BitVec.twoPow width 8 = 0 ∧
       BitVec.twoPow width 8 ≠ 0 := by
   exact ⟨different_masks_are_disjoint (by decide), mask_is_nonzero wide⟩
-
-#print axioms mask_is_nonzero
-#print axioms marking_sets_the_mask
-#print axioms marking_keeps_other_bits
-#print axioms masks_are_injective
-#print axioms different_masks_are_disjoint
-#print axioms truncating_an_index_loses_its_bit
 
 end Hibana.Epf.SendCalls

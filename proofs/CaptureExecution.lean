@@ -310,23 +310,4 @@ theorem a_committed_branch_cannot_be_replaced_by_an_opposite_query :
     check pendingPlan [] [.advance (.accepted 0), .advance (.committed ⟨0, .send⟩),
       .poll (pendingQuery true) 1] = false := by decide
 
-#print axioms checked_records_have_a_source_execution
-#print axioms a_poll_does_not_append_a_source_point
-#print axioms checking_append_preserves_the_exact_source_prefix
-#print axioms each_checked_advance_retains_its_resumption_obligation
-#print axioms repeating_a_poll_does_not_duplicate_acceptance
-#print axioms an_unobserved_predecessor_rejects_admission
-#print axioms a_poll_alone_cannot_support_acceptance
-#print axioms supported_acceptance_is_after_its_poll
-#print axioms supported_acceptance_is_before_publication
-#print axioms supported_acceptance_is_before_receipt
-#print axioms receipt_before_publication_can_support_acceptance
-#print axioms resumption_dependencies_read_only_commits
-#print axioms resumption_queries_read_only_commits
-#print axioms admission_depends_on_the_committed_prefix
-#print axioms each_checked_query_preserves_the_committed_prefix
-#print axioms a_published_sender_cannot_be_queried_again
-#print axioms opposite_uncommitted_queries_preserve_the_empty_source_word
-#print axioms a_committed_branch_cannot_be_replaced_by_an_opposite_query
-
 end Hibana.Epf.CaptureExecution

@@ -30,11 +30,6 @@ theorem witness_retains_every_original_occurrence (source : Source) (start : Nat
     simp_all [witness, SourceUnfolding.oneCopy, SourceUnfolding.occurrences,
       Source.messageEntries]
 
-#print axioms event_count_is_unchanged
-#print axioms messages_and_source_identities_are_unchanged
-#print axioms sequence_order_is_unchanged
-#print axioms witness_retains_every_original_occurrence
-
 /-- Mapping an event through the removal of an inserted body. Inserted events
 occupy the original focus's side of every enclosing binary subtree. -/
 def collapseInsertion (start added event : Nat) : Nat :=
@@ -73,9 +68,5 @@ theorem split_search_exact (cut first last : Nat)
   next h => omega
 termination_by last - first
 decreasing_by all_goals omega
-
-#print axioms collapse_before_cut
-#print axioms collapse_after_cut
-#print axioms split_search_exact
 
 end Hibana.Epf.CompactSource

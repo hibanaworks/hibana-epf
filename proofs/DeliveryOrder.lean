@@ -52,10 +52,4 @@ theorem individually_matched_receives_can_cycle :
       have backward := checked_edges_increase_rank checked (by decide : (3, 0) ∈ _)
       omega
 
-#print axioms checked_edges_increase_rank
-#print axioms checked_paths_increase_rank
-#print axioms checked_edges_have_no_cycle
-#print axioms receipt_can_precede_publication
-#print axioms individually_matched_receives_can_cycle
-
 end Hibana.Epf.DeliveryOrder
