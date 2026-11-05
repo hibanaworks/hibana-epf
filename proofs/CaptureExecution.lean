@@ -43,6 +43,15 @@ def admissionReady (plan : SourceOccurrenceCut source) (points : List SourcePoin
     (cut.resumptionReady (.accepted event) &&
       !points.contains (.committed ⟨event, .send⟩))
 
+/-- No choice of checked path can admit a send occurrence already published
+in this same unfolding. An uncommitted acceptance alone is not publication. -/
+theorem a_published_send_is_not_admission_ready
+    (plan : SourceOccurrenceCut source) (points : List SourcePoint) (event : Nat)
+    (published : points.contains (.committed ⟨event, .send⟩) = true) :
+    admissionReady plan points event = false := by
+  unfold admissionReady
+  simp only [published, Bool.not_true, Bool.and_false]
+
 /-- A different selection must preserve every committed operation's actor and
 all of its prefix prerequisites. Uncommitted acceptances do not freeze an arm. -/
 def queryCompatible (plan query : SourceOccurrenceCut source)

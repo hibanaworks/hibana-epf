@@ -18,14 +18,17 @@ impl SourcePath<'_, '_, '_> {
         actor: u8,
         workspace: &mut [usize],
     ) -> bool {
+        let finish = match point {
+            SourcePoint::Accepted(event) => SourcePoint::Sent(event),
+            other => other,
+        };
+        // A different choice cannot undo publication or repeat a committed
+        // point of this same unfolding. Reject before searching other paths.
+        if history.clone().any(|prior| prior == finish) {
+            return false;
+        }
         let available = |path: &SourcePath<'_, '_, '_>| {
-            let finish = match point {
-                SourcePoint::Accepted(event) => SourcePoint::Sent(event),
-                other => other,
-            };
-            path.point_actor(point) == Some(actor)
-                && !history.clone().any(|prior| prior == finish)
-                && path.missing(history.clone(), point).is_none()
+            path.point_actor(point) == Some(actor) && path.missing(history.clone(), point).is_none()
         };
         if available(self) {
             return true;

@@ -7,6 +7,48 @@ use hibana::{
 };
 use std::{vec, vec::Vec};
 
+#[test]
+fn completed_points_reject_without_searching_unrelated_choices() {
+    let global = g::seq(
+        g::send::<0, 1, g::Msg<1, ()>>(),
+        g::seq(
+            g::route(
+                g::send::<0, 1, g::Msg<2, ()>>(),
+                g::send::<0, 1, g::Msg<3, ()>>(),
+            )
+            .resolve::<77>(),
+            g::send::<0, 0, g::Msg<4, ()>>(),
+        ),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&[Unfold::Source])];
+    let source = protocol.unfolding(&[Unfold::Source], &mut proof).unwrap();
+    let mut actors = vec![0; source.path_workspace_len().unwrap()];
+    let path = source
+        .select(
+            &[crate::RouteChoice {
+                span: [1, 3],
+                right: false,
+            }],
+            &mut actors,
+        )
+        .unwrap();
+    let history = [
+        SourcePoint::Sent(0),
+        SourcePoint::Received(0),
+        SourcePoint::Local(3),
+    ];
+    for point in [SourcePoint::Accepted(0), history[0], history[1], history[2]] {
+        for actor in [0, 1, 255] {
+            // A completed occurrence needs no alternate-path workspace,
+            // even though this unfolding contains a different route.
+            assert!(!path.query_ready(history.into_iter(), point, actor, &mut []));
+        }
+    }
+}
+
 // The unfactored prerequisite rule, kept only as a comparison for the optimized
 // check. It deliberately evaluates resumption even for already present points.
 fn reference(

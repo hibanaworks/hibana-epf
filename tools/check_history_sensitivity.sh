@@ -11,7 +11,8 @@ cargo +stable test --locked --lib --features std protocol::history::tests \
 cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished CommittedSelection; do
+mutation_count=0
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished QueryCompletedSearch CommittedSelection; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -80,7 +81,10 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
       perl -0pi -e 's/\&\& audit\.causal_key\(\) as u8 != u8::from\(right\)/\&\& false \&\& audit.causal_key() as u8 != u8::from(right)/g == 1 or die "missing query decision correspondence\n"' "$source/src/protocol/execution.rs"
       ;;
     QueryFinished)
-      perl -0pi -e 's/\&\& !history\.clone\(\)\.any\(\|prior\| prior == finish\)/\&\& (!history.clone().any(|prior| prior == finish) || true)/g == 1 or die "missing unfinished query check\n"' "$source/src/protocol/query.rs"
+      perl -0pi -e 's/if history\.clone\(\)\.any\(\|prior\| prior == finish\)/if false \&\& history.clone().any(|prior| prior == finish)/g == 1 or die "missing unfinished query check\n"' "$source/src/protocol/query.rs"
+      ;;
+    QueryCompletedSearch)
+      perl -0pi -e 's/if history\.clone\(\)\.any\(\|prior\| prior == finish\)/if false \&\& history.clone().any(|prior| prior == finish)/g == 1 or die "missing completed query pruning\n"; s/path\.point_actor\(point\) == Some\(actor\)/path.point_actor(point) == Some(actor) \&\& !history.clone().any(|prior| prior == finish)/g == 1 or die "missing candidate readiness\n"' "$source/src/protocol/query.rs"
       ;;
     CommittedSelection)
       perl -0pi -e 's/\|\| self\.actors\(event\)\.is_some\(\)/|| true/g == 1 or die "missing committed selection membership\n"' "$source/src/protocol/execution.rs"
@@ -172,6 +176,8 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         cancelled_resolved_send_can_retry_the_other_arm_before_any_commit -- --exact ;;
       QueryFinished) cargo +stable test --locked --test endpoint_observation \
         cancelled_offer_records_a_decision_without_consuming_the_source_operation -- --exact ;;
+      QueryCompletedSearch) cargo +stable test --locked --lib \
+        protocol::word::tests::completed_points_reject_without_searching_unrelated_choices -- --exact ;;
       CommittedSelection) cargo +stable test --locked --test source_interpretation \
         a_committed_route_selection_cannot_name_an_unselected_query_occurrence -- --exact ;;
     esac
@@ -205,11 +211,13 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     ResolverEvidence) name=automatic_audit_checks_resolver_calls_from_outgoing_offers_in_each_visit ;;
     QuerySelection|QueryDecision) name=cancelled_resolved_send_can_retry_the_other_arm_before_any_commit ;;
     QueryFinished) name=cancelled_offer_records_a_decision_without_consuming_the_source_operation ;;
+    QueryCompletedSearch) name=protocol::word::tests::completed_points_reject_without_searching_unrelated_choices ;;
     CommittedSelection) name=a_committed_route_selection_cannot_name_an_unselected_query_occurrence ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"
   find "$source/target" -type f -perm -100 -exec shasum -a 256 -- {} + > "$out/$mutation-binaries.sha256"
   printf 'mutation=%s\nexit=%s\n' "$mutation" "$status" > "$out/$mutation-result.txt"
+  mutation_count=$((mutation_count + 1))
   rm -r -- "$source"
 done
-echo "History sensitivity: twenty-nine prefix, call, delivery, source-execution, index, construction, resolver-evidence and cancelled-query defects fail their regressions"
+printf 'History sensitivity: %s prefix, call, delivery, source-execution, index, construction, resolver-evidence and cancelled-query defects fail their regressions\n' "$mutation_count"
