@@ -217,27 +217,37 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                 }
             }
         }
+        // The traversal stack is dead now. Reuse it for immutable source
+        // locators instead of walking the unfolding for each pair below.
+        let origins = &mut stack[..count];
+        for event in 0..count {
+            if actors[event] != usize::MAX {
+                origins[event] = usize::from(self.origin(event).unwrap());
+            }
+        }
         for first in 0..count {
             if actors[first] == usize::MAX {
                 continue;
             }
+            let a = records[layout.sources.start + origins[first]];
             for second in first + 1..count {
                 if actors[second] == usize::MAX {
                     continue;
                 }
                 let sides = |packed: usize| [packed >> 8, packed & 255];
-                if self.independent_between(first, second)
-                    && sides(actors[first])
-                        .iter()
-                        .any(|actor| sides(actors[second]).contains(actor))
+                if sides(actors[first])
+                    .iter()
+                    .any(|actor| sides(actors[second]).contains(actor))
+                    && self.independent_between(first, second)
                 {
                     return Err(PathError::ParallelActor { first, second });
                 }
-                if self.before(first, second) {
+                let b = records[layout.sources.start + origins[second]];
+                if (a.causal_key() >> 8 != 1 && b.causal_key() >> 8 != 1)
+                    || self.before(first, second)
+                {
                     continue;
                 }
-                let a = records[layout.sources.start + usize::from(self.origin(first).unwrap())];
-                let b = records[layout.sources.start + usize::from(self.origin(second).unwrap())];
                 for (transfer, other) in [(a, b), (b, a)] {
                     if transfer.causal_key() >> 8 != 1 {
                         continue;
