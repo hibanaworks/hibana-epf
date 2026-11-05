@@ -8,6 +8,55 @@ use hibana::{
 use std::{vec, vec::Vec};
 
 #[test]
+fn impossible_directions_and_fixed_actors_reject_before_choice_search() {
+    let global = g::seq(
+        g::send::<0, 1, g::Msg<1, ()>>(),
+        g::seq(
+            g::route(
+                g::send::<0, 1, g::Msg<2, ()>>(),
+                g::send::<0, 1, g::Msg<3, ()>>(),
+            )
+            .resolve::<77>(),
+            g::send::<0, 0, g::Msg<4, ()>>(),
+        ),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&[Unfold::Source])];
+    let source = protocol.unfolding(&[Unfold::Source], &mut proof).unwrap();
+    let mut actors = vec![0; source.path_workspace_len().unwrap()];
+    let path = source
+        .select(
+            &[crate::RouteChoice {
+                span: [1, 3],
+                right: false,
+            }],
+            &mut actors,
+        )
+        .unwrap();
+    for event in 0..4 {
+        for point in [
+            SourcePoint::Local(event),
+            SourcePoint::Accepted(event),
+            SourcePoint::Sent(event),
+            SourcePoint::Received(event),
+        ] {
+            for actor in [0, 1, 255] {
+                if path
+                    .point_binding(point)
+                    .is_none_or(|(_, fixed)| fixed != u32::from(actor))
+                {
+                    // An impossible direction or constant actor cannot be fixed
+                    // by changing thousands of unrelated future route choices.
+                    assert!(!path.query_ready(core::iter::empty(), point, actor, &mut []));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn completed_points_reject_without_searching_unrelated_choices() {
     let global = g::seq(
         g::send::<0, 1, g::Msg<1, ()>>(),

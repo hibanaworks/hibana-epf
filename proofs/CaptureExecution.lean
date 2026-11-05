@@ -3,6 +3,39 @@ import Hibana.SourceOccurrenceTrace
 namespace Hibana.Epf.CaptureExecution
 open EndpointDelegation
 
+/-- The operation class is fixed by logical endpoints, even if two logical
+views happen to have the same physical actor. Changing choices cannot turn a
+wire message into a local action. -/
+theorem wire_message_cannot_decode_a_local_action
+    (bindings : List (Nat × Binding)) (event : Nat) (binding : Binding)
+    (found : bindings.find? (fun row => row.1 == event) = some (event, binding))
+    (different : binding.message.sender ≠ binding.message.receiver) :
+    action? bindings ⟨event, .local⟩ = none := by
+  simp [action?, found, different]
+
+theorem logical_self_message_cannot_decode_wire_halves
+    (bindings : List (Nat × Binding)) (event : Nat) (binding : Binding)
+    (found : bindings.find? (fun row => row.1 == event) = some (event, binding))
+    (same : binding.message.sender = binding.message.receiver) :
+    action? bindings ⟨event, .send⟩ = none ∧ action? bindings ⟨event, .receive⟩ = none := by
+  simp [action?, found, same]
+
+/-- A terminal compiled actor reference has no choice dependence. The checker
+does not apply this pruning rule to conditional references at or above 256. -/
+theorem terminal_actor_reference_is_choice_independent
+    (columns : DecodedProgramColumns) (selected : Nat → Option RouteArm)
+    (reference : Nat) (fixed : reference < 256) :
+    columns.selectedActor? selected reference = some reference := by
+  change (if reference < 256 then some reference else _) = some reference
+  rw [if_pos fixed]
+
+theorem a_different_actor_cannot_match_a_terminal_reference
+    (columns : DecodedProgramColumns) (selected : Nat → Option RouteArm)
+    (reference actor : Nat) (fixed : reference < 256) (different : reference ≠ actor) :
+    columns.selectedActor? selected reference ≠ some actor := by
+  rw [terminal_actor_reference_is_choice_independent columns selected reference fixed]
+  simpa using different
+
 /-- A readiness query uses another checked selection of the same unfolding,
 not another source, visit expansion or initial resource issuance. -/
 structure Query (plan : SourceOccurrenceCut source) where

@@ -133,18 +133,36 @@ impl SourcePath<'_, '_, '_> {
     }
 
     pub(super) fn point_actor(&self, point: SourcePoint) -> Option<u8> {
+        let (side, _) = self.point_binding(point)?;
+        Some(self.actors(point.event())?[side])
+    }
+
+    // Direction is fixed by the logical source message, independently of the
+    // selected arm or current holder. A terminal binding is likewise constant.
+    pub(super) fn point_binding(&self, point: SourcePoint) -> Option<(usize, u32)> {
         let event = point.event();
-        let actors = self.actors(event)?;
         let source = self.unfolding();
         let protocol = source.protocol();
         let layout = Layout::checked(protocol);
-        let row = protocol.records[layout.sources.start + usize::from(source.origin(event)?)];
+        let origin = usize::from(self.origin(event)?);
+        let row = protocol.records[layout.sources.start + origin];
         let local = row.arg0() >> 24 == (row.arg0() >> 16) & 255;
-        match point {
-            SourcePoint::Local(_) if local => Some(actors[0]),
-            SourcePoint::Accepted(_) | SourcePoint::Sent(_) if !local => Some(actors[0]),
-            SourcePoint::Received(_) if !local => Some(actors[1]),
-            _ => None,
-        }
+        let side = match point {
+            SourcePoint::Local(_) if local => 0,
+            SourcePoint::Accepted(_) | SourcePoint::Sent(_) if !local => 0,
+            SourcePoint::Received(_) if !local => 1,
+            _ => return None,
+        };
+        let binding = if layout.bindings.is_empty() {
+            if side == 0 {
+                row.arg0() >> 24
+            } else {
+                (row.arg0() >> 16) & 255
+            }
+        } else {
+            let row = protocol.records[layout.bindings.start + origin];
+            if side == 0 { row.arg0() } else { row.arg1() }
+        };
+        Some((side, binding))
     }
 }

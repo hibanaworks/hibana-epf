@@ -12,7 +12,7 @@ cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
 mutation_count=0
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished QueryCompletedSearch CommittedSelection; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary BoundaryIndex ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished QueryCompletedSearch QueryStaticKind QueryStaticActor CommittedSelection; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -86,6 +86,12 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     QueryCompletedSearch)
       perl -0pi -e 's/if history\.clone\(\)\.any\(\|prior\| prior == finish\)/if false \&\& history.clone().any(|prior| prior == finish)/g == 1 or die "missing completed query pruning\n"; s/path\.point_actor\(point\) == Some\(actor\)/path.point_actor(point) == Some(actor) \&\& !history.clone().any(|prior| prior == finish)/g == 1 or die "missing candidate readiness\n"' "$source/src/protocol/query.rs"
       ;;
+    QueryStaticKind)
+      perl -0pi -e 's/let Some\(\(_, binding\)\) = self\.point_binding\(point\) else \{\n            return false;\n        \};/let (_, binding) = self.point_binding(point).unwrap_or((0, u32::from(actor)));/g == 1 or die "missing static operation kind check\n"' "$source/src/protocol/query.rs"
+      ;;
+    QueryStaticActor)
+      perl -0pi -e 's/if binding < 256 \&\& binding != u32::from\(actor\)/if false \&\& binding < 256 \&\& binding != u32::from(actor)/g == 1 or die "missing static actor check\n"' "$source/src/protocol/query.rs"
+      ;;
     CommittedSelection)
       perl -0pi -e 's/\|\| self\.actors\(event\)\.is_some\(\)/|| true/g == 1 or die "missing committed selection membership\n"' "$source/src/protocol/execution.rs"
       ;;
@@ -108,6 +114,10 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     SplitBoundary)
       perl -0pi -e 's/if left \{\n                first = middle \+ 1;/if !left {\n                first = middle + 1;/g == 1 or die "missing structural boundary search\n"' \
         "$source/src/protocol/unfolding.rs"
+      ;;
+    BoundaryIndex)
+      perl -0pi -e 's/node = row\[0\];/return None;/g == 1 or die "missing indexed parent traversal\n"' \
+        "$source/src/protocol/path.rs"
       ;;
     ScopeLookup)
       perl -0pi -e 's/records\[index\]\.causal_key\(\) < key/records[index].causal_key() <= key/g == 1 or die "missing indexed scope lower bound\n"' "$source/src/protocol.rs"
@@ -163,7 +173,7 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         an_observed_send_poll_can_end_in_a_transport_error_without_a_commit -- --exact ;;
       ConstructorOrder) cargo +stable test --locked --test source_interpretation \
         causal_order_search_matches_every_interleaving_and_rejects_an_early_reply -- --exact ;;
-      SplitInsertion|SplitBoundary) cargo +stable test --locked --lib \
+      SplitInsertion|SplitBoundary|BoundaryIndex) cargo +stable test --locked --lib \
         protocol::unfolding::tests::structural_splits_match_full_cut_enumeration_across_all_unfolding_constructors -- --exact ;;
       ScopeLookup) cargo +stable test --locked --lib protocol::index_tests::retained_scope_index_matches_exhaustive_marker_lookup -- --exact ;;
       HeadPrefix) cargo +stable test --locked --test source_unfolding compiled_scope_nesting_preserves_sequence_parallel_and_choice -- --exact ;;
@@ -178,6 +188,8 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         cancelled_offer_records_a_decision_without_consuming_the_source_operation -- --exact ;;
       QueryCompletedSearch) cargo +stable test --locked --lib \
         protocol::word::tests::completed_points_reject_without_searching_unrelated_choices -- --exact ;;
+      QueryStaticKind|QueryStaticActor) cargo +stable test --locked --lib \
+        protocol::word::tests::impossible_directions_and_fixed_actors_reject_before_choice_search -- --exact ;;
       CommittedSelection) cargo +stable test --locked --test source_interpretation \
         a_committed_route_selection_cannot_name_an_unselected_query_occurrence -- --exact ;;
     esac
@@ -202,7 +214,7 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     ConstructorValidation) name=a_committed_route_selection_cannot_name_an_unselected_query_occurrence ;;
     AcceptanceEvidence) name=an_observed_send_poll_can_end_in_a_transport_error_without_a_commit ;;
     ConstructorOrder) name=causal_order_search_matches_every_interleaving_and_rejects_an_early_reply ;;
-    SplitInsertion|SplitBoundary) name=protocol::unfolding::tests::structural_splits_match_full_cut_enumeration_across_all_unfolding_constructors ;;
+    SplitInsertion|SplitBoundary|BoundaryIndex) name=protocol::unfolding::tests::structural_splits_match_full_cut_enumeration_across_all_unfolding_constructors ;;
     ScopeLookup) name=protocol::index_tests::retained_scope_index_matches_exhaustive_marker_lookup ;;
     HeadPrefix) name=compiled_scope_nesting_preserves_sequence_parallel_and_choice ;;
     BranchDemand) name=protocol::unfolding::generate::tests::branch_demands_add_while_sequence_parallel_and_nested_roll_share_visits ;;
@@ -212,6 +224,7 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     QuerySelection|QueryDecision) name=cancelled_resolved_send_can_retry_the_other_arm_before_any_commit ;;
     QueryFinished) name=cancelled_offer_records_a_decision_without_consuming_the_source_operation ;;
     QueryCompletedSearch) name=protocol::word::tests::completed_points_reject_without_searching_unrelated_choices ;;
+    QueryStaticKind|QueryStaticActor) name=protocol::word::tests::impossible_directions_and_fixed_actors_reject_before_choice_search ;;
     CommittedSelection) name=a_committed_route_selection_cannot_name_an_unselected_query_occurrence ;;
   esac
   grep -Fxq "test $name ... FAILED" "$out/$mutation.log"

@@ -72,8 +72,9 @@ impl<'p> Protocol<'p> {
             .ok_or(AuditError::Overflow)
     }
 
-    /// Eight search words and five retained words per derivation node, three
-    /// retained words per possible message, and execution-checking workspace.
+    /// Eight search words and five retained words per derivation node, one
+    /// actor word and two immutable locators per possible message, three per
+    /// binary source boundary, and reusable checking workspace.
     /// All capacities derive from the supplied source, captures and proof size.
     pub fn audit_workspace_len(
         &self,
@@ -82,6 +83,11 @@ impl<'p> Protocol<'p> {
     ) -> Result<usize, AuditError> {
         let layout = Layout::checked(*self);
         let events = self.audit_choice_capacity(derivation_capacity)?;
+        let parts = Layout::path_index_words(events).ok_or(AuditError::Overflow)?;
+        let query = events
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(layout.path_scratch_words(events)?))
+            .ok_or(AuditError::Overflow)?;
         // Also ensure every insertion interval's enumeration is representable.
         events
             .checked_mul(events.checked_add(1).ok_or(AuditError::Overflow)?)
@@ -94,16 +100,13 @@ impl<'p> Protocol<'p> {
             .checked_mul(8)
             .and_then(|n| n.checked_add(captures.len()))
             .and_then(|n| n.checked_add(self.custody_words(captures)?))
-            .and_then(|n| n.checked_add(events.checked_mul(4)?))
-            .and_then(|n| n.checked_add(layout.initial.len()))
-            .and_then(|n| n.checked_add(layout.choices.len()))
+            .and_then(|n| n.checked_add(query))
             .ok_or(AuditError::Overflow)?;
         derivation_capacity
             .checked_mul(13)
             .and_then(|n| n.checked_add(layout.sources.len().checked_mul(2)?))
-            .and_then(|n| n.checked_add(events.checked_mul(3)?))
-            .and_then(|n| n.checked_add(layout.initial.len()))
-            .and_then(|n| n.checked_add(layout.choices.len()))
+            .and_then(|n| n.checked_add(events))
+            .and_then(|n| n.checked_add(parts))
             .and_then(|n| n.checked_add(execution.max(events.checked_mul(2)?)))
             .ok_or(AuditError::Overflow)
     }
@@ -150,8 +153,8 @@ impl<'p> Protocol<'p> {
         let (search, rest) =
             workspace[..required].split_at_mut(8 * capacity + 2 * layout.sources.len());
         let (proof, rest) = rest.split_at_mut(5 * capacity);
-        let (actors, scratch) =
-            rest.split_at_mut(3 * events + layout.initial.len() + layout.choices.len());
+        let (actors, scratch) = rest.split_at_mut(events);
+        let (parts, scratch) = scratch.split_at_mut(Layout::path_index_words(events).unwrap());
         let ExecutionStorage {
             session,
             order,
@@ -181,7 +184,8 @@ impl<'p> Protocol<'p> {
                 loop {
                     let selected =
                         route_choices(source, choices, retained, captures, session, scratch);
-                    if let Ok(path) = source.select(&choices[..selected], actors) {
+                    if let Ok(path) = source.select_in(&choices[..selected], actors, parts, scratch)
+                    {
                         match path.interpret(
                             captures,
                             ExecutionStorage {
@@ -222,7 +226,7 @@ impl<'p> Protocol<'p> {
             .unfolding(&unfolding[..size], proof)
             .expect("checked derivation");
         let path = source
-            .select(&choices[..selected], actors)
+            .select_in(&choices[..selected], actors, parts, scratch)
             .expect("checked selections");
         let execution = ExecutionWitness {
             session,

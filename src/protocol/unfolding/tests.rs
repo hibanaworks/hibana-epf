@@ -15,6 +15,12 @@ fn compare(snapshot: &[TapEvent], steps: &[Unfold]) {
     let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
     let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(steps)];
     let source = protocol.unfolding(steps, &mut scratch).unwrap();
+    let mut parts = vec![usize::MAX; Layout::path_index_words(source.event_count()).unwrap()];
+    let mut parents = vec![0; source.event_count()];
+    let mut stack = vec![0; 2 * source.event_count()];
+    source
+        .index_source(&mut parts, &mut parents, &mut stack)
+        .unwrap();
     for first in 0..=source.event_count() {
         for last in 0..=source.event_count() + 1 {
             let span = [first, last];
@@ -34,6 +40,13 @@ fn compare(snapshot: &[TapEvent], steps: &[Unfold]) {
                 reference,
                 "span {span:?}, steps {steps:?}"
             );
+            if reference.is_some() {
+                assert_eq!(
+                    source.indexed_parts(span, &parts),
+                    reference,
+                    "indexed span {span:?}, steps {steps:?}"
+                );
+            }
         }
     }
 }

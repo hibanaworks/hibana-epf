@@ -142,13 +142,13 @@ impl SourcePath<'_, '_, '_> {
                 continue;
             }
             let Some(event) = event.filter(|&event| {
-                source.origin(event).is_some()
+                self.origin(event).is_some()
                     && (matches!(record.id(), tap::SEND_POLL | tap::RESOLVER_AUDIT)
                         || self.actors(event).is_some())
             }) else {
                 return Err(ExecutionError::Record { position });
             };
-            let origin = source.origin(event).unwrap();
+            let origin = self.origin(event).unwrap();
             let row = protocol.records[layout.sources.start + usize::from(origin)];
             let actor = (record.causal_key() >> 8) as u8;
             let point = operation_point(row, record, event);
@@ -196,7 +196,7 @@ impl SourcePath<'_, '_, '_> {
                     }
                 } else {
                     let right = if record.id() == tap::RESOLVER_AUDIT {
-                        source.route_at(event, scope).map(|(_, right)| right)
+                        self.route_at(event, scope).map(|(_, right)| right)
                     } else {
                         self.choice_at(event, scope)
                     };
@@ -230,7 +230,7 @@ impl SourcePath<'_, '_, '_> {
                 continue;
             }
             let scope = (audit.arg1() >> 16) as u16;
-            let (visit, right) = source
+            let (visit, right) = self
                 .route_at(witness.occurrences[position].unwrap(), scope)
                 .unwrap();
             for (at, &prior) in order[..position].iter().enumerate() {
@@ -244,7 +244,7 @@ impl SourcePath<'_, '_, '_> {
                     continue;
                 }
                 if let Some((span, arm)) =
-                    witness.occurrences[at].and_then(|event| source.route_at(event, scope))
+                    witness.occurrences[at].and_then(|event| self.route_at(event, scope))
                     && span == visit
                     && arm != right
                 {
@@ -298,7 +298,7 @@ impl SourcePath<'_, '_, '_> {
                 if choice.arg1() == 0 || choice.arg0() != u32::from(poll.causal_key() as u8) {
                     continue;
                 }
-                let Some((visit, right)) = source.route_at(event, scope) else {
+                let Some((visit, right)) = self.route_at(event, scope) else {
                     continue;
                 };
                 let same_actor = |prior: TapEvent| {
@@ -306,8 +306,7 @@ impl SourcePath<'_, '_, '_> {
                 };
                 let in_visit = |at: usize| {
                     witness.occurrences[at].is_some_and(|event| {
-                        source
-                            .route_at(event, scope)
+                        self.route_at(event, scope)
                             .is_some_and(|(span, _)| span == visit)
                     })
                 };
@@ -365,7 +364,7 @@ impl SourcePath<'_, '_, '_> {
             }
             let event = witness.occurrences[position].unwrap();
             let row =
-                protocol.records[layout.sources.start + usize::from(source.origin(event).unwrap())];
+                protocol.records[layout.sources.start + usize::from(self.origin(event).unwrap())];
             if let Some(point) = operation_point(row, record, event) {
                 if record.id() == tap::SEND_POLL {
                     if !self.query_ready(

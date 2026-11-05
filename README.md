@@ -297,16 +297,27 @@ both choice arms, repeated and independently unfolded rolls, and resumption
 before, alongside or after the continuation. Source regions are derived from
 the compiled root. A shared proof step must refer to the same source region;
 an insertion must name an actual subtree. No catalogue of fixed visit counts
-limits the witness. The checker retains five words per proof step and reads
-expanded origins and source order without constructing an expanded tree.
+limits the witness. The unfolding witness retains five words per proof step;
+the selected path's expanded lookup storage is sized separately.
 
 `Unfolded::select` checks a choice for each active expanded route and derives
 physical actors from the original resource bindings and selected transfers.
 It compares them with the compiled conditional bindings under those same
 choices. Separate visits can choose different arms. Parallel transfer/use
 conflicts, overlapping physical actors in independent visits, unselected
-resumption anchors and changed entry owners are rejected. Temporary storage
-is derived from expanded event, initial binding and compiled choice counts.
+resumption anchors and changed entry owners are rejected. Path selection uses
+`8N - 3 + I + C + A` caller-owned words for `N > 0` expanded messages,
+`I` initial bindings, `C` compiled choices and `A = max_role + 1` actor tags.
+This includes actor rows, the immutable index and reusable traversal scratch.
+The checked source's binary boundaries are indexed once, using three words
+per boundary and two words per message for its origin and proof-leaf order.
+Readiness queries borrow that immutable index instead of rediscovering the
+same subtrees for each alternative choice. Only the actor
+rows and index remain borrowed; selection scratch is reused for execution
+checking. Neither index nor reconstructed history grants an operation right.
+Independent visits are checked at adjacent occurrences of each physical actor
+in proof-leaf order, including tails split by insertion. Transfer/use conflicts
+are checked from each actual transfer instead of every ordinary message pair.
 
 `SourcePath::check_word` checks every prefix of a proposed source word.
 Acceptance, sender publication, receiver commit and a local action are
@@ -315,6 +326,11 @@ outgoing-continuation prerequisites activated by a committed resumed body.
 An incoming continuation already accepted by its sender does not acquire a
 new outgoing prerequisite. Reusing a proof DAG in two visits does not share
 their dynamic entry history.
+
+Readiness queries reject an impossible logical operation kind or a mismatched
+terminal actor binding before searching alternative choices. Conditional actor
+bindings still undergo selection and prefix checking. This pruning does not
+change the source domain; the remaining choice search can be exponential.
 
 `SourcePath::check_execution(captures, witness, workspace)` connects the complete
 captures to that selected path for one named session. The witness supplies an

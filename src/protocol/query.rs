@@ -1,11 +1,12 @@
 //! Readiness of an uncommitted attempt against the committed source prefix.
-use super::{PathError, SourcePath, SourcePoint};
+use super::{Layout, PathError, SourcePath, SourcePoint};
 
 impl SourcePath<'_, '_, '_> {
     pub(super) fn query_workspace_len(&self) -> Option<usize> {
-        self.unfolding()
-            .event_count()
-            .checked_add(self.unfolding().path_workspace_len().ok()?)
+        let source = self.unfolding();
+        source.event_count().checked_mul(2)?.checked_add(
+            Layout::checked(source.protocol()).path_scratch_words(source.event_count())?,
+        )
     }
 
     /// A query may select an uncommitted arm, but cannot change the actors,
@@ -18,6 +19,12 @@ impl SourcePath<'_, '_, '_> {
         actor: u8,
         workspace: &mut [usize],
     ) -> bool {
+        let Some((_, binding)) = self.point_binding(point) else {
+            return false;
+        };
+        if binding < 256 && binding != u32::from(actor) {
+            return false;
+        }
         let finish = match point {
             SourcePoint::Accepted(event) => SourcePoint::Sent(event),
             other => other,
@@ -35,6 +42,7 @@ impl SourcePath<'_, '_, '_> {
         }
         let source = self.unfolding();
         let (choices, storage) = workspace.split_at_mut(source.event_count());
+        let (actors, scratch) = storage.split_at_mut(source.event_count());
         choices.fill(0);
         loop {
             let mut used = 0;
@@ -67,7 +75,9 @@ impl SourcePath<'_, '_, '_> {
                             Ok(if *slot == 1 { !preferred } else { preferred })
                         }
                     },
-                    storage,
+                    actors,
+                    self.index,
+                    scratch,
                 );
             if let Ok(path) = candidate {
                 let compatible = history.clone().enumerate().all(|(index, prior)| {

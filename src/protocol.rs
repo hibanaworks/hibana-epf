@@ -174,6 +174,28 @@ impl Layout {
         self.decisions.len().div_ceil(usize::BITS as usize)
     }
 
+    fn path_scratch_words(&self, events: usize) -> Option<usize> {
+        events
+            .checked_mul(2)?
+            .checked_add(self.initial.len())?
+            .checked_add(self.choices.len())?
+            .checked_add(usize::from(self.max_role) + 1)
+    }
+
+    fn binary_words(events: usize) -> Option<usize> {
+        events.saturating_sub(1).checked_mul(3)
+    }
+
+    fn path_index_words(events: usize) -> Option<usize> {
+        Self::binary_words(events)?.checked_add(events.checked_mul(2)?)
+    }
+
+    fn path_words(&self, events: usize) -> Option<usize> {
+        self.path_scratch_words(events)?
+            .checked_add(events)?
+            .checked_add(Self::path_index_words(events)?)
+    }
+
     fn read(records: &[TapEvent]) -> Result<Self, ProtocolError> {
         if records.len() < 2 {
             return Err(ProtocolError::Length {

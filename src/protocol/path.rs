@@ -52,16 +52,15 @@ pub enum PathError {
 pub struct SourcePath<'p, 'u, 'w> {
     source: Unfolded<'p, 'u>,
     actors: &'w [usize],
+    pub(super) index: &'w [usize],
 }
 
 impl<'p, 'u> Unfolded<'p, 'u> {
-    /// Temporary words for selecting and normalizing this finite source.
+    /// Caller-owned actor rows, immutable binary index and selection scratch.
     pub fn path_workspace_len(&self) -> Result<usize, PathError> {
         let layout = Layout::checked(self.protocol());
-        self.event_count()
-            .checked_mul(3)
-            .and_then(|n| n.checked_add(layout.initial.len()))
-            .and_then(|n| n.checked_add(layout.choices.len()))
+        layout
+            .path_words(self.event_count())
             .ok_or(PathError::Overflow)
     }
 
@@ -86,6 +85,20 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                 actual: workspace.len(),
             });
         }
+        let (actors, scratch) = workspace[..required].split_at_mut(self.event_count());
+        let (parts, scratch) =
+            scratch.split_at_mut(Layout::path_index_words(self.event_count()).unwrap());
+        self.select_in(choices, actors, parts, scratch)
+    }
+
+    pub(super) fn select_in<'w>(
+        &self,
+        choices: &[RouteChoice],
+        actors: &'w mut [usize],
+        parts: &'w mut [usize],
+        scratch: &mut [usize],
+    ) -> Result<SourcePath<'p, 'u, 'w>, PathError> {
+        self.index_source(parts, actors, scratch)?;
         for (index, choice) in choices.iter().enumerate() {
             if choices[..index]
                 .iter()
@@ -107,7 +120,9 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                     used += 1;
                     Ok(choice.right)
                 },
-                workspace,
+                actors,
+                parts,
+                scratch,
             )?;
         if used != choices.len() {
             return Err(PathError::Choice {
@@ -120,22 +135,31 @@ impl<'p, 'u> Unfolded<'p, 'u> {
     pub(super) fn select_by<'w>(
         &self,
         mut choose: impl FnMut([usize; 2], u16, usize) -> Result<bool, PathError>,
-        workspace: &'w mut [usize],
+        actors: &'w mut [usize],
+        parts: &'w [usize],
+        workspace: &mut [usize],
     ) -> Result<SourcePath<'p, 'u, 'w>, PathError> {
         let required = self.path_workspace_len()?;
-        if workspace.len() < required {
+        let count = self.event_count();
+        let layout = Layout::checked(self.protocol());
+        let temporary = layout.path_scratch_words(count).unwrap();
+        if actors.len() < count
+            || parts.len() < Layout::path_index_words(count).unwrap()
+            || workspace.len() < temporary
+        {
             return Err(PathError::Workspace {
                 required,
-                actual: workspace.len(),
+                actual: workspace.len() + actors.len() + parts.len(),
             });
         }
         let protocol = self.protocol();
         let records = protocol.records;
-        let layout = Layout::checked(protocol);
-        let count = self.event_count();
-        let (actors, rest) = workspace[..required].split_at_mut(count);
-        let (stack, rest) = rest.split_at_mut(2 * count);
-        let (owners, selected) = rest.split_at_mut(layout.initial.len());
+        let actors = &mut actors[..count];
+        let parts = &parts[..Layout::path_index_words(count).unwrap()];
+        let (origins, order) = parts[Layout::binary_words(count).unwrap()..].split_at(count);
+        let (stack, rest) = workspace[..temporary].split_at_mut(2 * count);
+        let (owners, rest) = rest.split_at_mut(layout.initial.len());
+        let (selected, last) = rest.split_at_mut(layout.choices.len());
         actors.fill(usize::MAX);
         selected.fill(0);
         for (owner, initial) in owners.iter_mut().zip(&records[layout.initial.clone()]) {
@@ -146,17 +170,16 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         while depth != 0 {
             depth -= 2;
             let span = [stack[depth], stack[depth + 1]];
-            let (kind, split) = self.parts(span).ok_or(PathError::Structure {
-                start: span[0],
-                end: span[1],
-            })?;
+            let (kind, split) = self
+                .indexed_parts(span, parts)
+                .ok_or(PathError::Structure {
+                    start: span[0],
+                    end: span[1],
+                })?;
             match kind {
                 NodeKind::Message => {
                     let event = span[0];
-                    let origin = usize::from(self.origin(event).ok_or(PathError::Structure {
-                        start: event,
-                        end: event + 1,
-                    })?);
+                    let origin = origins[event];
                     let source = records[layout.sources.start + origin];
                     let from = (source.arg0() >> 24) as u8;
                     let to = (source.arg0() >> 16) as u8;
@@ -217,72 +240,199 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                 }
             }
         }
-        // The traversal stack is dead now. Reuse it for immutable source
-        // locators instead of walking the unfolding for each pair below.
-        let origins = &mut stack[..count];
-        for event in 0..count {
-            if actors[event] != usize::MAX {
-                origins[event] = usize::from(self.origin(event).unwrap());
-            }
+        if let Some((first, second)) = self.independent_conflict(actors, order, last) {
+            return Err(PathError::ParallelActor { first, second });
         }
-        for first in 0..count {
-            if actors[first] == usize::MAX {
+        for transfer in 0..count {
+            if actors[transfer] == usize::MAX {
                 continue;
             }
-            let a = records[layout.sources.start + origins[first]];
-            for second in first + 1..count {
-                if actors[second] == usize::MAX {
+            let loan = records[layout.sources.start + origins[transfer]];
+            if loan.causal_key() >> 8 != 1 {
+                continue;
+            }
+            let role = loan.arg1() as u8;
+            for other in 0..count {
+                if other == transfer || actors[other] == usize::MAX {
                     continue;
                 }
-                let sides = |packed: usize| [packed >> 8, packed & 255];
-                if sides(actors[first])
-                    .iter()
-                    .any(|actor| sides(actors[second]).contains(actor))
-                    && self.independent_between(first, second)
-                {
-                    return Err(PathError::ParallelActor { first, second });
-                }
-                let b = records[layout.sources.start + origins[second]];
-                if (a.causal_key() >> 8 != 1 && b.causal_key() >> 8 != 1)
-                    || self.before(first, second)
-                {
+                let row = records[layout.sources.start + origins[other]];
+                let used = (row.arg0() >> 24) as u8 == role
+                    || (row.arg0() >> 16) as u8 == role
+                    || (row.causal_key() >> 8 == 1 && row.arg1() as u8 == role);
+                if !used {
                     continue;
                 }
-                for (transfer, other) in [(a, b), (b, a)] {
-                    if transfer.causal_key() >> 8 != 1 {
-                        continue;
-                    }
-                    let role = transfer.arg1() as u8;
-                    let used = (other.arg0() >> 24) as u8 == role
-                        || (other.arg0() >> 16) as u8 == role
-                        || (other.causal_key() >> 8 == 1 && other.arg1() as u8 == role);
-                    if used {
-                        return Err(PathError::ParallelResource {
-                            first,
-                            second,
-                            role,
-                        });
-                    }
+                let first = transfer.min(other);
+                let second = transfer.max(other);
+                if !self.before(first, second) {
+                    return Err(PathError::ParallelResource {
+                        first,
+                        second,
+                        role,
+                    });
                 }
             }
         }
         let path = SourcePath {
             source: *self,
             actors,
+            index: parts,
         };
         path.check_entries()?;
         Ok(path)
     }
+
+    // One row per binary boundary: parent boundary, subtree end and kind;
+    // followed by source origins and the permutation into proof-leaf order.
+    // The actor output is not live yet, so it supplies the DFS's parent slots.
+    pub(super) fn index_source(
+        &self,
+        parts: &mut [usize],
+        parents: &mut [usize],
+        stack: &mut [usize],
+    ) -> Result<(), PathError> {
+        let count = self.event_count();
+        let required = self.path_workspace_len()?;
+        if parts.len() < Layout::path_index_words(count).unwrap()
+            || parents.len() < count
+            || stack.len() < 2 * count
+        {
+            return Err(PathError::Workspace {
+                required,
+                actual: parts.len() + parents.len() + stack.len(),
+            });
+        }
+        let (parts, locators) = parts[..Layout::path_index_words(count).unwrap()]
+            .split_at_mut(Layout::binary_words(count).unwrap());
+        stack[..2].copy_from_slice(&[0, count]);
+        parents[0] = usize::MAX;
+        let mut depth = 2;
+        while depth != 0 {
+            depth -= 2;
+            let span = [stack[depth], stack[depth + 1]];
+            let parent = parents[depth / 2];
+            let (kind, split) = self.parts(span).ok_or(PathError::Structure {
+                start: span[0],
+                end: span[1],
+            })?;
+            let tag = match kind {
+                NodeKind::Message => continue,
+                NodeKind::Sequence => 0,
+                NodeKind::Parallel => 1,
+                NodeKind::Choice(scope) => usize::from(scope) + 2,
+            };
+            let node = split - 1;
+            parts[3 * node..3 * node + 3].copy_from_slice(&[parent, span[1], tag]);
+            stack[depth..depth + 4].copy_from_slice(&[split, span[1], span[0], split]);
+            parents[depth / 2..depth / 2 + 2].fill(node);
+            depth += 4;
+        }
+        let (origins, order) = locators.split_at_mut(count);
+        order.fill(usize::MAX);
+        for (event, origin) in origins.iter_mut().enumerate() {
+            *origin = usize::from(self.origin(event).unwrap());
+            self.contexts(event, |proof, base, position| {
+                if matches!(self.step(proof), Unfold::Source) {
+                    order[base + position] = event;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        parents[..count].fill(0);
+        for (position, &event) in order.iter().enumerate() {
+            if event >= count || parents[event] != 0 {
+                return Err(PathError::Structure {
+                    start: position,
+                    end: position + 1,
+                });
+            }
+            parents[event] = 1;
+        }
+        Ok(())
+    }
+
+    // The caller visits actual subtrees of the checked root. The boundary
+    // between its first two leaves is inside it; climb until its end matches.
+    // Below that root every such ancestor is a left child, so ends increase.
+    pub(super) fn indexed_parts(
+        &self,
+        span: [usize; 2],
+        parts: &[usize],
+    ) -> Option<(NodeKind, usize)> {
+        if span[0] >= span[1] || span[1] > self.event_count() {
+            return None;
+        }
+        if span[1] - span[0] == 1 {
+            return Some((NodeKind::Message, span[1]));
+        }
+        let mut node = span[0];
+        loop {
+            let row = parts.get(3 * node..3 * node + 3)?;
+            if row[1] == span[1] {
+                return Some((
+                    match row[2] {
+                        0 => NodeKind::Sequence,
+                        1 => NodeKind::Parallel,
+                        scope => NodeKind::Choice((scope - 2) as u16),
+                    },
+                    node + 1,
+                ));
+            }
+            if row[1] > span[1] || row[0] == usize::MAX {
+                return None;
+            }
+            node = row[0];
+        }
+    }
+
+    fn independent_conflict(
+        &self,
+        actors: &[usize],
+        order: &[usize],
+        last: &mut [usize],
+    ) -> Option<(usize, usize)> {
+        last.fill(usize::MAX);
+        // Proof-leaf order keeps every independent child contiguous, including
+        // tails split by an insertion. A shared actor across such a cut has
+        // adjacent occurrences straddling it in this order.
+        for &event in order.iter() {
+            if actors[event] == usize::MAX {
+                continue;
+            }
+            let sides = [actors[event] >> 8, actors[event] & 255];
+            for (side, actor) in sides.into_iter().enumerate() {
+                if side == 1 && sides[0] == actor {
+                    continue;
+                }
+                let previous = last[actor];
+                if previous != usize::MAX {
+                    let first = previous.min(event);
+                    let second = previous.max(event);
+                    if self.independent_between(first, second) {
+                        return Some((first, second));
+                    }
+                }
+                last[actor] = event;
+            }
+        }
+        None
+    }
 }
+
+#[cfg(test)]
+mod tests;
 
 impl SourcePath<'_, '_, '_> {
     pub(super) fn choice_at(&self, event: usize, scope: u16) -> Option<bool> {
-        let (span, _) = self.source.route_at(event, scope)?;
+        let (span, _) = self.route_at(event, scope)?;
         self.selection(span)
     }
 
     pub(super) fn selection(&self, span: [usize; 2]) -> Option<bool> {
-        let (_, split) = self.source.parts(span)?;
+        let (_, split) = self.source.indexed_parts(span, self.index)?;
         self.actors[span[0]..span[1]]
             .iter()
             .position(|&actor| actor != usize::MAX)
@@ -401,17 +551,25 @@ impl SourcePath<'_, '_, '_> {
     pub fn unfolding(&self) -> Unfolded<'_, '_> {
         self.source
     }
-}
 
-impl Unfolded<'_, '_> {
-    /// The concrete visit containing this event, including unselected arms.
-    pub(super) fn route_at(&self, event: usize, scope: u16) -> Option<([usize; 2], bool)> {
-        if event >= self.event_count() {
+    pub(super) fn origin(&self, event: usize) -> Option<u16> {
+        let count = self.source.event_count();
+        if event >= count {
             return None;
         }
-        let mut span = [0, self.event_count()];
+        Some(self.index[Layout::binary_words(count).unwrap() + event] as u16)
+    }
+}
+
+impl SourcePath<'_, '_, '_> {
+    /// The concrete visit containing this event, including unselected arms.
+    pub(super) fn route_at(&self, event: usize, scope: u16) -> Option<([usize; 2], bool)> {
+        if event >= self.source.event_count() {
+            return None;
+        }
+        let mut span = [0, self.source.event_count()];
         loop {
-            let (kind, split) = self.parts(span)?;
+            let (kind, split) = self.source.indexed_parts(span, self.index)?;
             if let NodeKind::Choice(found) = kind
                 && found == scope
             {

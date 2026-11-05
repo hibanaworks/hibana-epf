@@ -291,7 +291,7 @@ impl SourcePath<'_, '_, '_> {
                                     continue;
                                 }
                             }
-                            let origin = source.origin(event).unwrap();
+                            let origin = self.origin(event).unwrap();
                             let row = protocol.records[layout.sources.start + usize::from(origin)];
                             if let Some(point) = execution::operation_point(row, record, event) {
                                 if record.id() == tap::SEND_POLL {
@@ -459,7 +459,7 @@ impl SourcePath<'_, '_, '_> {
 
     fn matches_record(&self, record: TapEvent, event: usize) -> bool {
         let source = self.unfolding();
-        let Some(origin) = source.origin(event) else {
+        let Some(origin) = self.origin(event) else {
             return false;
         };
         let protocol = source.protocol();
@@ -481,7 +481,7 @@ impl SourcePath<'_, '_, '_> {
             return origin == record.arg1() as u16 && source.reentered(event, scope);
         }
         let choice = if record.id() == tap::RESOLVER_AUDIT {
-            source.route_at(event, scope).map(|(_, right)| right)
+            self.route_at(event, scope).map(|(_, right)| right)
         } else {
             self.choice_at(event, scope)
         };
@@ -518,7 +518,7 @@ impl SourcePath<'_, '_, '_> {
             if record.arg0() == witness.session && execution::committed(record) {
                 let event = witness.occurrences[position].unwrap();
                 let row = protocol.records
-                    [layout.sources.start + usize::from(source.origin(event).unwrap())];
+                    [layout.sources.start + usize::from(self.origin(event).unwrap())];
                 execution::put(
                     &mut word[used..used + 2],
                     execution::operation_point(row, record, event).unwrap(),
