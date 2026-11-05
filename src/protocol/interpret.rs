@@ -1,7 +1,7 @@
 //! Construct and independently check a finite capture interpretation.
 use super::{
-    Acceptance, ExecutionError, ExecutionWitness, Layout, RecordId, RouteHistoryError, SourcePath,
-    SourcePoint, execution,
+    Acceptance, CustodyError, DeliveryError, ExecutionError, ExecutionWitness, Layout, RecordId,
+    RouteHistoryError, SourcePath, SourcePoint, execution,
 };
 use crate::Capture;
 use hibana::runtime::tap::{self, TapEvent};
@@ -126,6 +126,11 @@ impl SourcePath<'_, '_, '_> {
                     error,
                 )))
             })?;
+        // During order construction the output slots hold necessary incoming
+        // poll edges. Attribution replaces them only for a complete candidate.
+        // Rebuild the edges after an unsuccessful attribution; no extra array
+        // or application progress is introduced.
+        self.prepare_predecessors(captures, occurrences, scratch)?;
         next.fill(0);
         used.fill(0);
         let mut depth = 0;
@@ -157,9 +162,26 @@ impl SourcePath<'_, '_, '_> {
                     ) => {}
                     Err(error) => return Err(error),
                 }
+                self.prepare_predecessors(captures, occurrences, scratch)?;
             } else {
                 let candidate = (next[depth]..captures.len())
-                    .find(|&producer| used[producer] < captures[producer].records().len());
+                    .filter(|&producer| used[producer] < captures[producer].records().len())
+                    .find(|&producer| {
+                        let index = captures[..producer]
+                            .iter()
+                            .map(|capture| capture.records().len())
+                            .sum::<usize>()
+                            + used[producer];
+                        occurrences[index].is_none_or(|mut predecessor| {
+                            for (other, capture) in captures.iter().enumerate() {
+                                if predecessor < capture.records().len() {
+                                    return used[other] > predecessor;
+                                }
+                                predecessor -= capture.records().len();
+                            }
+                            unreachable!("checked delivery predecessor is within its capture")
+                        })
+                    });
                 if let Some(producer) = candidate {
                     next[depth] = producer + 1;
                     order[depth] = RecordId {
@@ -208,6 +230,50 @@ impl SourcePath<'_, '_, '_> {
             depth -= 1;
             used[order[depth].producer] -= 1;
         }
+    }
+
+    fn prepare_predecessors(
+        &self,
+        captures: &[Capture<'_>],
+        incoming: &mut [Option<usize>],
+        workspace: &mut [usize],
+    ) -> Result<(), InterpretationError> {
+        incoming.fill(None);
+        // A single producer has only one ordering, already checked in full.
+        if captures.len() < 2 {
+            return Ok(());
+        }
+        let source = self.unfolding();
+        let protocol = source.protocol();
+        let deliveries = match protocol.deliveries(captures, workspace) {
+            Ok(deliveries) => deliveries,
+            // A source stream spanning producers needs its witnessed custody
+            // order. It supplies no static FIFO prune; the complete search and
+            // independent execution check still cover every ordering.
+            Err(DeliveryError::Ambiguous { .. }) => return Ok(()),
+            Err(DeliveryError::Workspace { required, actual }) => {
+                return Err(InterpretationError::Workspace { required, actual });
+            }
+            Err(DeliveryError::History { producer, error }) => {
+                return Err(InterpretationError::Evidence(ExecutionError::History(
+                    RouteHistoryError::Custody(CustodyError::History { producer, error }),
+                )));
+            }
+            Err(DeliveryError::Cycle | DeliveryError::Unmatched { .. }) => {
+                return Err(InterpretationError::NoInterpretation);
+            }
+        };
+        let index = |id: RecordId| {
+            captures[..id.producer]
+                .iter()
+                .map(|capture| capture.records().len())
+                .sum::<usize>()
+                + id.ordinal
+        };
+        for delivery in deliveries {
+            incoming[index(delivery.receive)] = Some(index(delivery.first_poll));
+        }
+        Ok(())
     }
 
     fn interpret_order(
