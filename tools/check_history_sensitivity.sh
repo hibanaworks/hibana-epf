@@ -90,11 +90,11 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         "$source/src/protocol/execution.rs"
       ;;
     ConstructorValidation)
-      perl -0pi -e 's/match self\.check_execution\(captures, \&trial, scratch\)/match Ok::<(), ExecutionError>(())/g == 1 or die "missing completed-candidate validation\n"' \
+      perl -0pi -e 's/match self\.check_execution\(captures, \&trial, tail\)/match Ok::<(), ExecutionError>(())/g == 1 or die "missing completed-candidate validation\n"' \
         "$source/src/protocol/interpret.rs"
       ;;
     ConstructorOrder)
-      perl -0pi -e 's/used\[producer\] < captures\[producer\]\.records\(\)\.len\(\)/used[producer] < captures[producer].records().len() \&\& order[..depth].iter().all(|prior| prior.producer <= producer)/g == 1 or die "missing record interleaving search\n"' \
+      perl -0pi -e 's/if taken\[producer\] == captures\[producer\]\.records\(\)\.len\(\)/if order[..depth].iter().any(|prior| prior.producer > producer) || taken[producer] == captures[producer].records().len()/g == 1 or die "missing record interleaving search\n"' \
         "$source/src/protocol/interpret.rs"
       ;;
     SplitInsertion)
@@ -151,8 +151,10 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         only_a_committed_resumed_body_delays_the_outgoing_continuation -- --exact ;;
       InvocationContext) cargo +stable test --locked --test source_word \
         reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations -- --exact ;;
-      PollAdmission|ConstructorValidation) cargo +stable test --locked --test endpoint_history \
+      PollAdmission) cargo +stable test --locked --test endpoint_history \
         source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame -- --exact ;;
+      ConstructorValidation) cargo +stable test --locked --test source_interpretation \
+        a_committed_route_selection_cannot_name_an_unselected_query_occurrence -- --exact ;;
       AcceptanceEvidence) cargo +stable test --locked --test endpoint_history \
         an_observed_send_poll_can_end_in_a_transport_error_without_a_commit -- --exact ;;
       ConstructorOrder) cargo +stable test --locked --test source_interpretation \

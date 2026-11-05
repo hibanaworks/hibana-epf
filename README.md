@@ -416,13 +416,19 @@ The returned `ExecutionWitness` borrows their used portions.
 Send polls, publications and FIFO receipts share one search variable. Roll
 reset attribution follows its exact next committed operation, and distinct
 calls cannot reuse an expanded event. The constructor searches the finite
-expanded domain and producer-order-preserving interleavings. A prefix whose
-custody already fails is discarded using the same custody walk as the complete
-check. Each finished candidate is validated with `check_execution`.
+expanded domain and producer-order-preserving interleavings together. Each
+record's possible occurrences are checked against the actual source prefix
+before any later records are added. This avoids enumerating whole suffixes
+of an already rejected source prefix. Custody prefixes use the same custody
+walk as the complete check. Opaque diagnostics remain in the witness but have
+one canonical placement between source-relevant records. Each finished
+candidate is validated with `check_execution`.
 It cannot substitute its own acceptance for that check.
 
 Acceptance is proposed after the first poll only for calls with completion
-evidence. This is an allowed interval interpretation, not a physical timestamp.
+evidence. When a source stream spans producers, completion alternatives remain
+in the search until the custody order and final check establish the matching
+receipt. This is an allowed interval interpretation, not a physical timestamp.
 Space is eight words per captured record, one per producer, custody space and
 query-selection scratch (four words per expanded event, plus the source's
 initial bindings and choices), without a fixed depth or visit horizon.
@@ -440,7 +446,10 @@ producer-preserving interleavings, both for a valid exchange and for an early
 reply that no ordering can legalize. A defect control restricts the constructor
 to grouping whole producers and must fail this comparison.
 The constructor's final validation is also removed in a defect control, which
-must fail the early-poll regression. These checks do not prove general search
+must fail the contradictory-resolver regression. Prefix source readiness alone
+cannot establish that record correspondence. Open-call completion with a stream
+split across producers is also checked against a separate explicit witness.
+These checks do not prove general search
 completeness or Rust/Lean refinement.
 
 The selected path governs source advances. A withdrawn send or resolver attempt
@@ -455,7 +464,8 @@ application permission service.
 `CaptureExecution.lean` interprets these per-query selections and source advances
 using the selected core's existing source-occurrence semantics. It proves that a checked
 record list has a source execution, preserves the exact source prefix at every
-append, and retains each advance's resumption check. Polling does not append a
+append, rejects every extension of the same rejected prefix, and retains each
+advance's resumption check. Polling does not append a
 source point; repeating a poll cannot duplicate acceptance. Queries preserve
 the committed prefix and cannot reuse a published finite operation. Concrete
 opposite-arm examples accept two uncommitted attempts and reject a branch

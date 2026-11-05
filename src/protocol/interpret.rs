@@ -70,9 +70,8 @@ impl SourcePath<'_, '_, '_> {
     /// Construct a checked interpretation of this particular finite source path.
     ///
     /// Searches producer-order-preserving record interleavings and the expanded
-    /// occurrence domain. Custody-invalid prefixes are discarded by the same
-    /// custody walk used to check a complete order. A completed call's acceptance
-    /// is proposed after its first poll;
+    /// occurrence domain together, checking custody and source readiness before
+    /// extending each prefix. A completed call's acceptance is proposed after its first poll;
     /// every poll's source admission is still checked separately. Acceptance
     /// alone advances no actor or resumed body. This supplies an interval
     /// witness rather than claiming a recovered physical acceptance time.
@@ -115,38 +114,48 @@ impl SourcePath<'_, '_, '_> {
         }
         let source = self.unfolding();
         let protocol = source.protocol();
-        let (next, rest) = workspace[..required].split_at_mut(count);
-        let (used, scratch) = rest.split_at_mut(captures.len());
-        // Validate every producer before searching. A malformed capture cannot
-        // be hidden by choosing a different interleaving or an empty prefix.
-        protocol
-            .custody_prefix(captures, &[], scratch)
-            .map_err(|error| {
-                InterpretationError::Evidence(ExecutionError::History(RouteHistoryError::Custody(
-                    error,
-                )))
-            })?;
-        // During order construction the output slots hold necessary incoming
-        // poll edges. Attribution replaces them only for a complete candidate.
-        // Rebuild the edges after an unsuccessful attribution; no extra array
-        // or application progress is introduced.
-        self.prepare_predecessors(captures, occurrences, scratch)?;
-        next.fill(0);
-        used.fill(0);
+        let (next_producer, rest) = workspace[..required].split_at_mut(count);
+        let (next_event, rest) = rest.split_at_mut(count);
+        let (completion, rest) = rest.split_at_mut(count);
+        let (taken, tail) = rest.split_at_mut(captures.len());
+        self.prepare_completions(captures, completion, tail)?;
+        let mut flat = 0;
+        let mut needed = 0;
+        for capture in captures {
+            for record in capture.records() {
+                needed += usize::from(completion[flat] == 1 && record.arg0() == session);
+                flat += 1;
+            }
+        }
+        if acceptances.len() < needed {
+            return Err(InterpretationError::Acceptances {
+                required: needed,
+                actual: acceptances.len(),
+            });
+        }
+        next_producer.fill(0);
+        next_event.fill(0);
+        taken.fill(0);
+        occurrences.fill(None);
+        let layout = Layout::checked(protocol);
+        let observed = |id: RecordId| captures[id.producer].records()[id.ordinal];
         let mut depth = 0;
-        loop {
+        let mut word_len = 0;
+        let mut accepted = 0;
+        let alternatives = source
+            .event_count()
+            .checked_mul(2)
+            .ok_or(InterpretationError::Overflow)?;
+        'search: loop {
             if depth == count {
-                match self.interpret_order(
-                    captures,
-                    ExecutionStorage {
-                        session,
-                        order: &mut *order,
-                        occurrences: &mut *occurrences,
-                        acceptances: &mut *acceptances,
-                    },
-                    scratch,
-                ) {
-                    Ok(accepted) => {
+                let trial = ExecutionWitness {
+                    session,
+                    order,
+                    occurrences,
+                    acceptances: &acceptances[..accepted],
+                };
+                match self.check_execution(captures, &trial, tail) {
+                    Ok(()) => {
                         return Ok(ExecutionWitness {
                             session,
                             order,
@@ -154,113 +163,285 @@ impl SourcePath<'_, '_, '_> {
                             acceptances: &acceptances[..accepted],
                         });
                     }
-                    Err(
-                        InterpretationError::NoInterpretation
-                        | InterpretationError::Evidence(
-                            ExecutionError::History(_) | ExecutionError::Acceptance { .. },
-                        ),
-                    ) => {}
-                    Err(error) => return Err(error),
+                    Err(ExecutionError::Workspace { required, actual }) => {
+                        return Err(InterpretationError::Workspace { required, actual });
+                    }
+                    Err(ExecutionError::Overflow) => return Err(InterpretationError::Overflow),
+                    Err(_) => {
+                        // The independent final check uses this same temporary
+                        // region. Restore the selected prefix, not a second
+                        // interpreter or a fresh Cartesian attribution search.
+                        self.restore_prefix(captures, &trial, tail);
+                    }
                 }
-                self.prepare_predecessors(captures, occurrences, scratch)?;
             } else {
-                // Diagnostics carry no source step or custody change. Consume
-                // ready diagnostics canonically, while retaining every record
-                // and every ordering of the source-relevant observations.
+                let (word_cuts, rest) = tail.split_at_mut(count);
+                let (acceptance_cuts, rest) = rest.split_at_mut(count);
+                let (word, scratch) = rest.split_at_mut(2 * count);
+                let (custody, query) =
+                    scratch.split_at_mut(protocol.custody_workspace_len(captures));
+                word_cuts[depth] = word_len;
+                acceptance_cuts[depth] = accepted;
+                // Opaque diagnostics neither advance source nor change custody.
+                // Keep them all, but do not permute their equivalent placements.
                 let diagnostic = (0..captures.len()).find(|&producer| {
                     captures[producer]
                         .records()
-                        .get(used[producer])
+                        .get(taken[producer])
                         .is_some_and(|&record| !execution::relevant(record))
                 });
-                let candidate = (next[depth]..captures.len())
-                    .filter(|&producer| used[producer] < captures[producer].records().len())
-                    .filter(|&producer| diagnostic.is_none_or(|eager| producer == eager))
-                    .find(|&producer| {
-                        let index = captures[..producer]
-                            .iter()
-                            .map(|capture| capture.records().len())
-                            .sum::<usize>()
-                            + used[producer];
-                        occurrences[index].is_none_or(|mut predecessor| {
-                            for (other, capture) in captures.iter().enumerate() {
-                                if predecessor < capture.records().len() {
-                                    return used[other] > predecessor;
-                                }
-                                predecessor -= capture.records().len();
-                            }
-                            unreachable!("checked delivery predecessor is within its capture")
-                        })
-                    });
-                if let Some(producer) = candidate {
-                    next[depth] = producer + 1;
-                    order[depth] = RecordId {
+                while next_producer[depth] < captures.len() {
+                    let producer = next_producer[depth];
+                    if taken[producer] == captures[producer].records().len()
+                        || diagnostic.is_some_and(|eager| producer != eager)
+                    {
+                        next_producer[depth] += 1;
+                        next_event[depth] = 0;
+                        continue;
+                    }
+                    let id = RecordId {
                         producer,
-                        ordinal: used[producer],
+                        ordinal: taken[producer],
                     };
-                    used[producer] += 1;
-                    // Prefix custody is a search prune. When every remaining
-                    // record belongs to this producer, there is no alternate
-                    // suffix to choose; interpret_order checks the complete
-                    // custody once before any execution can be certified.
-                    let prefix = if used.iter().enumerate().any(|(other, &taken)| {
-                        other != producer && taken < captures[other].records().len()
-                    }) {
-                        protocol
-                            .custody_prefix(captures, &order[..depth + 1], scratch)
-                            .map(|_| ())
-                    } else {
-                        Ok(())
-                    };
-                    match prefix {
-                        Ok(_) => {
-                            depth += 1;
-                            if depth != count {
-                                next[depth] = 0;
-                            }
-                        }
-                        Err(
-                            super::CustodyError::Unmatched { .. }
-                            | super::CustodyError::Owner { .. },
-                        ) => {
-                            used[producer] -= 1;
+                    order[depth] = id;
+                    taken[producer] += 1;
+                    let links = match protocol.custody_prefix(captures, &order[..=depth], custody) {
+                        Ok(links) => links,
+                        Err(CustodyError::Unmatched { .. } | CustodyError::Owner { .. }) => {
+                            taken[producer] -= 1;
+                            next_producer[depth] += 1;
+                            next_event[depth] = 0;
+                            continue;
                         }
                         Err(error) => {
                             return Err(InterpretationError::Evidence(ExecutionError::History(
                                 RouteHistoryError::Custody(error),
                             )));
                         }
+                    };
+                    let record = observed(id);
+                    let relevant = execution::relevant(record) && record.arg0() == session;
+                    let root = links.root_rank(id);
+                    let first_poll =
+                        relevant && record.id() == tap::SEND_POLL && root == Some(depth);
+                    let evidence = completion[links.index(id)];
+                    let alternatives = if relevant { alternatives } else { 1 };
+                    while next_event[depth] < alternatives {
+                        let candidate = next_event[depth];
+                        next_event[depth] += 1;
+                        let event = candidate / 2;
+                        let accepts = candidate % 2 != 0;
+                        if accepts && !first_poll
+                            || first_poll
+                                && match evidence {
+                                    0 => accepts,
+                                    1 => !accepts,
+                                    2 => false,
+                                    _ => {
+                                        unreachable!("completion evidence is checked before search")
+                                    }
+                                }
+                        {
+                            continue;
+                        }
+                        if relevant {
+                            if !self.matches_record(record, event) {
+                                continue;
+                            }
+                            if execution::operation(record) {
+                                if let Some(first) = root.filter(|&first| first < depth) {
+                                    if occurrences[first] != Some(event) {
+                                        continue;
+                                    }
+                                } else if order[..depth].iter().enumerate().any(|(at, &prior)| {
+                                    execution::operation(observed(prior))
+                                        && observed(prior).arg0() == session
+                                        && occurrences[at] == Some(event)
+                                }) {
+                                    continue;
+                                }
+                            }
+                            if execution::committed(record) {
+                                // A roll reset names the next commit by this
+                                // actor/view. Resolve that forward obligation
+                                // here, before exploring any later records.
+                                let mut resets_match = true;
+                                for (at, &prior) in order[..depth].iter().enumerate().rev() {
+                                    let prior = observed(prior);
+                                    if prior.arg0() != session
+                                        || prior.causal_key() >> 8 != record.causal_key() >> 8
+                                    {
+                                        continue;
+                                    }
+                                    if execution::committed(prior)
+                                        && prior.arg1() >> 24 == record.arg1() >> 24
+                                    {
+                                        break;
+                                    }
+                                    if prior.id() == tap::SCOPE_REENTRY
+                                        && prior.arg1() >> 29 == 1
+                                        && prior.causal_key() as u8 == (record.arg1() >> 24) as u8
+                                        && occurrences[at] != Some(event)
+                                    {
+                                        resets_match = false;
+                                        break;
+                                    }
+                                }
+                                if !resets_match {
+                                    continue;
+                                }
+                            }
+                            let origin = source.origin(event).unwrap();
+                            let row = protocol.records[layout.sources.start + usize::from(origin)];
+                            if let Some(point) = execution::operation_point(row, record, event) {
+                                if record.id() == tap::SEND_POLL {
+                                    if !self.query_ready(
+                                        execution::points(&word[..word_len]),
+                                        point,
+                                        (record.causal_key() >> 8) as u8,
+                                        query,
+                                    ) {
+                                        continue;
+                                    }
+                                } else if self
+                                    .check_next(
+                                        execution::points(&word[..word_len]),
+                                        point,
+                                        word_len / 2,
+                                    )
+                                    .is_err()
+                                {
+                                    continue;
+                                }
+                            } else if matches!(
+                                record.id(),
+                                tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION
+                            ) && ![
+                                SourcePoint::Local(event),
+                                SourcePoint::Accepted(event),
+                                SourcePoint::Received(event),
+                            ]
+                            .into_iter()
+                            .any(|point| {
+                                self.query_ready(
+                                    execution::points(&word[..word_len]),
+                                    point,
+                                    (record.causal_key() >> 8) as u8,
+                                    query,
+                                )
+                            }) {
+                                continue;
+                            }
+                            if accepts
+                                && self
+                                    .check_next(
+                                        execution::points(&word[..word_len]),
+                                        SourcePoint::Accepted(event),
+                                        word_len / 2,
+                                    )
+                                    .is_err()
+                            {
+                                continue;
+                            }
+                            occurrences[depth] = Some(event);
+                            if execution::committed(record) {
+                                let point = execution::operation_point(row, record, event).unwrap();
+                                execution::put(&mut word[word_len..word_len + 2], point);
+                                word_len += 2;
+                            }
+                            if accepts {
+                                if accepted == acceptances.len() {
+                                    return Err(InterpretationError::Acceptances {
+                                        required: accepted + 1,
+                                        actual: acceptances.len(),
+                                    });
+                                }
+                                acceptances[accepted] = Acceptance {
+                                    first_poll: id,
+                                    before: depth + 1,
+                                };
+                                accepted += 1;
+                                execution::put(
+                                    &mut word[word_len..word_len + 2],
+                                    SourcePoint::Accepted(event),
+                                );
+                                word_len += 2;
+                            }
+                        } else {
+                            occurrences[depth] = None;
+                        }
+                        depth += 1;
+                        if depth < count {
+                            next_producer[depth] = 0;
+                            next_event[depth] = 0;
+                        }
+                        continue 'search;
                     }
-                    continue;
+                    taken[producer] -= 1;
+                    next_producer[depth] += 1;
+                    next_event[depth] = 0;
                 }
             }
             if depth == 0 {
                 return Err(InterpretationError::NoInterpretation);
             }
             depth -= 1;
-            used[order[depth].producer] -= 1;
+            taken[order[depth].producer] -= 1;
+            let (word_cuts, rest) = tail.split_at_mut(count);
+            let (acceptance_cuts, _) = rest.split_at_mut(count);
+            word_len = word_cuts[depth];
+            accepted = acceptance_cuts[depth];
         }
     }
 
-    fn prepare_predecessors(
+    fn prepare_completions(
         &self,
         captures: &[Capture<'_>],
-        incoming: &mut [Option<usize>],
+        completion: &mut [usize],
         workspace: &mut [usize],
     ) -> Result<(), InterpretationError> {
-        incoming.fill(None);
-        // A single producer has only one ordering, already checked in full.
-        if captures.len() < 2 {
-            return Ok(());
-        }
         let source = self.unfolding();
         let protocol = source.protocol();
-        let deliveries = match protocol.deliveries(captures, workspace) {
-            Ok(deliveries) => deliveries,
-            // A source stream spanning producers needs its witnessed custody
-            // order. It supplies no static FIFO prune; the complete search and
-            // independent execution check still cover every ordering.
-            Err(DeliveryError::Ambiguous { .. }) => return Ok(()),
+        let links = protocol
+            .custody_prefix(captures, &[], workspace)
+            .map_err(|error| {
+                InterpretationError::Evidence(ExecutionError::History(RouteHistoryError::Custody(
+                    error,
+                )))
+            })?;
+        completion.fill(0);
+        for (producer, capture) in captures.iter().enumerate() {
+            for (ordinal, record) in capture.records().iter().enumerate() {
+                let id = RecordId { producer, ordinal };
+                if let Some(root) = links.root(id) {
+                    if record.id() == tap::SEND_POLL && links.index(id) == root {
+                        completion[root] = 2; // A later receipt may support this open call.
+                    } else if execution::committed(*record) {
+                        completion[root] = 1;
+                    }
+                }
+            }
+        }
+        match protocol.deliveries(captures, workspace) {
+            Ok(deliveries) => {
+                for state in completion.iter_mut() {
+                    if *state == 2 {
+                        *state = 0;
+                    }
+                }
+                for delivery in deliveries {
+                    let id = delivery.first_poll;
+                    let index = captures[..id.producer]
+                        .iter()
+                        .map(|c| c.records().len())
+                        .sum::<usize>()
+                        + id.ordinal;
+                    completion[index] = 1;
+                }
+            }
+            // Custody search chooses the actual FIFO order of streams that span
+            // producers. Retain both completion alternatives until it does.
+            Err(DeliveryError::Ambiguous { .. }) => {}
             Err(DeliveryError::Workspace { required, actual }) => {
                 return Err(InterpretationError::Workspace { required, actual });
             }
@@ -272,247 +453,90 @@ impl SourcePath<'_, '_, '_> {
             Err(DeliveryError::Cycle | DeliveryError::Unmatched { .. }) => {
                 return Err(InterpretationError::NoInterpretation);
             }
-        };
-        let index = |id: RecordId| {
-            captures[..id.producer]
-                .iter()
-                .map(|capture| capture.records().len())
-                .sum::<usize>()
-                + id.ordinal
-        };
-        for delivery in deliveries {
-            incoming[index(delivery.receive)] = Some(index(delivery.first_poll));
         }
         Ok(())
     }
 
-    fn interpret_order(
+    fn matches_record(&self, record: TapEvent, event: usize) -> bool {
+        let source = self.unfolding();
+        let Some(origin) = source.origin(event) else {
+            return false;
+        };
+        let protocol = source.protocol();
+        let row = protocol.records[Layout::checked(protocol).sources.start + usize::from(origin)];
+        let actor = (record.causal_key() >> 8) as u8;
+        if !matches!(record.id(), tap::SEND_POLL | tap::RESOLVER_AUDIT)
+            && self.actors(event).is_none()
+        {
+            return false;
+        }
+        if execution::operation(record) {
+            return origin == record.arg1() as u16
+                && (record.id() == tap::SEND_POLL
+                    || execution::operation_point(row, record, event)
+                        .is_some_and(|point| self.point_actor(point) == Some(actor)));
+        }
+        let scope = (record.arg1() >> 16) as u16;
+        if record.id() == tap::SCOPE_REENTRY && scope >> 13 == 1 {
+            return origin == record.arg1() as u16 && source.reentered(event, scope);
+        }
+        let choice = if record.id() == tap::RESOLVER_AUDIT {
+            source.route_at(event, scope).map(|(_, right)| right)
+        } else {
+            self.choice_at(event, scope)
+        };
+        let arm = if record.id() == tap::RESOLVER_AUDIT {
+            u16::from(record.causal_key() as u8)
+        } else {
+            record.arg1() as u16
+        };
+        choice.is_some_and(|right| {
+            (arm == u16::from(right) || record.id() == tap::RESOLVER_AUDIT && arm == 255)
+                && (record.id() != tap::SCOPE_REENTRY || source.reentered(event, scope))
+        })
+    }
+
+    fn restore_prefix(
         &self,
         captures: &[Capture<'_>],
-        storage: ExecutionStorage<'_>,
+        witness: &ExecutionWitness<'_>,
         workspace: &mut [usize],
-    ) -> Result<usize, InterpretationError> {
-        let ExecutionStorage {
-            session,
-            order,
-            occurrences,
-            acceptances,
-        } = storage;
+    ) {
+        let count = witness.order.len();
+        let (word_cuts, rest) = workspace.split_at_mut(count);
+        let (acceptance_cuts, rest) = rest.split_at_mut(count);
+        let (word, _) = rest.split_at_mut(2 * count);
         let source = self.unfolding();
         let protocol = source.protocol();
-        let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
-        let (classes, rest) = workspace.split_at_mut(count);
-        let (variables, rest) = rest.split_at_mut(count);
-        let (next, scratch) = rest.split_at_mut(count);
-        let links = protocol
-            .checked_custody(captures, order, scratch)
-            .map_err(|error| {
-                InterpretationError::Evidence(ExecutionError::History(RouteHistoryError::Custody(
-                    error,
-                )))
-            })?;
-        protocol
-            .check_route_records(captures, order)
-            .map_err(|error| InterpretationError::Evidence(ExecutionError::History(error)))?;
-        let observed = |id: RecordId| captures[id.producer].records()[id.ordinal];
-        let relevant = |record: TapEvent| execution::relevant(record) && record.arg0() == session;
-        classes.fill(usize::MAX);
-        occurrences.fill(None);
-        next.fill(0);
-        for (position, &id) in order.iter().enumerate() {
-            let record = observed(id);
-            if !relevant(record) {
-                continue;
-            }
-            classes[position] = if execution::operation(record) {
-                links.root_rank(id).unwrap_or(position)
-            } else {
-                position
-            };
-        }
-        for (position, &id) in order.iter().enumerate() {
-            let record = observed(id);
-            if !relevant(record) || record.id() != tap::SCOPE_REENTRY || record.arg1() >> 29 != 1 {
-                continue;
-            }
-            let after = order[position + 1..]
-                .iter()
-                .position(|&id| {
-                    let candidate = observed(id);
-                    execution::committed(candidate)
-                        && candidate.arg0() == session
-                        && candidate.causal_key() >> 8 == record.causal_key() >> 8
-                        && (candidate.arg1() >> 24) as u8 == record.causal_key() as u8
-                })
-                .ok_or(InterpretationError::NoInterpretation)?;
-            classes[position] = classes[position + 1 + after];
-        }
-        let needed = order
-            .iter()
-            .enumerate()
-            .filter(|(position, id)| {
-                let record = observed(**id);
-                relevant(record)
-                    && record.id() == tap::SEND_POLL
-                    && classes[*position] == *position
-                    && order.iter().any(|&other| {
-                        links.root(other) == links.root(**id)
-                            && execution::committed(observed(other))
-                    })
-            })
-            .count();
-        if acceptances.len() < needed {
-            return Err(InterpretationError::Acceptances {
-                required: needed,
-                actual: acceptances.len(),
-            });
-        }
-        let mut accepted = 0;
+        let layout = Layout::checked(protocol);
         let mut used = 0;
-        for (position, &id) in order.iter().enumerate() {
-            if classes[position] != position {
-                continue;
+        let mut accepted = 0;
+        for (position, &id) in witness.order.iter().enumerate() {
+            word_cuts[position] = used;
+            acceptance_cuts[position] = accepted;
+            let record = captures[id.producer].records()[id.ordinal];
+            if record.arg0() == witness.session && execution::committed(record) {
+                let event = witness.occurrences[position].unwrap();
+                let row = protocol.records
+                    [layout.sources.start + usize::from(source.origin(event).unwrap())];
+                execution::put(
+                    &mut word[used..used + 2],
+                    execution::operation_point(row, record, event).unwrap(),
+                );
+                used += 2;
             }
-            variables[used] = position;
-            used += 1;
-            if observed(id).id() == tap::SEND_POLL
-                && order.iter().any(|&other| {
-                    links.root(other) == links.root(id) && execution::committed(observed(other))
-                })
+            if witness
+                .acceptances
+                .get(accepted)
+                .is_some_and(|a| a.before == position + 1)
             {
-                acceptances[accepted] = Acceptance {
-                    first_poll: id,
-                    before: position + 1,
-                };
+                execution::put(
+                    &mut word[used..used + 2],
+                    SourcePoint::Accepted(witness.occurrences[position].unwrap()),
+                );
+                used += 2;
                 accepted += 1;
             }
         }
-        let acceptances = &acceptances[..accepted];
-        let variables = &variables[..used];
-        let layout = Layout::checked(protocol);
-        let mut depth = 0;
-        loop {
-            if depth != variables.len() {
-                let variable = variables[depth];
-                let candidate = (next[depth]..source.event_count()).find(|&event| {
-                    let Some(origin) = source.origin(event) else {
-                        return false;
-                    };
-                    let row = protocol.records[layout.sources.start + usize::from(origin)];
-                    if execution::operation(observed(order[variable]))
-                        && variables[..depth].iter().any(|&prior| {
-                            execution::operation(observed(order[prior]))
-                                && occurrences[prior] == Some(event)
-                        })
-                    {
-                        return false;
-                    }
-                    order.iter().enumerate().all(|(position, &id)| {
-                        if classes[position] != variable {
-                            return true;
-                        }
-                        let record = observed(id);
-                        let actor = (record.causal_key() >> 8) as u8;
-                        if execution::operation(record) {
-                            return origin == record.arg1() as u16
-                                && (record.id() == tap::SEND_POLL
-                                    || execution::operation_point(row, record, event)
-                                        .is_some_and(|point| {
-                                            self.point_actor(point) == Some(actor)
-                                        }));
-                        }
-                        let key = (record.arg1() >> 16) as u16;
-                        if record.id() == tap::SCOPE_REENTRY && key >> 13 == 1 {
-                            return origin == record.arg1() as u16 && source.reentered(event, key);
-                        }
-                        let arm = if record.id() == tap::RESOLVER_AUDIT {
-                            u16::from(record.causal_key() as u8)
-                        } else {
-                            record.arg1() as u16
-                        };
-                        let choice = if record.id() == tap::RESOLVER_AUDIT {
-                            source.route_at(event, key).map(|(_, right)| right)
-                        } else {
-                            self.choice_at(event, key)
-                        };
-                        choice.is_some_and(|right| {
-                            (arm == u16::from(right)
-                                || record.id() == tap::RESOLVER_AUDIT && arm == 255)
-                                && (record.id() != tap::SCOPE_REENTRY
-                                    || source.reentered(event, key))
-                                && (record.id() == tap::RESOLVER_AUDIT
-                                    || [
-                                        SourcePoint::Local(event),
-                                        SourcePoint::Accepted(event),
-                                        SourcePoint::Received(event),
-                                    ]
-                                    .into_iter()
-                                    .any(|point| self.point_actor(point) == Some(actor)))
-                        })
-                    })
-                });
-                if let Some(event) = candidate {
-                    next[depth] = event + 1;
-                    occurrences[variable] = Some(event);
-                    depth += 1;
-                    if depth != variables.len() {
-                        next[depth] = 0;
-                    }
-                    continue;
-                }
-                next[depth] = 0;
-                occurrences[variable] = None;
-                if depth == 0 {
-                    return Err(InterpretationError::NoInterpretation);
-                }
-                depth -= 1;
-                continue;
-            }
-            for position in 0..order.len() {
-                if classes[position] != usize::MAX {
-                    occurrences[position] = occurrences[classes[position]];
-                }
-            }
-            let trial = ExecutionWitness {
-                session,
-                order,
-                occurrences,
-                acceptances,
-            };
-            match self.check_execution(captures, &trial, scratch) {
-                Ok(()) => break,
-                Err(
-                    error @ (ExecutionError::Record { .. }
-                    | ExecutionError::Source { .. }
-                    | ExecutionError::Admission { .. }),
-                ) => {
-                    let position = match error {
-                        ExecutionError::Record { position } => position,
-                        ExecutionError::Source { record, .. }
-                        | ExecutionError::Admission { record, .. } => order
-                            .iter()
-                            .position(|&id| id == record)
-                            .expect("execution rejection names an observed record"),
-                        _ => unreachable!("only occurrence-dependent rejections are retried"),
-                    };
-                    // A failure at this boundary reads only the prefix's
-                    // occurrence classes. Include forward aliases (a reset
-                    // can name its following commit), then skip assignments
-                    // of later variables that cannot repair this prefix.
-                    depth = classes[..=position]
-                        .iter()
-                        .copied()
-                        .filter(|&class| class != usize::MAX)
-                        .max()
-                        .map_or(0, |last| variables.partition_point(|&v| v <= last));
-                    if depth == 0 {
-                        return Err(InterpretationError::NoInterpretation);
-                    }
-                    depth -= 1;
-                }
-                Err(error) => return Err(InterpretationError::Evidence(error)),
-            }
-        }
-        Ok(accepted)
     }
 }

@@ -110,6 +110,16 @@ theorem checking_append_preserves_the_exact_source_prefix
   | cons record first ih =>
     cases record <;> simp [check, advances, ih, Bool.and_assoc, List.append_assoc]
 
+/-- Reject while constructing the actual source prefix: no choice of a later
+suffix can repair that same prefix. Record attribution and completion support
+remain separate obligations of the capture constructor and final checker. -/
+theorem a_rejected_prefix_has_no_accepted_extension
+    (plan : SourceOccurrenceCut source) (history : List SourcePoint)
+    (first rest : List (Record plan)) (rejected : check plan history first = false) :
+    check plan history (first ++ rest) = false := by
+  rw [checking_append_preserves_the_exact_source_prefix, rejected]
+  rfl
+
 theorem each_checked_advance_retains_its_resumption_obligation
     (plan : SourceOccurrenceCut source) (history : List SourcePoint)
     (first rest : List (Record plan)) (point : SourcePoint)

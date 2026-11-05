@@ -442,7 +442,7 @@ pub(super) fn operation_point(
     })
 }
 
-fn points(words: &[usize]) -> impl Clone + Iterator<Item = SourcePoint> + '_ {
+pub(super) fn points(words: &[usize]) -> impl Clone + Iterator<Item = SourcePoint> + '_ {
     words.as_chunks::<2>().0.iter().map(|row| match row[0] {
         0 => SourcePoint::Accepted(row[1]),
         1 => SourcePoint::Sent(row[1]),
@@ -452,7 +452,7 @@ fn points(words: &[usize]) -> impl Clone + Iterator<Item = SourcePoint> + '_ {
     })
 }
 
-fn put(words: &mut [usize], point: SourcePoint) {
+pub(super) fn put(words: &mut [usize], point: SourcePoint) {
     words[0] = match point {
         SourcePoint::Accepted(_) => 0,
         SourcePoint::Sent(_) => 1,

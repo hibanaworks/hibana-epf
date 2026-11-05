@@ -107,6 +107,154 @@ fn a_committed_route_selection_cannot_name_an_unselected_query_occurrence() {
         path.check_execution(&captures, &witness, &mut workspace)
             .is_err()
     );
+    // Prefix readiness alone cannot reject a later contradictory resolver
+    // decision: the final checker must retain the earlier committed choice.
+    workspace.resize(path.interpretation_workspace_len(&captures).unwrap(), 0);
+    let mut inferred = order;
+    let mut occurrences = [None; 3];
+    assert!(matches!(
+        path.interpret(
+            &captures,
+            ExecutionStorage {
+                session: 1,
+                order: &mut inferred,
+                occurrences: &mut occurrences,
+                acceptances: &mut [],
+            },
+            &mut workspace,
+        ),
+        Err(hibana_epf::InterpretationError::NoInterpretation)
+    ));
+}
+
+#[test]
+fn interleaved_captures_resolve_open_call_completion_without_a_static_fifo_order() {
+    let global = g::send::<7, 8, g::Msg<1, ()>>().roll();
+    let snapshot: Vec<_> = tap::projected(&project::<7>(&global)).collect();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let steps = [Unfold::Source, Unfold::Once(0), Unfold::More([1, 0])];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut bindings = vec![0; source.path_workspace_len().unwrap()];
+    let path = source.select(&[], &mut bindings).unwrap();
+    let lane = (snapshot[2].arg0() >> 8) as u8;
+    let scope = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
+        .unwrap()
+        .causal_key();
+    let observed = |ordinal, id, actor: u8| {
+        let (direction, detail) = if id == tap::SEND_POLL {
+            (actor, 0xffff_0000)
+        } else {
+            (
+                if id == tap::ENDPOINT_SEND { 1 } else { 2 },
+                u32::from(actor) << 24 | u32::from(lane) << 16,
+            )
+        };
+        let mut bytes: [u8; 16] = record(ordinal, id, direction, detail).into();
+        bytes[6] = actor;
+        TapEvent::from(bytes)
+    };
+    // Complete synthetic prefixes. One publication is observed, whereas the
+    // other call is supported only by a receipt in a different producer.
+    let first = [
+        observed(0, tap::SEND_POLL, 7),
+        observed(1, tap::ENDPOINT_SEND, 7),
+    ];
+    let mut prepared: [u8; 16] = observed(0, tap::SEND_POLL, 7).into();
+    prepared[12..].copy_from_slice(&(u32::from(scope) << 16).to_be_bytes());
+    let second = [TapEvent::from(prepared)];
+    let mut reset: [u8; 16] = record(1, tap::SCOPE_REENTRY, 8, u32::from(scope) << 16).into();
+    reset[6] = 8;
+    let received = [
+        observed(0, tap::ENDPOINT_RECV, 8),
+        TapEvent::from(reset),
+        observed(2, tap::ENDPOINT_RECV, 8),
+    ];
+    let captures = [
+        Capture::new(&first, Some(2)).unwrap(),
+        Capture::new(&second, Some(1)).unwrap(),
+        Capture::new(&received, Some(3)).unwrap(),
+    ];
+    let reference_order = [
+        RecordId {
+            producer: 0,
+            ordinal: 0,
+        },
+        RecordId {
+            producer: 0,
+            ordinal: 1,
+        },
+        RecordId {
+            producer: 2,
+            ordinal: 0,
+        },
+        RecordId {
+            producer: 1,
+            ordinal: 0,
+        },
+        RecordId {
+            producer: 2,
+            ordinal: 1,
+        },
+        RecordId {
+            producer: 2,
+            ordinal: 2,
+        },
+    ];
+    let reference = ExecutionWitness {
+        session: 1,
+        order: &reference_order,
+        occurrences: &[Some(0), Some(0), Some(0), Some(1), Some(1), Some(1)],
+        acceptances: &[
+            Acceptance {
+                first_poll: reference_order[0],
+                before: 1,
+            },
+            Acceptance {
+                first_poll: reference_order[3],
+                before: 4,
+            },
+        ],
+    };
+    let mut reference_workspace =
+        vec![0; path.execution_workspace_len(&captures, &reference).unwrap()];
+    path.check_execution(&captures, &reference, &mut reference_workspace)
+        .unwrap();
+    for captures in [captures, [captures[2], captures[1], captures[0]]] {
+        let mut workspace = vec![0; path.interpretation_workspace_len(&captures).unwrap()];
+        assert!(matches!(
+            protocol.deliveries(&captures, &mut workspace),
+            Err(hibana_epf::DeliveryError::Ambiguous { .. })
+        ));
+        let mut order = [RecordId {
+            producer: 0,
+            ordinal: 0,
+        }; 6];
+        let mut occurrences = [None; 6];
+        let mut acceptances = [Acceptance {
+            first_poll: order[0],
+            before: 0,
+        }; 2];
+        let witness = path
+            .interpret(
+                &captures,
+                ExecutionStorage {
+                    session: 1,
+                    order: &mut order,
+                    occurrences: &mut occurrences,
+                    acceptances: &mut acceptances,
+                },
+                &mut workspace,
+            )
+            .unwrap();
+        assert_eq!(witness.acceptances.len(), 2);
+        assert_eq!(witness.order.len(), 6);
+        path.check_execution(&captures, &witness, &mut workspace)
+            .unwrap();
+    }
 }
 
 #[cfg(not(miri))]
@@ -407,6 +555,56 @@ fn causal_order_search_matches_every_interleaving_and_rejects_an_early_reply() {
                     actual: 5
                 })
             ));
+            // Opaque diagnostics must remain in the returned order. Another
+            // session's complete send is checked by custody, but must neither
+            // acquire a source occurrence nor consume this session's slots.
+            let mut padded = captures.map(|capture| capture.records().to_vec());
+            padded[0].insert(0, record(0, tap::LANE_ACQUIRE, 7, 0));
+            padded[1].push(record(0, tap::LANE_RELEASE, 7, 0));
+            for producer in &mut padded {
+                for (ordinal, event) in producer.iter_mut().enumerate() {
+                    let mut bytes: [u8; 16] = (*event).into();
+                    bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+                    *event = bytes.into();
+                }
+            }
+            let unrelated = [first[0], first[1]].map(|event| {
+                let mut bytes: [u8; 16] = event.into();
+                bytes[8..12].copy_from_slice(&2u32.to_be_bytes());
+                TapEvent::from(bytes)
+            });
+            let padded = [
+                Capture::new(&padded[0], Some(4)).unwrap(),
+                Capture::new(&padded[1], Some(4)).unwrap(),
+                Capture::new(&unrelated, Some(2)).unwrap(),
+            ];
+            workspace.resize(path.interpretation_workspace_len(&padded).unwrap(), 0);
+            let mut order = [order[0]; 10];
+            let mut occurrences = [None; 10];
+            let result = path.interpret(
+                &padded,
+                ExecutionStorage {
+                    session: 1,
+                    order: &mut order,
+                    occurrences: &mut occurrences,
+                    acceptances: &mut acceptances,
+                },
+                &mut workspace,
+            );
+            assert_eq!(result.is_ok(), !early);
+            if let Ok(witness) = result {
+                assert_eq!(witness.order.len(), 10);
+                assert_eq!(
+                    witness
+                        .occurrences
+                        .iter()
+                        .filter(|event| event.is_none())
+                        .count(),
+                    4
+                );
+                path.check_execution(&padded, &witness, &mut workspace)
+                    .unwrap();
+            }
         }
     }
 }
