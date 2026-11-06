@@ -185,7 +185,7 @@ impl Layout {
     fn query_words(&self, events: usize) -> Option<usize> {
         events
             .checked_mul(3)?
-            .checked_add(self.path_scratch_words(events)?)
+            .checked_add(self.path_scratch_words(events)?.max(events.checked_mul(4)?))
     }
 
     fn binary_words(events: usize) -> Option<usize> {

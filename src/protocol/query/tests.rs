@@ -389,6 +389,29 @@ fn root_route(
 
 #[cfg(not(miri))]
 #[test]
+fn prefix_queries_match_complete_search_on_both_skewed_sequence_shapes() {
+    let first = || g::send::<1, 0, g::Msg<1, ()>>();
+    let second = || g::send::<1, 0, g::Msg<2, ()>>();
+    let third = || g::send::<1, 0, g::Msg<3, ()>>();
+    let choice = || {
+        g::route(
+            g::send::<0, 1, g::Msg<4, ()>>(),
+            g::send::<0, 1, g::Msg<5, ()>>(),
+        )
+        .resolve::<77>()
+    };
+    let left = g::seq(g::seq(g::seq(first(), second()), third()), choice());
+    let right = g::seq(first(), g::seq(second(), g::seq(third(), choice())));
+    for snapshot in [
+        tap::projected(&project::<0>(&left)).collect::<Vec<_>>(),
+        tap::projected(&project::<0>(&right)).collect::<Vec<_>>(),
+    ] {
+        compare(&snapshot, &[Unfold::Source]);
+    }
+}
+
+#[cfg(not(miri))]
+#[test]
 fn prefix_pruning_matches_complete_choice_search_for_both_parallel_subtrees() {
     let global = g::par(
         g::seq(

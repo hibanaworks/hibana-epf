@@ -335,13 +335,18 @@ choice enumeration: seq/par require both children, while a route needs one
 arm containing every demanded occurrence and no missing fixed-actor
 predecessor. Conditional holders still require full selection and execution
 checking. Point membership and demand prefix counts are derived once from the
-same committed word; they never authorize an operation. The query uses one
-additional caller-owned word per expanded event for its binary domains and
-four point-presence bits, reusing selection scratch for the traversal and
-demand counts. The remaining conditional choice search can be exponential.
+same committed word; they never authorize an operation. A nontrivial query
+inverts the immutable parent edges once and traverses known child boundaries,
+instead of repeatedly climbing from each subtree's first leaf. Its caller-owned
+workspace is `3E + max(4E, 2E + I + C + A)` words: domains and four point-presence
+bits, reusable choice/actor arrays, traversal and demand counts, and two child
+links per boundary. Selection reuses that scratch. This removes quadratic
+navigation on skewed source trees; conditional choice search can still be
+exponential.
 Enclosing routes are located through the existing binary-parent index; a live
 occurrence already identifies its selected arm without scanning siblings.
-Native comparisons use complete choice enumeration on fixed parallel,
+Native comparisons use complete choice enumeration on fixed left- and
+right-associated sequences, parallel,
 conditional-delegation and retained-reentry sources. They compare every point
 and actor probe for all valid subsets of two canonical wire-half orders;
 this is a finite comparison, not all interleavings or a general Rust refinement
@@ -432,12 +437,30 @@ checkpoint for each producer:
 
 ```text
 hibana-epf audit protocol.bin SESSION DERIVATION_CAPACITY producer.bin CHECKPOINT [producer.bin CHECKPOINT ...]
+hibana-epf check protocol.bin witness.bin producer.bin CHECKPOINT [producer.bin CHECKPOINT ...]
 ```
 
 It exits unsuccessfully when no certificate is produced. Its JSON output names
 the checked run, record ordering, expanded occurrences, original source events
 and acceptance intervals. It does not certify session completion or application
 effects. Saving an EOF-derived count as a producer checkpoint is invalid.
+
+`audit` searches for a finite source interpretation. `check` instead receives
+an untrusted candidate and runs the same library checks for source unfolding,
+choices, physical actor bindings, complete captures and execution eligibility.
+It does not search for a replacement when the candidate fails. A generator
+that already knows its finite visit plan can therefore avoid rediscovering it
+through exponential search. Both commands require real observation records and
+independently saved producer checkpoints.
+
+The host-only witness codec is defined in
+[`src/bin/hibana-epf/execution.rs`](src/bin/hibana-epf/execution.rs). It stores
+the session, `Unfold` steps, `RouteChoice` rows, complete record order with
+expanded occurrences, and supported `Acceptance` intervals. Counts must match
+the entire byte length before allocation; truncated or trailing data is an
+error. A real Endpoint regression checks two resolver-controlled roll visits
+and rejects changed choices, occurrences, record order, lengths and missing
+capture suffixes. This codec does not add a runtime permission or progress API.
 
 `SourcePath::interpret(captures, storage, workspace)` constructs a causal record
 order, record attribution and supported acceptance boundaries for an already

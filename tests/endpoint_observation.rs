@@ -18,6 +18,177 @@ use hibana_epf::{Epf, EpfStorage, ImageSpec};
 
 struct LocalOnly;
 
+#[cfg(feature = "std")]
+#[test]
+fn supplied_source_witness_checks_real_endpoint_visits_and_rejects_mutations() {
+    use std::{
+        fs,
+        io::Write as _,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    let captured = Cell::new(Vec::new());
+    let recorder = |event| {
+        let mut rows = captured.take();
+        rows.push(event);
+        captured.set(rows);
+    };
+    let right = Cell::new(false);
+    let global = g::route(
+        g::seq(g::send::<7, 7, Msg<1, ()>>(), g::send::<7, 7, Msg<3, ()>>()),
+        g::seq(g::send::<7, 7, Msg<2, ()>>(), g::send::<7, 7, Msg<3, ()>>()),
+    )
+    .resolve::<77>()
+    .roll();
+    let program = project::<7>(&global);
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    let mut slab = [0; 8192];
+    let mut storage = SessionKitStorage::uninit();
+    let rv = storage.init().rendezvous(&mut slab, LocalOnly).unwrap();
+    rv.observe(&recorder);
+    rv.set_resolver(
+        &program,
+        ResolverRef::<77>::decision_state(&right, |right| {
+            Ok(if right.get() {
+                DecisionArm::Right
+            } else {
+                DecisionArm::Left
+            })
+        }),
+    )
+    .unwrap();
+    let mut endpoint = rv.enter(SessionId::new(1), &program).unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let operation = core::pin::pin!(async {
+        endpoint.offer().await?.send::<Msg<1, ()>>(&()).await?;
+        endpoint.send::<Msg<3, ()>>(&()).await?;
+        right.set(true);
+        endpoint.offer().await?.send::<Msg<2, ()>>(&()).await?;
+        endpoint.send::<Msg<3, ()>>(&()).await?;
+        Ok::<_, hibana::EndpointError>(())
+    });
+    assert!(matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
+    let records = captured.take();
+    let checkpoint = rv.tap().checkpoint().unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "epf-certificate-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    let save_records = |name: &str, rows: &[TapEvent]| {
+        let mut file = fs::File::create(root.join(name)).unwrap();
+        for &record in rows {
+            let bytes: [u8; 16] = record.into();
+            file.write_all(&bytes).unwrap();
+        }
+    };
+    save_records("protocol.bin", &snapshot);
+    save_records("capture.bin", &records);
+    let mut order = vec![[0u64; 3]; records.len()];
+    let mut commits = 0usize;
+    for (index, row) in records.iter().enumerate() {
+        order[index] = [0, u64::from(row.ts()), u64::MAX];
+        if row.id() == tap::ENDPOINT_SEND {
+            order[index][2] = u64::from(row.arg1() as u16) + if commits < 2 { 0 } else { 4 };
+            commits += 1;
+        }
+    }
+    assert_eq!(commits, 4);
+    for (index, row) in records.iter().enumerate() {
+        if matches!(
+            row.id(),
+            tap::SEND_POLL | tap::SCOPE_REENTRY | tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION
+        ) {
+            let next = records[index + 1..]
+                .iter()
+                .position(|row| row.id() == tap::ENDPOINT_SEND)
+                .unwrap()
+                + index
+                + 1;
+            order[index][2] = order[next][2];
+        }
+    }
+    let mut bytes = b"HEPC\0\0\0\x01".to_vec();
+    bytes.extend_from_slice(&1u32.to_be_bytes());
+    let steps = [[0u64; 7], [4, 0, 0, 0, 0, 0, 0], [5, 1, 0, 0, 0, 0, 0]];
+    let choices = [[0u64, 4, 0], [4, 8, 1]];
+    for count in [steps.len(), choices.len(), order.len(), 0] {
+        bytes.extend_from_slice(&(count as u64).to_be_bytes());
+    }
+    for row in steps {
+        for word in row {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    for row in choices {
+        for word in row {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    for row in &order {
+        for word in row {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+    }
+    let check = |bytes: &[u8]| {
+        fs::write(root.join("witness.bin"), bytes).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_hibana-epf"))
+            .arg("check")
+            .arg(root.join("protocol.bin"))
+            .arg(root.join("witness.bin"))
+            .arg(root.join("capture.bin"))
+            .arg(checkpoint.to_string())
+            .output()
+            .unwrap()
+    };
+    let valid = check(&bytes);
+    assert!(valid.status.success(), "{valid:?}");
+    let order_offset = 44 + steps.len() * 56 + choices.len() * 24;
+    let first_commit = records
+        .iter()
+        .position(|row| row.id() == tap::ENDPOINT_SEND)
+        .unwrap();
+    let mut mutations = Vec::new();
+    let mut invalid = bytes.clone();
+    invalid[44..52].copy_from_slice(&99u64.to_be_bytes());
+    mutations.push(invalid);
+    let mut invalid = bytes.clone();
+    invalid[44 + steps.len() * 56 + 16..44 + steps.len() * 56 + 24]
+        .copy_from_slice(&1u64.to_be_bytes());
+    mutations.push(invalid);
+    let mut invalid = bytes.clone();
+    let at = order_offset + 24 * first_commit + 16;
+    invalid[at..at + 8].copy_from_slice(&7u64.to_be_bytes());
+    mutations.push(invalid);
+    let mut invalid = bytes.clone();
+    invalid[order_offset + 24..order_offset + 48]
+        .copy_from_slice(&bytes[order_offset..order_offset + 24]);
+    mutations.push(invalid);
+    let mut invalid = bytes.clone();
+    invalid.pop();
+    mutations.push(invalid);
+    let mut invalid = bytes.clone();
+    invalid.push(0);
+    mutations.push(invalid);
+    let mut invalid = bytes.clone();
+    invalid[12..20].copy_from_slice(&u64::MAX.to_be_bytes());
+    mutations.push(invalid);
+    for (index, invalid) in mutations.iter().enumerate() {
+        let output = check(invalid);
+        assert!(!output.status.success(), "mutation {index} accepted");
+        assert!(output.stdout.is_empty());
+    }
+    save_records("capture.bin", &records[..records.len() - 1]);
+    let missing = check(&bytes);
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn automatic_audit_uses_a_complete_burst_capture_instead_of_the_diagnostic_window() {
     use hibana_epf::Capture;

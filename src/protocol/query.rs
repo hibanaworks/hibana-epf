@@ -82,22 +82,45 @@ impl SourcePath<'_, '_, '_> {
             // Reuse the future choice/actor arrays and selection scratch as a
             // depth-bounded traversal stack; only `domains` survives this pass.
             let (states, rest) = scratch.split_at_mut(count);
-            let demands = &mut rest[..count];
+            let (demands, rest) = rest.split_at_mut(count);
+            let (left, rest) = rest.split_at_mut(count);
+            let right = &mut rest[..count];
+            // Each binary boundary already names its parent. Inverting those
+            // edges once gives direct child navigation; looking up every span
+            // from its first leaf would repeatedly climb a skewed seq tree.
+            left.fill(usize::MAX);
+            right.fill(usize::MAX);
+            let mut root = usize::MAX;
+            for node in 0..count - 1 {
+                let parent = self.index[3 * node];
+                if parent == usize::MAX {
+                    root = node;
+                } else if node < parent {
+                    left[parent] = node;
+                } else {
+                    right[parent] = node;
+                }
+            }
             let mut total = 0;
             for (event, before) in demands.iter_mut().enumerate() {
                 *before = total;
                 total += usize::from(event == point.event() || domains[event] & 56 != 0);
             }
             choices[0] = 0;
-            actors[0] = count;
+            actors[0] = root;
             states[0] = 0;
             let mut depth = 1;
             while depth != 0 {
                 let frame = depth - 1;
-                let span = [choices[frame], actors[frame]];
-                let (kind, split) = source
-                    .indexed_parts(span, self.index)
-                    .expect("checked path contains every source subtree");
+                let node = actors[frame];
+                let (kind, split, end) = if node == usize::MAX {
+                    (NodeKind::Message, choices[frame] + 1, choices[frame] + 1)
+                } else {
+                    source
+                        .indexed_branch(node, self.index)
+                        .expect("checked path contains every source boundary")
+                };
+                let span = [choices[frame], end];
                 if kind == NodeKind::Message {
                     viable = ![
                         SourcePoint::Local(span[0]),
@@ -139,7 +162,7 @@ impl SourcePath<'_, '_, '_> {
                         viable = false;
                         if mask & 1 != 0 {
                             choices[depth] = span[0];
-                            actors[depth] = split;
+                            actors[depth] = left[node];
                             states[depth] = 0;
                             depth += 1;
                         }
@@ -156,7 +179,7 @@ impl SourcePath<'_, '_, '_> {
                         viable = false;
                         if mask & 2 != 0 {
                             choices[depth] = split;
-                            actors[depth] = span[1];
+                            actors[depth] = right[node];
                             states[depth] = 0;
                             depth += 1;
                         }

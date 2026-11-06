@@ -372,20 +372,36 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         loop {
             let row = parts.get(3 * node..3 * node + 3)?;
             if row[1] == span[1] {
-                return Some((
-                    match row[2] {
-                        0 => NodeKind::Sequence,
-                        1 => NodeKind::Parallel,
-                        scope => NodeKind::Choice((scope - 2) as u16),
-                    },
-                    node + 1,
-                ));
+                return self
+                    .indexed_branch(node, parts)
+                    .map(|(kind, split, _)| (kind, split));
             }
             if row[1] > span[1] || row[0] == usize::MAX {
                 return None;
             }
             node = row[0];
         }
+    }
+
+    /// Read a known binary boundary without searching for its enclosing span.
+    pub(super) fn indexed_branch(
+        &self,
+        node: usize,
+        parts: &[usize],
+    ) -> Option<(NodeKind, usize, usize)> {
+        if node >= self.event_count().saturating_sub(1) {
+            return None;
+        }
+        let row = parts.get(3 * node..3 * node + 3)?;
+        Some((
+            match row[2] {
+                0 => NodeKind::Sequence,
+                1 => NodeKind::Parallel,
+                scope => NodeKind::Choice((scope - 2) as u16),
+            },
+            node + 1,
+            row[1],
+        ))
     }
 
     fn independent_conflict(
