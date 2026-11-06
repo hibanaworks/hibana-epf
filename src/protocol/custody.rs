@@ -127,6 +127,61 @@ impl Protocol<'_> {
         order: &[RecordId],
         workspace: &'w mut [usize],
     ) -> Result<Correspondence<'w>, CustodyError> {
+        self.prepare_custody(captures, workspace)?;
+        self.prepared_custody_prefix(captures, order, workspace)
+    }
+
+    // Send-call roots and producer offsets depend only on these immutable
+    // captures, not on the proposed record order. Reuse the existing custody
+    // columns; receive links remain prefix-dependent and are cleared below.
+    pub(super) fn prepare_custody(
+        &self,
+        captures: &[Capture<'_>],
+        workspace: &mut [usize],
+    ) -> Result<(), CustodyError> {
+        let required = self.custody_words(captures).ok_or(CustodyError::Overflow)?;
+        if workspace.len() < required {
+            return Err(CustodyError::Workspace {
+                required,
+                actual: workspace.len(),
+            });
+        }
+        let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
+        let layout = Layout::checked(*self);
+        let (_, rest) = workspace[..required].split_at_mut(count);
+        let (roots, rest) = rest.split_at_mut(count);
+        let (_, rest) = rest.split_at_mut(2 * count);
+        let (offsets, rest) = rest.split_at_mut(captures.len() + 1);
+        let (_, scratch) = rest.split_at_mut(layout.initial.len());
+        offsets[0] = 0;
+        roots.fill(0);
+        for (producer, &capture) in captures.iter().enumerate() {
+            let base = offsets[producer];
+            offsets[producer + 1] = base + capture.records().len();
+            for call in self
+                .send_calls(capture, scratch)
+                .map_err(|error| CustodyError::History { producer, error })?
+            {
+                let root = base + call.first_poll().ts() as usize;
+                for poll in call.polls() {
+                    roots[base + poll.ts() as usize] = root + 1;
+                }
+                if let Some(publication) = call.publication() {
+                    roots[base + publication.ts() as usize] = root + 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Only the interpreter's private, disjoint custody region uses prepared
+    // roots. Public checks prepare them afresh, as does final witness checking.
+    pub(super) fn prepared_custody_prefix<'w>(
+        &self,
+        captures: &[Capture<'_>],
+        order: &[RecordId],
+        workspace: &'w mut [usize],
+    ) -> Result<Correspondence<'w>, CustodyError> {
         let required = self.custody_words(captures).ok_or(CustodyError::Overflow)?;
         if workspace.len() < required {
             return Err(CustodyError::Workspace {
@@ -146,27 +201,18 @@ impl Protocol<'_> {
         let (links, rest) = rest.split_at_mut(count);
         let (sessions, rest) = rest.split_at_mut(count);
         let (offsets, rest) = rest.split_at_mut(captures.len() + 1);
-        let (holders, scratch) = rest.split_at_mut(layout.initial.len());
-        offsets[0] = 0;
-        roots.fill(0);
-        links.fill(0);
-        ranks.fill(usize::MAX);
-        for (producer, &capture) in captures.iter().enumerate() {
-            let base = offsets[producer];
-            offsets[producer + 1] = base + capture.records().len();
-            for call in self
-                .send_calls(capture, scratch)
-                .map_err(|error| CustodyError::History { producer, error })?
-            {
-                let root = base + call.first_poll().ts() as usize;
-                for poll in call.polls() {
-                    roots[base + poll.ts() as usize] = root + 1;
-                }
-                if let Some(publication) = call.publication() {
-                    roots[base + publication.ts() as usize] = root + 1;
+        let (holders, _) = rest.split_at_mut(layout.initial.len());
+        // A previous prefix may have received a different set of frames, or
+        // assigned them a different causal sender. Never retain those links.
+        for (producer, capture) in captures.iter().enumerate() {
+            for (ordinal, &record) in capture.records().iter().enumerate() {
+                if receive(record) {
+                    roots[offsets[producer] + ordinal] = 0;
                 }
             }
         }
+        links.fill(0);
+        ranks.fill(usize::MAX);
         let index_of = |id: RecordId| {
             let capture = captures.get(id.producer)?;
             (id.ordinal < capture.records().len()).then(|| offsets[id.producer] + id.ordinal)
@@ -181,18 +227,27 @@ impl Protocol<'_> {
             ranks[index] = position;
         }
         let record_at = |id: RecordId| captures[id.producer].records()[id.ordinal];
+        // Index each first poll by (session, source, witnessed position).
+        // Receipts consume that group's queue instead of rescanning every
+        // earlier observation. Both columns are reused after matching below.
+        let mut send_count = 0;
+        for (position, &id) in order.iter().enumerate() {
+            let index = index_of(id).unwrap();
+            if record_at(id).id() == tap::SEND_POLL && roots[index] == index + 1 {
+                sessions[send_count] = position;
+                send_count += 1;
+            }
+        }
+        let key = |position: usize| {
+            let record = record_at(order[position]);
+            (record.arg0(), record.arg1() as u16)
+        };
+        let sends = &mut sessions[..send_count];
+        sends.sort_unstable_by_key(|&position| (key(position), position));
         // Match in the witnessed order. No producer's unrelated ordinal is
         // compared with another producer's ordinal to infer delivery order.
-        let mut session_count = 0;
         for (position, &id) in order.iter().enumerate() {
             let record = record_at(id);
-            if !operation(record)
-                && !matches!(record.id(), tap::SCOPE_REENTRY | tap::RESOLVER_AUDIT)
-            {
-                continue;
-            }
-            sessions[session_count] = record.arg0() as usize;
-            session_count += 1;
             if !receive(record) {
                 continue;
             }
@@ -200,22 +255,30 @@ impl Protocol<'_> {
             if source.arg0() >> 24 == (source.arg0() >> 16) & 255 {
                 continue;
             }
-            let sender = order[..position].iter().copied().find(|&candidate| {
-                let index = index_of(candidate).unwrap();
-                let poll = record_at(candidate);
-                poll.id() == tap::SEND_POLL
-                    && roots[index] == index + 1
-                    && links[index] == 0
-                    && poll.arg0() == record.arg0()
-                    && poll.arg1() as u16 == record.arg1() as u16
-            });
-            let Some(sender) = sender else {
+            let target = (record.arg0(), record.arg1() as u16);
+            let start = sends.partition_point(|&send| key(send) < target);
+            if start == sends.len() {
+                return Err(CustodyError::Unmatched { receive: id });
+            }
+            let Some(&sender) = sends.get(start + links[start]) else {
                 return Err(CustodyError::Unmatched { receive: id });
             };
-            let first = index_of(sender).unwrap();
+            if key(sender) != target || sender >= position {
+                return Err(CustodyError::Unmatched { receive: id });
+            }
+            links[start] += 1;
+            let first = index_of(order[sender]).unwrap();
             let received = index_of(id).unwrap();
             roots[received] = first + 1;
-            links[first] = received + 1;
+        }
+        let mut session_count = 0;
+        for &id in order {
+            let record = record_at(id);
+            if operation(record) || matches!(record.id(), tap::SCOPE_REENTRY | tap::RESOLVER_AUDIT)
+            {
+                sessions[session_count] = record.arg0() as usize;
+                session_count += 1;
+            }
         }
         let sessions = &mut sessions[..session_count];
         sessions.sort_unstable();

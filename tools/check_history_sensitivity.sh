@@ -12,7 +12,7 @@ cargo +stable test --locked --lib --features std protocol::delivery::tests \
   > "$out/positive-deliveries.log" 2>&1
 cargo +stable test --locked --test source_word > "$out/positive-source-word.log" 2>&1
 mutation_count=0
-for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary BoundaryIndex ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished QueryCompletedSearch QueryStaticKind QueryStaticActor QueryDomain QueryDemand CommittedSelection; do
+for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEvidence DeliveryProducerOrder DeliveryEdgeOrder DeliveryAmbiguity DeliveryCoverage SourceOrder ResumptionAdmission InvocationContext PollAdmission AcceptanceEvidence ConstructorValidation ConstructorOrder SplitInsertion SplitBoundary BoundaryIndex ResolverEvidence ScopeLookup HeadPrefix BranchDemand TypedArmSeed InsertionPrune QuerySelection QueryDecision QueryFinished QueryCompletedSearch QueryStaticKind QueryStaticActor QueryDomain QueryDemand CommittedSelection CustodyReceiveRoots CustodyFifo OccurrenceCounts; do
   source="$out/$mutation"
   test ! -e "$source"
   git clone --quiet --shared --no-checkout "$root" "$source"
@@ -41,6 +41,18 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     ResetEvidence)
       perl -0pi -e 's/resets\[after\] <= before \+ 1/false/g == 1 or die "missing reset correspondence check\n"' \
         "$source/src/protocol/history.rs"
+      ;;
+    CustodyReceiveRoots)
+      perl -0pi -e 's/^(\s*)if receive\(record\) \{/${1}if false \&\& receive(record) {/mg == 1 or die "missing prefix receive-link reset\n"' \
+        "$source/src/protocol/custody.rs"
+      ;;
+    CustodyFifo)
+      perl -0pi -e 's/\(key\(position\), position\)/(key(position), core::cmp::Reverse(position))/g == 1 or die "missing witnessed FIFO queue order\n"' \
+        "$source/src/protocol/custody.rs"
+      ;;
+    OccurrenceCounts)
+      perl -0pi -e 's/counts\[2 \* origin\] \+= 1;/counts[2 * origin] += 2;/g == 1 or die "missing expanded occurrence count\n"' \
+        "$source/src/protocol/audit.rs"
       ;;
     DeliveryProducerOrder)
       perl -0pi -e 's/ranks\[interval\[0\]\.\.interval\[1\]\]/ranks[interval[0]..interval[0]]/g == 1 or die "missing producer order check\n"' \
@@ -169,6 +181,12 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
         later_publication_cannot_hide_an_acceptance_before_its_source_predecessor -- --exact ;;
       ResumptionAdmission) cargo +stable test --locked --test source_word \
         only_a_committed_resumed_body_delays_the_outgoing_continuation -- --exact ;;
+      CustodyReceiveRoots) cargo +stable test --locked --lib \
+        protocol::index_tests::prepared_custody_matches_fresh_for_every_prefix_and_rewind -- --exact ;;
+      CustodyFifo) cargo +stable test --locked --lib \
+        protocol::index_tests::indexed_fifo_matches_direct_pairing_across_all_producer_interleavings -- --exact ;;
+      OccurrenceCounts) cargo +stable test --locked --lib \
+        protocol::audit::tests::occurrence_counts_match_the_direct_rule_for_every_small_commit_multiset -- --exact ;;
       InvocationContext) cargo +stable test --locked --test source_word \
         reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations -- --exact ;;
       PollAdmission) cargo +stable test --locked --test endpoint_history \
@@ -207,7 +225,7 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
   test "$status" = 101
   case "$mutation" in
     Length|Ordinals) grep -Fq 'test result: FAILED. 3 passed; 1 failed;' "$out/$mutation.log" ;;
-    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*|Split*|ResolverEvidence|ScopeLookup|HeadPrefix|BranchDemand|TypedArmSeed|InsertionPrune|Query*|CommittedSelection) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
+    CallOverlap|CallCoverage|CallPreparation|ResetEvidence|Delivery*|SourceOrder|ResumptionAdmission|InvocationContext|PollAdmission|AcceptanceEvidence|Constructor*|Split*|ResolverEvidence|ScopeLookup|HeadPrefix|BranchDemand|TypedArmSeed|InsertionPrune|Query*|CommittedSelection|CustodyReceiveRoots|CustodyFifo|OccurrenceCounts) grep -Fq 'test result: FAILED. 0 passed; 1 failed;' "$out/$mutation.log" ;;
   esac
   case "$mutation" in
     Length) name=deleting_any_record_including_the_last_is_incomplete ;;
@@ -219,6 +237,9 @@ for mutation in Length Ordinals CallOverlap CallCoverage CallPreparation ResetEv
     DeliveryAmbiguity|DeliveryCoverage) name=protocol::delivery::tests::missing_reused_or_unordered_producer_evidence_cannot_supply_a_receive ;;
     SourceOrder) name=later_publication_cannot_hide_an_acceptance_before_its_source_predecessor ;;
     ResumptionAdmission) name=only_a_committed_resumed_body_delays_the_outgoing_continuation ;;
+    CustodyReceiveRoots) name=protocol::index_tests::prepared_custody_matches_fresh_for_every_prefix_and_rewind ;;
+    CustodyFifo) name=protocol::index_tests::indexed_fifo_matches_direct_pairing_across_all_producer_interleavings ;;
+    OccurrenceCounts) name=protocol::audit::tests::occurrence_counts_match_the_direct_rule_for_every_small_commit_multiset ;;
     InvocationContext) name=reusing_a_proof_dag_does_not_share_a_resumption_entry_across_invocations ;;
     PollAdmission) name=source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame ;;
     ConstructorValidation) name=a_committed_route_selection_cannot_name_an_unselected_query_occurrence ;;

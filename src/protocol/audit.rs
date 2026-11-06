@@ -174,7 +174,7 @@ impl<'p> Protocol<'p> {
                 if source.event_count() > events {
                     continue;
                 }
-                if !enough_occurrences(source, captures, session) {
+                if !enough_occurrences(source, captures, session, scratch) {
                     continue;
                 }
                 let mut retained = 0;
@@ -237,24 +237,39 @@ impl<'p> Protocol<'p> {
     }
 }
 
-fn enough_occurrences(source: Unfolded<'_, '_>, captures: &[Capture<'_>], session: u32) -> bool {
+fn enough_occurrences(
+    source: Unfolded<'_, '_>,
+    captures: &[Capture<'_>],
+    session: u32,
+    scratch: &mut [usize],
+) -> bool {
     let protocol = source.protocol();
     let layout = Layout::checked(protocol);
-    for origin in 0..layout.sources.len() {
-        let copies = (0..source.event_count())
-            .filter(|&i| source.origin(i) == Some(origin as u16))
-            .count();
-        for kind in [tap::ENDPOINT_SEND, tap::ENDPOINT_RECV] {
-            let commits = captures
-                .iter()
-                .flat_map(|c| c.records())
-                .filter(|row| {
-                    row.id() == kind && row.arg0() == session && row.arg1() as u16 == origin as u16
-                })
-                .count();
-            if commits > copies {
+    // Reuse selection scratch before a path is built. Count every expanded
+    // origin once, with separate budgets for its send and receive commits.
+    let counts = &mut scratch[..2 * layout.sources.len()];
+    counts.fill(0);
+    for event in 0..source.event_count() {
+        let origin = usize::from(source.origin(event).expect("checked unfolding origin"));
+        counts[2 * origin] += 1;
+        counts[2 * origin + 1] += 1;
+    }
+    for row in captures.iter().flat_map(|capture| capture.records()) {
+        if row.arg0() != session {
+            continue;
+        }
+        let side = match row.id() {
+            tap::ENDPOINT_SEND => 0,
+            tap::ENDPOINT_RECV => 1,
+            _ => continue,
+        };
+        // Unknown origins are diagnosed by the independent history checker,
+        // just as before this necessary-count filter was indexed.
+        if let Some(count) = counts.get_mut(2 * usize::from(row.arg1() as u16) + side) {
+            let Some(remaining) = count.checked_sub(1) else {
                 return false;
-            }
+            };
+            *count = remaining;
         }
     }
     true
@@ -369,6 +384,71 @@ mod tests {
     use super::*;
     use hibana::{g, runtime::program::project};
     use std::vec;
+
+    #[test]
+    fn occurrence_counts_match_the_direct_rule_for_every_small_commit_multiset() {
+        let global = g::par(
+            g::route(
+                g::send::<0, 0, g::Msg<1, ()>>(),
+                g::send::<0, 0, g::Msg<2, ()>>(),
+            ),
+            g::send::<0, 0, g::Msg<3, ()>>(),
+        )
+        .roll();
+        let snapshot = tap::projected(&project::<0>(&global)).collect::<std::vec::Vec<_>>();
+        let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+        let steps = [Unfold::Source, Unfold::Once(0), Unfold::More([1, 0])];
+        let mut proof = [0; 15];
+        let mut scratch = [usize::MAX; 6];
+        let record = |ordinal: usize, kind: u16, session: u32, origin: u32| {
+            let words = [ordinal as u32, u32::from(kind) << 16, session, origin];
+            let mut bytes = [0; 16];
+            for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                chunk.copy_from_slice(&word.to_be_bytes());
+            }
+            tap::TapEvent::from(bytes)
+        };
+        for size in [1, 3] {
+            let source = protocol.unfolding(&steps[..size], &mut proof).unwrap();
+            // Each of the three origins has independent send/receive counts
+            // in 0..=2, crossing the one-visit budget and reaching two visits.
+            for mut counts in 0..3usize.pow(6) {
+                let mut records = vec![];
+                for origin in 0..3u32 {
+                    for kind in [tap::ENDPOINT_SEND, tap::ENDPOINT_RECV] {
+                        for _ in 0..counts % 3 {
+                            records.push(record(records.len(), kind, 1, origin));
+                        }
+                        counts /= 3;
+                    }
+                }
+                // A commit from another session spends no budget.
+                records.push(record(records.len(), tap::ENDPOINT_SEND, 2, 0));
+                let captures = [Capture::new(&records, Some(records.len() as u32)).unwrap()];
+                let direct = (0..3u16).all(|origin| {
+                    let copies = (0..source.event_count())
+                        .filter(|&event| source.origin(event) == Some(origin))
+                        .count();
+                    [tap::ENDPOINT_SEND, tap::ENDPOINT_RECV]
+                        .into_iter()
+                        .all(|kind| {
+                            records
+                                .iter()
+                                .filter(|r| {
+                                    r.id() == kind && r.arg0() == 1 && r.arg1() as u16 == origin
+                                })
+                                .count()
+                                <= copies
+                        })
+                });
+                assert_eq!(
+                    enough_occurrences(source, &captures, 1, &mut scratch),
+                    direct
+                );
+            }
+        }
+    }
 
     #[test]
     fn typed_operations_seed_distinct_branch_visits_before_later_offer_evidence() {

@@ -119,6 +119,7 @@ impl SourcePath<'_, '_, '_> {
         let (completion, rest) = rest.split_at_mut(count);
         let (taken, tail) = rest.split_at_mut(captures.len());
         self.prepare_completions(captures, completion, tail)?;
+        self.prepare_custody(captures, tail)?;
         let mut flat = 0;
         let mut needed = 0;
         for capture in captures {
@@ -171,7 +172,7 @@ impl SourcePath<'_, '_, '_> {
                         // The independent final check uses this same temporary
                         // region. Restore the selected prefix, not a second
                         // interpreter or a fresh Cartesian attribution search.
-                        self.restore_prefix(captures, &trial, tail);
+                        self.restore_prefix(captures, &trial, tail)?;
                     }
                 }
             } else {
@@ -205,20 +206,22 @@ impl SourcePath<'_, '_, '_> {
                     };
                     order[depth] = id;
                     taken[producer] += 1;
-                    let links = match protocol.custody_prefix(captures, &order[..=depth], custody) {
-                        Ok(links) => links,
-                        Err(CustodyError::Unmatched { .. } | CustodyError::Owner { .. }) => {
-                            taken[producer] -= 1;
-                            next_producer[depth] += 1;
-                            next_event[depth] = 0;
-                            continue;
-                        }
-                        Err(error) => {
-                            return Err(InterpretationError::Evidence(ExecutionError::History(
-                                RouteHistoryError::Custody(error),
-                            )));
-                        }
-                    };
+                    let links =
+                        match protocol.prepared_custody_prefix(captures, &order[..=depth], custody)
+                        {
+                            Ok(links) => links,
+                            Err(CustodyError::Unmatched { .. } | CustodyError::Owner { .. }) => {
+                                taken[producer] -= 1;
+                                next_producer[depth] += 1;
+                                next_event[depth] = 0;
+                                continue;
+                            }
+                            Err(error) => {
+                                return Err(InterpretationError::Evidence(
+                                    ExecutionError::History(RouteHistoryError::Custody(error)),
+                                ));
+                            }
+                        };
                     let record = observed(id);
                     let relevant = execution::relevant(record) && record.arg0() == session;
                     let root = links.root_rank(id);
@@ -394,6 +397,25 @@ impl SourcePath<'_, '_, '_> {
         }
     }
 
+    fn prepare_custody(
+        &self,
+        captures: &[Capture<'_>],
+        workspace: &mut [usize],
+    ) -> Result<(), InterpretationError> {
+        let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
+        // The preceding four rows hold cuts and the reconstructed source word.
+        // Completion preparation and final checking reuse that region, so
+        // restore the immutable roots whenever either has overwritten it.
+        self.unfolding()
+            .protocol()
+            .prepare_custody(captures, &mut workspace[4 * count..])
+            .map_err(|error| {
+                InterpretationError::Evidence(ExecutionError::History(RouteHistoryError::Custody(
+                    error,
+                )))
+            })
+    }
+
     fn prepare_completions(
         &self,
         captures: &[Capture<'_>],
@@ -501,7 +523,8 @@ impl SourcePath<'_, '_, '_> {
         captures: &[Capture<'_>],
         witness: &ExecutionWitness<'_>,
         workspace: &mut [usize],
-    ) {
+    ) -> Result<(), InterpretationError> {
+        self.prepare_custody(captures, workspace)?;
         let count = witness.order.len();
         let (word_cuts, rest) = workspace.split_at_mut(count);
         let (acceptance_cuts, rest) = rest.split_at_mut(count);
@@ -538,5 +561,6 @@ impl SourcePath<'_, '_, '_> {
                 accepted += 1;
             }
         }
+        Ok(())
     }
 }

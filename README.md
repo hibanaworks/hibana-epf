@@ -451,7 +451,28 @@ expanded domain and producer-order-preserving interleavings together. Each
 record's possible occurrences are checked against the actual source prefix
 before any later records are added. This avoids enumerating whole suffixes
 of an already rejected source prefix. Custody prefixes use the same custody
-walk as the complete check. Opaque diagnostics remain in the witness but have
+walk as the complete check. Send-call grouping, static validation and producer
+offsets are prepared once in the existing custody workspace. Every prefix
+clears its earlier receive associations and rebuilds ranks, FIFO matching and
+ownership. Backtracking cannot retain a receipt from a longer or different
+prefix. First polls are sorted by session, source and witnessed position in
+existing temporary columns. Each receipt consumes its group's next poll;
+producer ordinal numbers never order different producers. This removes the
+repeated full-prefix scan for each receipt. The final complete check prepares the send calls afresh; a failed
+candidate restores the constructor's prepared columns before resuming.
+No additional workspace, application progress state or public mode is added.
+The prepared walk is compared with fresh preparation at every advancing and
+rewinding prefix of all fifteen interleavings of a two-producer fixture. A
+mutation that retains old receive associations must fail that comparison.
+FIFO matching is separately compared with a direct first-unmatched-send search
+at every advancing and rewinding prefix of all 90 three-producer interleavings,
+for repeated sources, separate sessions and separate source groups. Reversing
+the indexed queue must fail this comparison. Before path selection, the
+necessary occurrence-count filter counts each expanded origin once in reused
+selection scratch, with independent send/receive budgets. All 729 small commit
+multisets are compared with direct counting in both one- and two-visit unfoldings;
+inflating an origin's budget must fail that comparison.
+Opaque diagnostics remain in the witness but have
 one canonical placement between source-relevant records. Each finished
 candidate is validated with `check_execution`.
 It cannot substitute its own acceptance for that check.
