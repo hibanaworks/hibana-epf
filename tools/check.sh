@@ -66,5 +66,4 @@ case "$stage" in all|miri-integration|miri-*)
 esac
 case "$stage" in all|native)
     bash tools/check_proofs.sh
-    bash tools/check_history_sensitivity.sh
 esac

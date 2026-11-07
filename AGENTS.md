@@ -57,6 +57,11 @@ only for an obligation those checks do not cover, and state that obligation.
 Generate any necessary SMT input from its checked specification during the
 check; do not commit generated solver inputs or results.
 
+Do not restore old production defects and rebuild cloned source trees as a
+validation gate. Delete the dedicated mutation scripts and restoration patches.
+Keep current-source regression tests, actual Endpoint/EPF conformance, Lean and
+necessary Miri, including rejection of malformed or illegal input histories.
+
 Preserve unrelated dirty files. Replace obsolete architecture when necessary,
 without compatibility modes, speculative wrappers or silent fallbacks. Do not
 claim a diagnostic VM provides dynamic protocol replay. Qualify the selected

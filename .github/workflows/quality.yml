@@ -89,7 +89,6 @@ jobs:
           path: |
             target/validation-${{ matrix.stage }}.log
             target/commit-observation-proof/
-            target/history-sensitivity/
 
   required:
     name: epf-contract
