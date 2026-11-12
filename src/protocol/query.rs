@@ -7,6 +7,138 @@ impl SourcePath<'_, '_, '_> {
         Layout::checked(source.protocol()).query_words(source.event_count())
     }
 
+    // A selected sequence's earlier child cannot be empty. An unavoidable
+    // fixed-actor operation there remains necessary even when other actors
+    // also participate. If every leaf belongs to this actor, nonemptiness
+    // additionally covers alternatives without one shared mandatory leaf.
+    // Mandatory right children of a sequence/par remain necessary too.
+    // This is only a necessary condition: uncertified spans and conditional
+    // ownership still use full readiness.
+    // The returned end bounds the remaining ordered suffix, initially that
+    // sequence's right child and any later sequential children. Every later
+    // query in this span has the same missing mandatory predecessor; do not
+    // retry each leaf or later visit of the same impossible sequence.
+    pub(super) fn fixed_prefix_blocked_until(
+        &self,
+        point: SourcePoint,
+        actor: u8,
+        prefix: &[usize],
+    ) -> Option<usize> {
+        let count = self.unfolding().event_count();
+        let event = point.event();
+        if matches!(point, SourcePoint::Sent(_)) || count < 2 || event >= count {
+            return None;
+        }
+        let mut node = if event > 0 && self.index[3 * (event - 1) + 1] == event + 1 {
+            event - 1
+        } else {
+            event
+        };
+        loop {
+            // Binary boundaries are their split minus one; tag zero is seq.
+            if node < event && self.index[3 * node + 2] == 0 {
+                let mut ancestor = node;
+                let mut start = 0;
+                loop {
+                    let parent = self.index[3 * ancestor];
+                    if parent == usize::MAX {
+                        break;
+                    }
+                    if ancestor > parent {
+                        start = parent + 1;
+                        break;
+                    }
+                    ancestor = parent;
+                }
+                let mut span = [start, node + 1];
+                // These earlier siblings on the query's ancestor path are
+                // disjoint. A mandatory missing leaf certifies the entire
+                // right child, rather than retrying every later occurrence
+                // merely because this earlier child also uses another actor.
+                let missing = (span[0]..span[1]).any(|prior| {
+                    prefix[prior] & 56 == 0
+                        && self
+                            .actors(prior)
+                            .is_some_and(|actors| actors.contains(&actor))
+                        && [
+                            SourcePoint::Local(prior),
+                            SourcePoint::Sent(prior),
+                            SourcePoint::Received(prior),
+                        ]
+                        .into_iter()
+                        .any(|point| {
+                            self.point_binding(point)
+                                .is_some_and(|(_, binding)| binding == u32::from(actor))
+                        })
+                        && self.unavoidable_before(prior, event, |span| {
+                            prefix[span[0]..span[1]]
+                                .iter()
+                                .any(|points| points & 56 != 0)
+                        })
+                });
+                let last_commit = prefix[start..span[1]]
+                    .iter()
+                    .rposition(|points| points & 56 != 0)
+                    .map(|offset| start + offset);
+                let mut different = None;
+                loop {
+                    // These sibling subtrees on the query's ancestor path
+                    // are disjoint. During right descent, reuse the last
+                    // commit and the first nonmatching leaf, so overlapping
+                    // suffixes do not rescan the same prefix or binding rows.
+                    if missing
+                        || last_commit.is_none_or(|at| at < span[0])
+                            && different.is_none_or(|at| at < span[0])
+                    {
+                        if !missing {
+                            different = (span[0]..span[1]).find(|&event| {
+                                ![
+                                    SourcePoint::Local(event),
+                                    SourcePoint::Sent(event),
+                                    SourcePoint::Received(event),
+                                ]
+                                .into_iter()
+                                .any(|prior| {
+                                    self.point_binding(prior)
+                                        .is_some_and(|(_, binding)| binding == u32::from(actor))
+                                })
+                            });
+                        }
+                        if missing || different.is_none() {
+                            let mut blocked = node;
+                            loop {
+                                let parent = self.index[3 * blocked];
+                                if parent == usize::MAX {
+                                    break;
+                                }
+                                let kind = self.index[3 * parent + 2];
+                                if kind >= 2 || kind == 1 && blocked < parent {
+                                    break;
+                                }
+                                // A later sequence child also needs this
+                                // missing operation. A right parallel child
+                                // has the same end and preserves that fact.
+                                // Stop at choices and before independent
+                                // right parallel siblings: those can omit or
+                                // run independently of the missing operation.
+                                blocked = parent;
+                            }
+                            return Some(self.index[3 * blocked + 1]);
+                        }
+                    }
+                    match self.unfolding().indexed_parts(span, self.index) {
+                        Some((NodeKind::Sequence | NodeKind::Parallel, split)) => span[0] = split,
+                        _ => break,
+                    }
+                }
+            }
+            node = self.index[3 * node];
+            if node == usize::MAX {
+                return None;
+            }
+        }
+    }
+
     /// A query may select an uncommitted arm, but cannot change the actors,
     /// presence or prerequisites of any operation that already committed.
     /// Search only constructs retrospective evidence; it never drives a view.
@@ -17,25 +149,42 @@ impl SourcePath<'_, '_, '_> {
         actor: u8,
         workspace: &mut [usize],
     ) -> bool {
-        let Some((_, binding)) = self.point_binding(point) else {
+        let Some((side, binding)) = self.point_binding(point) else {
             return false;
         };
         if binding < 256 && binding != u32::from(actor) {
             return false;
         }
-        let finish = match point {
-            SourcePoint::Accepted(event) => SourcePoint::Sent(event),
-            other => other,
-        };
         // A different choice cannot undo publication or repeat a committed
         // point of this same unfolding. Acceptance alone is not publication.
-        if history.clone().any(|prior| prior == finish) {
+        if !point.query_preconditions(|prior| history.clone().any(|entry| entry == prior)) {
             return false;
         }
-        if matches!(point, SourcePoint::Sent(_) | SourcePoint::Received(_))
-            && !history
-                .clone()
-                .any(|prior| prior == SourcePoint::Accepted(point.event()))
+        let mandatory = |prior: SourcePoint, prefix: Option<&[usize]>| {
+            !matches!(point, SourcePoint::Sent(_))
+                && self
+                    .point_binding(prior)
+                    .is_some_and(|(_, binding)| binding == u32::from(actor))
+                && self.unavoidable_before(prior.event(), point.event(), |span| {
+                    prefix.is_some_and(|prefix| {
+                        prefix[span[0]..span[1]]
+                            .iter()
+                            .any(|points| points & 56 != 0)
+                    })
+                })
+        };
+        // A request/reply pair in an unselected arm has no current actor row
+        // yet. Its fixed-actor request is still mandatory for that reply in
+        // every selection containing it. Test this adjacent source leaf
+        // before scanning the full prefix or propagating source boundaries.
+        if let Some(event) = point.event().checked_sub(1)
+            && [
+                SourcePoint::Local(event),
+                SourcePoint::Sent(event),
+                SourcePoint::Received(event),
+            ]
+            .into_iter()
+            .any(|prior| mandatory(prior, None) && !history.clone().any(|entry| entry == prior))
         {
             return false;
         }
@@ -46,28 +195,57 @@ impl SourcePath<'_, '_, '_> {
         let (actors, scratch) = storage.split_at_mut(count);
         // Bits above each binary domain retain this event's observed points.
         // The immutable word is indexed once; it is not an execution cursor.
-        let bit = |prior| match prior {
-            SourcePoint::Accepted(_) => 4,
-            SourcePoint::Sent(_) => 8,
-            SourcePoint::Received(_) => 16,
-            SourcePoint::Local(_) => 32,
+        let bit = SourcePoint::bit;
+        // Selecting an inactive fixed-actor leaf also introduces its
+        // publication/receipt. It cannot become a new prerequisite of an
+        // already committed local/receive point. Reuse the prefix-indexing
+        // pass for the same `newly_required` contradiction checked below,
+        // before walking unrelated source arms. Conditional actors still
+        // require the full selection check.
+        let introduced = match point {
+            SourcePoint::Accepted(event) => SourcePoint::Sent(event),
+            other => other,
         };
+        let introduced = (binding == u32::from(actor)
+            && self.point_actor(introduced) != Some(actor))
+        .then_some(introduced);
         domains.fill(0);
         for prior in history.clone() {
             if let Some(row) = domains.get_mut(prior.event()) {
                 *row |= bit(prior);
             }
+            if let Some(introduced) = introduced
+                && matches!(prior, SourcePoint::Local(_) | SourcePoint::Received(_))
+                && prior.event() >= introduced.event()
+                && self.point_actor(prior) == Some(actor)
+                && self.prerequisite(history.clone(), prior)(introduced, actor)
+            {
+                return false;
+            }
         }
-        if self.point_actor(point) == Some(actor)
-            && self
-                .missing(history.clone(), point, |prior| {
-                    domains
-                        .get(prior.event())
-                        .is_some_and(|row| row & bit(prior) != 0)
-                })
-                .is_none()
+        if self
+            .fixed_prefix_blocked_until(point, actor, domains)
+            .is_some()
         {
-            return true;
+            return false;
+        }
+        if self.point_actor(point) == Some(actor) {
+            let missing = self.missing(history.clone(), point, |prior| {
+                domains
+                    .get(prior.event())
+                    .is_some_and(|row| row & bit(prior) != 0)
+            });
+            let Some(prior) = missing else {
+                return true;
+            };
+            // No compatible alternative can remove this fixed-actor source
+            // predecessor: every intervening choice is either absent or
+            // forced by a commit in that arm. Acceptance alone does not
+            // force an arm. Conditional actors and resumption-only
+            // prerequisites still use the full selection checks below.
+            if mandatory(prior, Some(domains)) {
+                return false;
+            }
         }
 
         // Propagate necessary conditions through the same immutable source
@@ -121,20 +299,36 @@ impl SourcePath<'_, '_, '_> {
                         .expect("checked path contains every source boundary")
                 };
                 let span = [choices[frame], end];
+                let end_demands = if end == count { total } else { demands[end] };
+                if states[frame] == 0 && span[0] > point.event() && end_demands == demands[span[0]]
+                {
+                    // Every leaf here is after the query, and no committed
+                    // point forces either arm. The ordinary traversal would
+                    // mark every leaf viable and every internal domain 3.
+                    // Binary boundaries fill exactly this contiguous range;
+                    // preserve the independent observation bits in each word.
+                    for domain in &mut domains[span[0]..end - 1] {
+                        *domain |= 3;
+                    }
+                    viable = true;
+                    depth -= 1;
+                    continue;
+                }
                 if kind == NodeKind::Message {
-                    viable = ![
-                        SourcePoint::Local(span[0]),
-                        SourcePoint::Sent(span[0]),
-                        SourcePoint::Received(span[0]),
-                    ]
-                    .into_iter()
-                    .any(|prior| {
-                        self.point_binding(prior).is_some_and(|(_, binding)| {
-                            binding == u32::from(actor)
-                                && domains[prior.event()] & bit(prior) == 0
-                                && required(prior, actor)
-                        })
-                    });
+                    viable = span[0] > point.event()
+                        || ![
+                            SourcePoint::Local(span[0]),
+                            SourcePoint::Sent(span[0]),
+                            SourcePoint::Received(span[0]),
+                        ]
+                        .into_iter()
+                        .any(|prior| {
+                            self.point_binding(prior).is_some_and(|(_, binding)| {
+                                binding == u32::from(actor)
+                                    && domains[prior.event()] & bit(prior) == 0
+                                    && required(prior, actor)
+                            })
+                        });
                     depth -= 1;
                 } else if states[frame] == 0 {
                     let mut mask = 3;
@@ -202,6 +396,40 @@ impl SourcePath<'_, '_, '_> {
         if !viable {
             return false;
         }
+        // Index every observed local/receive commit by actor and decreasing
+        // source event. This reuses the propagation stack after that pass;
+        // it neither discards a commit nor adds mutable execution state.
+        let (previous, scratch) = scratch.split_at_mut(count);
+        let mut committed = [usize::MAX; u8::MAX as usize + 1];
+        for (event, points) in domains.iter().enumerate() {
+            let point = if points & 32 != 0 {
+                SourcePoint::Local(event)
+            } else if points & 16 != 0 {
+                SourcePoint::Received(event)
+            } else {
+                continue;
+            };
+            let actor = self
+                .point_actor(point)
+                .expect("checked history only contains selected source points");
+            previous[event] = committed[usize::from(actor)];
+            committed[usize::from(actor)] = event;
+        }
+        let newly_required = |prior: SourcePoint, actor: u8| {
+            let mut event = committed[usize::from(actor)];
+            while event != usize::MAX && event >= prior.event() {
+                let point = if domains[event] & 32 != 0 {
+                    SourcePoint::Local(event)
+                } else {
+                    SourcePoint::Received(event)
+                };
+                if self.prerequisite(history.clone(), point)(prior, actor) {
+                    return true;
+                }
+                event = previous[event];
+            }
+            false
+        };
         let available = |path: &SourcePath<'_, '_, '_>| {
             path.point_actor(point) == Some(actor)
                 && path
@@ -233,23 +461,53 @@ impl SourcePath<'_, '_, '_> {
                         _ => Err(PathError::Choice { index: used - 1 }),
                     }
                 },
+                |event, actual| {
+                    if event == point.event() && actual[side] != actor {
+                        return false;
+                    }
+                    // These are necessary conditions of the unchanged final
+                    // compatibility/readiness checks. Reject a determined
+                    // contradiction before enumerating suffix choices that
+                    // cannot change this earlier row.
+                    for prior in [
+                        SourcePoint::Local(event),
+                        SourcePoint::Sent(event),
+                        SourcePoint::Received(event),
+                    ] {
+                        let Some((side, _)) = self.point_binding(prior) else {
+                            continue;
+                        };
+                        if domains[event] & bit(prior) != 0 {
+                            if self.point_actor(prior) != Some(actual[side]) {
+                                return false;
+                            }
+                        } else if (actual[side] == actor
+                            && event <= point.event()
+                            && required(prior, actor))
+                            || (self.point_actor(prior) != Some(actual[side])
+                                && newly_required(prior, actual[side]))
+                        {
+                            // A newly present predecessor cannot be inserted
+                            // before an already committed action. Existing
+                            // predecessors were checked in the original path.
+                            return false;
+                        }
+                    }
+                    true
+                },
                 actors,
                 self.index,
                 scratch,
             );
-            if let Ok(path) = candidate {
-                let compatible = history.clone().enumerate().all(|(index, prior)| {
-                    if matches!(prior, SourcePoint::Accepted(_)) {
-                        return true;
-                    }
-                    path.point_actor(prior) == self.point_actor(prior)
-                        && path
-                            .check_next(history.clone().take(index), prior, index)
-                            .is_ok()
-                });
-                if compatible && available(&path) {
-                    return true;
-                }
+            if let Ok(path) = candidate
+                && available(&path)
+            {
+                // `history` is a checked prefix of `self`. Forced domains
+                // retain its committed leaves, and the row predicate above
+                // retains their actors and rejects every newly required
+                // predecessor. Rechecking every whole prefix here would
+                // repeatedly prove the unchanged part of the same word.
+                return true;
             }
             let Some(index) = choices[..used].iter().rposition(|&choice| choice == 0) else {
                 return false;

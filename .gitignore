@@ -1,2 +1,5 @@
 /target
 *.smt2
+
+# Local verification records and profiler data.
+/output/

@@ -3,6 +3,131 @@ import Hibana.SourceOccurrenceTrace
 namespace Hibana.Epf.CaptureExecution
 open EndpointDelegation
 
+/-- Observer arrival order only rotates the complete producer domain. -/
+def preferredProducer (count first rank : Nat) : Nat :=
+  if rank < count - first then first + rank else rank - (count - first)
+
+theorem preferred_producer_is_in_range (count first rank : Nat)
+    (preferred : first < count) (candidate : rank < count) :
+    preferredProducer count first rank < count := by
+  unfold preferredProducer
+  split <;> omega
+
+theorem preferred_producer_is_first (count first : Nat) (preferred : first < count) :
+    preferredProducer count first 0 = first := by
+  unfold preferredProducer
+  split <;> omega
+
+theorem preferred_producer_does_not_repeat (count first left right : Nat)
+    (preferred : first < count) (leftBound : left < count) (rightBound : right < count)
+    (same : preferredProducer count first left = preferredProducer count first right) :
+    left = right := by
+  unfold preferredProducer at same
+  split at same <;> split at same <;> omega
+
+theorem preferred_producer_visits_every_candidate (count first producer : Nat)
+    (preferred : first < count) (candidate : producer < count) :
+    ∃ rank, rank < count ∧ preferredProducer count first rank = producer := by
+  by_cases later : first ≤ producer
+  · refine ⟨producer - first, by omega, ?_⟩
+    unfold preferredProducer
+    split <;> omega
+  · refine ⟨count - first + producer, by omega, ?_⟩
+    unfold preferredProducer
+    split <;> omega
+
+/-- The event and the four observation phases have distinct keys, even when
+the same original message is reused in another expanded visit. -/
+theorem source_point_rank_is_injective (left right : SourcePoint)
+    (same : left.rank = right.rank) : left = right := by
+  cases left with
+  | accepted event =>
+    cases right with
+    | accepted other =>
+      have equal : event = other := by simp only [SourcePoint.rank] at same; omega
+      subst other
+      rfl
+    | committed action =>
+      rcases action with ⟨other, side⟩
+      cases side <;> simp only [SourcePoint.rank] at same <;> omega
+  | committed action =>
+    rcases action with ⟨event, side⟩
+    cases right with
+    | accepted other =>
+      cases side <;> simp only [SourcePoint.rank] at same <;> omega
+    | committed action =>
+      rcases action with ⟨other, otherSide⟩
+      cases side <;> cases otherSide <;> simp only [SourcePoint.rank] at same
+      all_goals
+        first
+        | omega
+        | have equal : event = other := by omega
+          simp only [equal]
+
+/-- Indexing this exact prefix by event/phase preserves membership. The index
+is rebuilt on rewind; it is not a second source word or an application cursor. -/
+theorem indexed_prefix_membership (history : List SourcePoint) (point : SourcePoint) :
+    (history.map SourcePoint.rank).contains point.rank = history.contains point := by
+  apply Bool.eq_iff_iff.mpr
+  simp only [List.contains_iff_mem, List.mem_map]
+  constructor
+  · rintro ⟨prior, member, same⟩
+    have equal := source_point_rank_is_injective prior point same
+    simpa [equal] using member
+  · intro member
+    exact ⟨point, member, rfl⟩
+
+/-- Appending observations extends the same membership index. Rebuilding old
+entries on every forward step is unnecessary; rewinds still use the exact
+retained prefix. This is a source-list identity, not a Rust refinement proof. -/
+theorem indexed_prefix_append_membership
+    (history extra : List SourcePoint) (point : SourcePoint) :
+    ((history ++ extra).map SourcePoint.rank).contains point.rank =
+      ((history.map SourcePoint.rank).contains point.rank ||
+        (extra.map SourcePoint.rank).contains point.rank) := by
+  simp
+
+/-- Attributed operations need their own membership index: a pending poll
+can already name an occurrence without adding a committed source point.
+Filtering controls, foreign sessions and absent attributions before indexing
+preserves exactly the direct existence query on any prefix or rewind. -/
+theorem attributed_prefix_membership (history : List (Option Nat)) (event : Nat) :
+    (history.filterMap id).contains event =
+      history.any (fun attributed => attributed == some event) := by
+  apply Bool.eq_iff_iff.mpr
+  simp only [List.contains_iff_mem, List.mem_filterMap, List.any_eq_true, beq_iff_eq]
+  rfl
+
+/-- Pending polls extend attribution membership without becoming commits.
+Controls and foreign sessions are filtered before this identity is applied. -/
+theorem attributed_prefix_append_membership
+    (history extra : List (Option Nat)) (event : Nat) :
+    ((history ++ extra).filterMap id).contains event =
+      ((history.filterMap id).contains event || (extra.filterMap id).contains event) := by
+  simp
+
+/-- The two preferred acceptance variants precede the original enumeration;
+every original rank is still present at its rank plus two. This certifies the
+rank arithmetic, not the full Rust search or a recovered runtime ordering. -/
+theorem a_preferred_pair_retains_every_original_candidate
+    (events preferred rank : Nat) (within : rank < 2 * events) :
+    rank + 2 < 2 * events + 2 ∧
+      (if rank + 2 < 2 then 2 * preferred + (rank + 2) else rank + 2 - 2) = rank := by
+  have later : ¬ rank + 2 < 2 := by omega
+  constructor
+  · omega
+  · simp [later]
+
+/-- A necessary condition that only reads prefix membership may use that
+index. Full source readiness and final execution checking are still required. -/
+theorem indexed_prefix_preserves_read_only_conditions
+    (history : List SourcePoint) (condition : (SourcePoint → Bool) → Bool) :
+    condition (fun point => (history.map SourcePoint.rank).contains point.rank) =
+      condition (fun point => history.contains point) := by
+  apply congrArg condition
+  funext point
+  exact indexed_prefix_membership history point
+
 /-- The operation class is fixed by logical endpoints, even if two logical
 views happen to have the same physical actor. Changing choices cannot turn a
 wire message into a local action. -/
@@ -46,6 +171,19 @@ theorem a_decoded_prefix_action_survives_a_binding_extension
   | none => simp [action?, found] at decoded
   | some row => simpa [action?, List.find?_append, found] using decoded
 
+/-- Once selection reconstructed a row's actor, choosing an unrelated source
+suffix cannot repair its disagreement with a recorded actor. -/
+theorem no_binding_suffix_repairs_a_decoded_actor_mismatch
+    (earlier later : List (Nat × Binding)) (id : ActionId) (action : Action)
+    (actor : Nat) (decoded : action? earlier id = some action)
+    (different : action.actor ≠ actor) :
+    ¬ ∃ result, action? (earlier ++ later) id = some result ∧ result.actor = actor := by
+  intro ⟨result, found, agrees⟩
+  have same : action = result := Option.some.inj
+    ((a_decoded_prefix_action_survives_a_binding_extension earlier later id action decoded).symm.trans found)
+  subst result
+  exact different agrees
+
 /-- A readiness query uses another checked selection of the same unfolding,
 not another source, visit expansion or initial resource issuance. -/
 structure Query (plan : SourceOccurrenceCut source) where
@@ -86,6 +224,50 @@ def admissionReady (plan : SourceOccurrenceCut source) (points : List SourcePoin
     (cut.resumptionReady (.accepted event) &&
       !points.contains (.committed ⟨event, .send⟩))
 
+/-- A predecessor that is required in every compatible selection cannot be
+removed by searching more choices. The Rust index checks this sufficient
+condition only for structurally mandatory, fixed-actor source predecessors. -/
+theorem a_missing_unavoidable_predecessor_forbids_every_point_query
+    (plan : SourceOccurrenceCut source) (points : List SourcePoint)
+    (point prior : SourcePoint)
+    (absent : points.contains prior = false)
+    (required : ∀ query : Query plan,
+      prior ∈ sourceVisitPoints query.path.bindings ∧
+        sourcePointDepends query.cut.expanded query.path.bindings prior point = true) :
+    ∀ query : Query plan, (occurrenceCut query.cut points).ready point = false := by
+  intro query
+  apply Bool.eq_false_iff.mpr
+  intro ready
+  have completed := List.all_eq_true.mp (Bool.and_eq_true_iff.mp ready).2
+    prior (required query).1
+  change (!sourcePointDepends query.cut.expanded query.path.bindings prior point ||
+    points.contains prior) = true at completed
+  have present : points.contains prior = true := by
+    simpa only [(required query).2, Bool.not_true, Bool.false_or] using completed
+  rw [absent] at present
+  cases present
+
+theorem a_missing_unavoidable_predecessor_forbids_every_query
+    (plan : SourceOccurrenceCut source) (points : List SourcePoint)
+    (event : Nat) (prior : SourcePoint)
+    (absent : points.contains prior = false)
+    (required : ∀ query : Query plan,
+      prior ∈ sourceVisitPoints query.path.bindings ∧
+        sourcePointDepends query.cut.expanded query.path.bindings prior (.accepted event) = true) :
+    ∀ query : Query plan, admissionReady query.cut points event = false := by
+  intro query
+  apply Bool.eq_false_iff.mpr
+  intro ready
+  have prerequisites := (Bool.and_eq_true_iff.mp
+    (Bool.and_eq_true_iff.mp ready).1).2
+  have completed := List.all_eq_true.mp prerequisites prior (required query).1
+  change (!sourcePointDepends query.cut.expanded query.path.bindings prior
+    (.accepted event) || points.contains prior) = true at completed
+  have present : points.contains prior = true := by
+    simpa only [(required query).2, Bool.not_true, Bool.false_or] using completed
+  rw [absent] at present
+  cases present
+
 /-- No choice of checked path can admit a send occurrence already published
 in this same unfolding. An uncommitted acceptance alone is not publication. -/
 theorem a_published_send_is_not_admission_ready
@@ -94,6 +276,68 @@ theorem a_published_send_is_not_admission_ready
     admissionReady plan points event = false := by
   unfold admissionReady
   simp only [published, Bool.not_true, Bool.and_false]
+
+/-- The full source relation never requires a later event. The Rust word
+checker can stop its predecessor scan at the target event; the equal-event
+send/receive dependency remains inside that inclusive boundary. -/
+theorem actor_prerequisites_are_not_later_events
+    (source : Source) (bindings : List (Nat × Binding)) (before after : ActionId)
+    (ordered : precedes source bindings before after = true) :
+    before.event ≤ after.event := by
+  rcases actor_order_has_source_order_or_message_halves ordered with earlier | same
+  · omega
+  · omega
+
+/-- A newly selected row beyond an actor's observed local/receive prefix
+cannot become a missing predecessor of that prefix. The checker still checks
+the original source relation for every row inside this bound. -/
+theorem a_new_row_beyond_committed_history_is_not_a_predecessor
+    (source : Source) (bindings : List (Nat × Binding))
+    (history : List ActionId) (before : ActionId) (limit : Nat)
+    (bounded : ∀ after ∈ history, after.event < limit)
+    (later : limit ≤ before.event) :
+    ¬ ∃ after ∈ history, precedes source bindings before after = true := by
+  rintro ⟨after, member, ordered⟩
+  have forward := actor_prerequisites_are_not_later_events source bindings before after ordered
+  have bound := bounded after member
+  omega
+
+/-- Grouping history by the relevant actor and skipping smaller source events
+preserves every possible predecessor witness. Sorting that retained history
+does not require any assumption about the order in which it was observed. -/
+theorem predecessor_search_can_filter_actor_and_event
+    (source : Source) (bindings : List (Nat × Binding))
+    (history : List ActionId) (belongs : ActionId → Bool) (before : ActionId) :
+    (∃ after ∈ history, belongs after = true ∧ precedes source bindings before after = true) ↔
+    ∃ after ∈ history.filter (fun after => belongs after && decide (before.event ≤ after.event)),
+      precedes source bindings before after = true := by
+  constructor
+  · rintro ⟨after, member, actor, ordered⟩
+    refine ⟨after, List.mem_filter.mpr ⟨member, ?_⟩, ordered⟩
+    have forward := actor_prerequisites_are_not_later_events source bindings before after ordered
+    simp [actor, forward]
+  · rintro ⟨after, member, ordered⟩
+    have filtered := List.mem_filter.mp member
+    exact ⟨after, filtered.1, (Bool.and_eq_true_iff.mp filtered.2).1, ordered⟩
+
+theorem resumption_prerequisites_are_strictly_earlier_events
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (before : ActionId) (after : Nat)
+    (depends : plan.resumptionDepends observed (.committed before) (.accepted after) = true) :
+    before.event < after := by
+  have ranked := a_resumption_dependency_increases_source_rank depends
+  cases sideAt : before.side <;> simp only [SourcePoint.rank, sideAt] at ranked <;> omega
+
+/-- Once transport accepted a send, publication has no additional source or
+resumption prerequisite. This does not infer acceptance from an earlier poll. -/
+theorem sender_publication_has_only_its_acceptance_predecessor
+    (source : Source) (bindings : List (Nat × Binding)) (prior : SourcePoint) (event : Nat) :
+    sourcePointDepends source bindings prior (.committed ⟨event, .send⟩) =
+      decide (prior = .accepted event) := by
+  cases prior with
+  | accepted before =>
+      by_cases same : before = event <;> simp [sourcePointDepends, same]
+  | committed before => simp [sourcePointDepends]
 
 /-- A different selection must preserve every committed operation's actor and
 all of its prefix prerequisites. Uncommitted acceptances do not freeze an arm. -/
@@ -152,6 +396,21 @@ theorem a_poll_does_not_append_a_source_point (query : Query plan)
     (event : Nat) (rest : List (Record plan)) :
     advances (.poll query event :: rest) = advances rest := rfl
 
+/-- Once two read-only queries passed their own obligations, neither changes
+the source prefix seen by the suffix. The Rust proposer additionally retains
+the exact observed choice visit and arm when merging record attributions. -/
+theorem accepted_queries_preserve_the_same_suffix
+    (plan : SourceOccurrenceCut source) (history : List SourcePoint)
+    (first second : Query plan) (firstEvent secondEvent : Nat)
+    (firstReady : (queryCompatible plan first.cut history &&
+      admissionReady first.cut history firstEvent) = true)
+    (secondReady : (queryCompatible plan second.cut history &&
+      admissionReady second.cut history secondEvent) = true)
+    (rest : List (Record plan)) :
+    check plan history (.poll first firstEvent :: rest) =
+      check plan history (.poll second secondEvent :: rest) := by
+  simp only [check, firstReady, secondReady]
+
 theorem checking_append_preserves_the_exact_source_prefix
     (plan : SourceOccurrenceCut source) (history : List SourcePoint)
     (first rest : List (Record plan)) :
@@ -171,6 +430,23 @@ theorem a_rejected_prefix_has_no_accepted_extension
     check plan history (first ++ rest) = false := by
   rw [checking_append_preserves_the_exact_source_prefix, rejected]
   rfl
+
+/-- A reset obliges a later commit to name the same point. If that point has
+already committed, no intervening queries, commits or producer reordering can
+make this attribution valid. This justifies discarding obsolete visits before
+enumerating their suffixes; it does not infer the next visit or weaken checking. -/
+theorem an_observed_reset_target_cannot_commit_in_any_suffix
+    (plan : SourceOccurrenceCut source) (history : List SourcePoint)
+    (between rest : List (Record plan)) (point : SourcePoint)
+    (observed : history.contains point = true) :
+    check plan history (between ++ .advance point :: rest) = false := by
+  have retained : (history ++ advances between).contains point = true := by
+    rw [List.contains_append, observed]
+    rfl
+  have rejected : check plan (history ++ advances between) (.advance point :: rest) = false := by
+    simp only [check, SourceOccurrenceCut.ready, occurrenceCut, retained,
+      Bool.not_true, Bool.and_false, Bool.false_and]
+  rw [checking_append_preserves_the_exact_source_prefix, rejected, Bool.and_false]
 
 theorem each_checked_advance_retains_its_resumption_obligation
     (plan : SourceOccurrenceCut source) (history : List SourcePoint)

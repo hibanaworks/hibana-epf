@@ -261,6 +261,11 @@ fn audit_capture(
         captured.len()
     ];
     let mut workspace = std::vec![0; protocol.audit_workspace_len(&captures, capacity).unwrap()];
+    let observed_producers: Vec<_> = captures
+        .iter()
+        .enumerate()
+        .flat_map(|(producer, capture)| std::iter::repeat_n(producer, capture.records().len()))
+        .collect();
     let audit = protocol.audit(
         &captures,
         AuditStorage {
@@ -268,6 +273,7 @@ fn audit_capture(
             choices: &mut choices,
             execution: ExecutionStorage {
                 session: 1,
+                observed_producers: &observed_producers,
                 order: &mut order,
                 occurrences: &mut occurrences,
                 acceptances: &mut acceptances,
@@ -531,12 +537,14 @@ fn nested_route_visits_can_change_arms_without_reusing_the_previous_choice() {
     let mut inferred = vec![None; order.len()];
     let mut inferred_acceptances = [];
     let mut inferred_order = order.clone();
+    let observed_producers = vec![0; order.len()];
     workspace.resize(path.interpretation_workspace_len(&[capture]).unwrap(), 0);
     let automatic = path
         .interpret(
             &[capture],
             hibana_epf::ExecutionStorage {
                 session: 137,
+                observed_producers: &observed_producers,
                 order: &mut inferred_order,
                 occurrences: &mut inferred,
                 acceptances: &mut inferred_acceptances,

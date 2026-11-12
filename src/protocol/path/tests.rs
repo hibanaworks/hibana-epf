@@ -56,7 +56,8 @@ fn compare_actor_subsets(snapshot: &[tap::TapEvent], steps: &[Unfold]) {
     source
         .index_source(&mut index, &mut actors, &mut stack)
         .unwrap();
-    let (origins, order) = index[Layout::binary_words(count).unwrap()..].split_at(count);
+    let locators = &index[Layout::binary_words(count).unwrap()..][..2 * count];
+    let (origins, order) = locators.split_at(count);
     for (event, &origin) in origins.iter().enumerate() {
         assert_eq!(origin, usize::from(source.origin(event).unwrap()));
     }
@@ -281,7 +282,8 @@ fn an_inserted_occurrence_cannot_hide_a_conflict_between_tail_visits() {
             source
                 .index_source(&mut index, &mut [0; 4], &mut [0; 8])
                 .unwrap();
-            let order = &index[Layout::binary_words(4).unwrap() + 4..];
+            let start = Layout::binary_words(4).unwrap() + 4;
+            let order = &index[start..start + 4];
             let mut last = vec![0; usize::from(Layout::checked(protocol).max_role) + 1];
             assert!(pairwise_conflict(&source, &actors).is_some());
             assert!(

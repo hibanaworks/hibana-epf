@@ -6,11 +6,36 @@ use super::{
 use crate::Capture;
 use hibana::runtime::tap::{self, TapEvent};
 
-/// Caller-owned evidence outputs for one run in complete producer captures.
+// SourcePoint membership occupies bits 2..=5. This separate marker says only
+// that a captured operation already names an occurrence, even before commit.
+const ATTRIBUTED: usize = 1;
+
+pub(super) fn mark_attributions(
+    captures: &[Capture<'_>],
+    witness: &ExecutionWitness<'_>,
+    prefix: &mut [usize],
+) {
+    for (&id, event) in witness.order.iter().zip(witness.occurrences) {
+        let record = captures[id.producer].records()[id.ordinal];
+        if let Some(event) = event
+            && record.arg0() == witness.session
+            && execution::operation(record)
+        {
+            prefix[*event] |= ATTRIBUTED;
+        }
+    }
+}
+
+/// Caller-owned observations and evidence outputs for complete producer captures.
 /// These arrays never hold application progress or permissions.
 pub struct ExecutionStorage<'a> {
     /// Session whose source interpretation is being constructed.
     pub session: u32,
+    /// Producer index of each record in the observer's arrival order. Each
+    /// producer's records occur in ordinal order. This is a search preference,
+    /// not a distributed clock or an asserted causal order. All other producer
+    /// interleavings remain candidates and the final checker decides validity.
+    pub observed_producers: &'a [usize],
     /// One output slot per captured record. Initial contents are ignored.
     pub order: &'a mut [RecordId],
     /// One writable occurrence entry per ordered record.
@@ -26,6 +51,8 @@ pub enum InterpretationError {
     Evidence(ExecutionError),
     /// One ordering slot is required per captured record.
     Order { required: usize, actual: usize },
+    /// The first missing, excessive or unknown observation in the inventory.
+    ObservationOrder { index: usize },
     /// One occurrence slot is required per ordered record.
     Occurrences { required: usize, actual: usize },
     /// Too few slots for the completed wire calls.
@@ -40,8 +67,8 @@ pub enum InterpretationError {
 }
 
 impl SourcePath<'_, '_, '_> {
-    /// Eight words per captured record, one per producer, custody space and
-    /// readiness-query selection space derived from this source unfolding.
+    /// Nine words per captured record, two per producer, one per expanded
+    /// source event, custody space and readiness-query selection space.
     /// There is no fixed source-depth, visit-count or search-step capacity.
     pub fn interpretation_workspace_len(
         &self,
@@ -59,9 +86,10 @@ impl SourcePath<'_, '_, '_> {
             .custody_words(captures)
             .and_then(|n| {
                 records
-                    .checked_mul(8)?
-                    .checked_add(captures.len())?
+                    .checked_mul(9)?
+                    .checked_add(captures.len().checked_mul(2)?)?
                     .checked_add(n)
+                    .and_then(|n| n.checked_add(source.event_count()))
                     .and_then(|n| n.checked_add(self.query_workspace_len()?))
             })
             .ok_or(InterpretationError::Overflow)
@@ -95,6 +123,7 @@ impl SourcePath<'_, '_, '_> {
         }
         let ExecutionStorage {
             session,
+            observed_producers,
             order,
             occurrences,
             acceptances,
@@ -117,9 +146,31 @@ impl SourcePath<'_, '_, '_> {
         let (next_producer, rest) = workspace[..required].split_at_mut(count);
         let (next_event, rest) = rest.split_at_mut(count);
         let (completion, rest) = rest.split_at_mut(count);
-        let (taken, tail) = rest.split_at_mut(captures.len());
+        let (observation_positions, rest) = rest.split_at_mut(count);
+        let (taken, rest) = rest.split_at_mut(captures.len());
+        let (producer_offsets, tail) = rest.split_at_mut(captures.len());
+        if observed_producers.len() != count {
+            return Err(InterpretationError::ObservationOrder {
+                index: observed_producers.len().min(count),
+            });
+        }
+        taken.fill(0);
+        let mut offset = 0;
+        for (producer, capture) in captures.iter().enumerate() {
+            producer_offsets[producer] = offset;
+            offset += capture.records().len();
+        }
+        for (index, &producer) in observed_producers.iter().enumerate() {
+            let Some(capture) = captures.get(producer) else {
+                return Err(InterpretationError::ObservationOrder { index });
+            };
+            if taken[producer] == capture.records().len() {
+                return Err(InterpretationError::ObservationOrder { index });
+            }
+            observation_positions[producer_offsets[producer] + taken[producer]] = index;
+            taken[producer] += 1;
+        }
         self.prepare_completions(captures, completion, tail)?;
-        self.prepare_custody(captures, tail)?;
         let mut flat = 0;
         let mut needed = 0;
         for capture in captures {
@@ -134,12 +185,25 @@ impl SourcePath<'_, '_, '_> {
                 actual: acceptances.len(),
             });
         }
+        if captures.len() == 1 {
+            // A complete ordinal-preserving order of one producer is unique.
+            // Check its custody once, independently of source attribution.
+            for (ordinal, id) in order.iter_mut().enumerate() {
+                *id = RecordId {
+                    producer: 0,
+                    ordinal,
+                };
+            }
+        }
+        self.prepare_custody(captures, order, tail)?;
         next_producer.fill(0);
         next_event.fill(0);
         taken.fill(0);
         occurrences.fill(None);
         let layout = Layout::checked(protocol);
         let observed = |id: RecordId| captures[id.producer].records()[id.ordinal];
+        let prefix_start = 4 * count + protocol.custody_workspace_len(captures);
+        tail[prefix_start..prefix_start + source.event_count()].fill(0);
         let mut depth = 0;
         let mut word_len = 0;
         let mut accepted = 0;
@@ -179,8 +243,12 @@ impl SourcePath<'_, '_, '_> {
                 let (word_cuts, rest) = tail.split_at_mut(count);
                 let (acceptance_cuts, rest) = rest.split_at_mut(count);
                 let (word, scratch) = rest.split_at_mut(2 * count);
-                let (custody, query) =
+                let (custody, scratch) =
                     scratch.split_at_mut(protocol.custody_workspace_len(captures));
+                let (prefix, query) = scratch.split_at_mut(source.event_count());
+                // Appends below extend the index of this exact prefix. A
+                // rewind rebuilds it from the retained word and attributions;
+                // advancing through diagnostics does not rescan that history.
                 word_cuts[depth] = word_len;
                 acceptance_cuts[depth] = accepted;
                 // Opaque diagnostics neither advance source nor change custody.
@@ -191,8 +259,24 @@ impl SourcePath<'_, '_, '_> {
                         .get(taken[producer])
                         .is_some_and(|&record| !execution::relevant(record))
                 });
+                // Prefer the earliest still-unconsumed arrival. Diagnostics
+                // and earlier causal repairs may have moved records away from
+                // their arrival positions, so depth alone is not a locator.
+                let preferred = (0..captures.len())
+                    .filter(|&producer| taken[producer] < captures[producer].records().len())
+                    .min_by_key(|&producer| {
+                        observation_positions[producer_offsets[producer] + taken[producer]]
+                    })
+                    .expect("an incomplete prefix has an unconsumed record");
                 while next_producer[depth] < captures.len() {
-                    let producer = next_producer[depth];
+                    let rank = next_producer[depth];
+                    // Rotate the full producer domain, without overflowing
+                    // preferred + rank. Arrival order never prunes a candidate.
+                    let producer = if rank < captures.len() - preferred {
+                        preferred + rank
+                    } else {
+                        rank - (captures.len() - preferred)
+                    };
                     if taken[producer] == captures[producer].records().len()
                         || diagnostic.is_some_and(|eager| producer != eager)
                     {
@@ -204,9 +288,16 @@ impl SourcePath<'_, '_, '_> {
                         producer,
                         ordinal: taken[producer],
                     };
+                    if next_event[depth] == 0 {
+                        // A new producer or source prefix cannot reuse the
+                        // previous prefix's successful record attribution.
+                        occurrences[depth] = None;
+                    }
                     order[depth] = id;
                     taken[producer] += 1;
-                    let links =
+                    let links = if captures.len() == 1 {
+                        protocol.prepared_custody_links(captures, custody)
+                    } else {
                         match protocol.prepared_custody_prefix(captures, &order[..=depth], custody)
                         {
                             Ok(links) => links,
@@ -221,7 +312,8 @@ impl SourcePath<'_, '_, '_> {
                                     ExecutionError::History(RouteHistoryError::Custody(error)),
                                 ));
                             }
-                        };
+                        }
+                    };
                     let record = observed(id);
                     let relevant = execution::relevant(record) && record.arg0() == session;
                     let root = links.root_rank(id);
@@ -229,8 +321,104 @@ impl SourcePath<'_, '_, '_> {
                         relevant && record.id() == tap::SEND_POLL && root == Some(depth);
                     let evidence = completion[links.index(id)];
                     let alternatives = if relevant { alternatives } else { 1 };
+                    // Identity and a prior call's attribution are immutable
+                    // candidate constraints, not readiness decisions. Jump to
+                    // matching occurrences; retain both acceptance variants
+                    // and every later admissibility/independent check.
+                    let anchored = if relevant && execution::operation(record) {
+                        root.filter(|&first| first < depth)
+                            .and_then(|first| occurrences[first])
+                    } else if relevant
+                        && captures.len() == 1
+                        && record.id() == tap::SCOPE_REENTRY
+                        && record.arg1() >> 29 == 1
+                    {
+                        // Final checking binds this reset to the next commit
+                        // by its actor/view. In a fixed producer order, that
+                        // receive may already have an attributed sender call.
+                        // Reuse that exact occurrence before guessing resets;
+                        // without an earlier root, retain the full search.
+                        captures[0].records()[id.ordinal + 1..]
+                            .iter()
+                            .enumerate()
+                            .find(|(_, next)| {
+                                next.arg0() == session
+                                    && next.causal_key() >> 8 == record.causal_key() >> 8
+                                    && execution::committed(**next)
+                                    && (next.arg1() >> 24) as u8 == record.causal_key() as u8
+                            })
+                            .and_then(|(offset, _)| {
+                                links.root_rank(RecordId {
+                                    producer: 0,
+                                    ordinal: id.ordinal + 1 + offset,
+                                })
+                            })
+                            .filter(|&first| first < depth)
+                            .and_then(|first| occurrences[first])
+                    } else {
+                        None
+                    };
+                    let named_origin = if relevant
+                        && (execution::operation(record)
+                            || record.id() == tap::SCOPE_REENTRY && record.arg1() >> 29 == 1)
+                    {
+                        Some(record.arg1() as u16)
+                    } else {
+                        None
+                    };
+                    // A selection often immediately precedes a receive whose
+                    // sender call already has an occurrence. Prefer that
+                    // occurrence before enumerating every visit of this route.
+                    // This is only a preference: the next same-actor commit
+                    // can belong to an independent view or a later visit.
+                    // Both preferred variants are followed by the complete
+                    // original domain, using the existing per-depth rank.
+                    let preferred = if relevant
+                        && captures.len() == 1
+                        && matches!(record.id(), tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION)
+                    {
+                        captures[0].records()[id.ordinal + 1..]
+                            .iter()
+                            .enumerate()
+                            .find(|(_, next)| {
+                                next.arg0() == session
+                                    && next.causal_key() >> 8 == record.causal_key() >> 8
+                                    && execution::committed(**next)
+                            })
+                            .and_then(|(offset, _)| {
+                                links.root_rank(RecordId {
+                                    producer: 0,
+                                    ordinal: id.ordinal + 1 + offset,
+                                })
+                            })
+                            .filter(|&first| first < depth)
+                            .and_then(|first| occurrences[first])
+                    } else {
+                        None
+                    };
+                    let preference = 2 * usize::from(preferred.is_some());
+                    let alternatives = alternatives
+                        .checked_add(preference)
+                        .ok_or(InterpretationError::Overflow)?;
                     while next_event[depth] < alternatives {
-                        let candidate = next_event[depth];
+                        if let Some(event) = anchored {
+                            if next_event[depth] >= 2 * (event + 1) {
+                                break;
+                            }
+                            next_event[depth] = next_event[depth].max(2 * event);
+                        } else if let Some(origin) = named_origin {
+                            let Some(event) = self.next_origin_event(origin, next_event[depth] / 2)
+                            else {
+                                break;
+                            };
+                            next_event[depth] = next_event[depth].max(2 * event);
+                        }
+                        let hinted = next_event[depth] < preference;
+                        let candidate = if let Some(event) = preferred.filter(|_| hinted) {
+                            2 * event + next_event[depth]
+                        } else {
+                            next_event[depth] - preference
+                        };
                         next_event[depth] += 1;
                         let event = candidate / 2;
                         let accepts = candidate % 2 != 0;
@@ -251,16 +439,56 @@ impl SourcePath<'_, '_, '_> {
                             if !self.matches_record(record, event) {
                                 continue;
                             }
+                            if matches!(record.id(), tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION)
+                            {
+                                let (span, right) = self
+                                    .route_at(event, (record.arg1() >> 16) as u16)
+                                    .expect("the record matches this route occurrence");
+                                let (_, split) = source
+                                    .indexed_parts(span, self.index)
+                                    .expect("the immutable index contains this checked subtree");
+                                let opposite = if right {
+                                    span[0]..split
+                                } else {
+                                    split..span[1]
+                                };
+                                if prefix[opposite].iter().any(|points| points & 56 != 0) {
+                                    // Every readiness query would force this
+                                    // arm and the already committed opposite
+                                    // arm. Reject that same demand conflict
+                                    // once for the whole arm, independent of
+                                    // its actors or leaf directions. Accepted
+                                    // but unpublished sends do not force it.
+                                    next_event[depth] = if hinted {
+                                        preference
+                                    } else {
+                                        preference + 2 * if right { span[1] } else { split }
+                                    };
+                                    continue;
+                                }
+                            }
+                            // The full checker reads only the prior prefix for
+                            // these choice constraints. Reject the candidate
+                            // here instead of constructing an impossible suffix.
+                            let previous = occurrences[depth].replace(event);
+                            let prefix_witness = ExecutionWitness {
+                                session,
+                                order: &order[..=depth],
+                                occurrences: &occurrences[..=depth],
+                                acceptances: &[],
+                            };
+                            let agrees = self.resolver_agrees(captures, &prefix_witness, depth)
+                                && self.poll_agrees(captures, &prefix_witness, depth);
+                            occurrences[depth] = previous;
+                            if !agrees {
+                                continue;
+                            }
                             if execution::operation(record) {
                                 if let Some(first) = root.filter(|&first| first < depth) {
                                     if occurrences[first] != Some(event) {
                                         continue;
                                     }
-                                } else if order[..depth].iter().enumerate().any(|(at, &prior)| {
-                                    execution::operation(observed(prior))
-                                        && observed(prior).arg0() == session
-                                        && occurrences[at] == Some(event)
-                                }) {
+                                } else if prefix[event] & ATTRIBUTED != 0 {
                                     continue;
                                 }
                             }
@@ -296,6 +524,48 @@ impl SourcePath<'_, '_, '_> {
                             }
                             let origin = self.origin(event).unwrap();
                             let row = protocol.records[layout.sources.start + usize::from(origin)];
+                            if record.id() == tap::SCOPE_REENTRY && record.arg1() >> 29 == 1 {
+                                // This reset must name the next commit through
+                                // its logical view. A point already committed
+                                // in this prefix cannot be that future commit,
+                                // regardless of producer interleaving or actor
+                                // custody. Do not explore an obsolete visit's
+                                // entire suffix before discovering the duplicate.
+                                let view = record.causal_key() as u8;
+                                let sender = (row.arg0() >> 24) as u8;
+                                let receiver = (row.arg0() >> 16) as u8;
+                                let point = if sender == receiver && sender == view {
+                                    Some(SourcePoint::Local(event))
+                                } else if sender == view {
+                                    Some(SourcePoint::Sent(event))
+                                } else if receiver == view {
+                                    Some(SourcePoint::Received(event))
+                                } else {
+                                    None
+                                };
+                                if point.is_some_and(|point| prefix[event] & point.bit() != 0) {
+                                    continue;
+                                }
+                            }
+                            if matches!(
+                                record.id(),
+                                tap::SEND_POLL | tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION
+                            ) && let Some(end) = self.fixed_prefix_blocked_until(
+                                SourcePoint::Accepted(event),
+                                (record.causal_key() >> 8) as u8,
+                                prefix,
+                            ) {
+                                // An empty mandatory predecessor excludes
+                                // this actor throughout the same sequential
+                                // right child. This proof is independent of
+                                // later route choices and leaf identities.
+                                next_event[depth] = if hinted {
+                                    preference
+                                } else {
+                                    preference + 2 * end
+                                };
+                                continue;
+                            }
                             if let Some(point) = execution::operation_point(row, record, event) {
                                 if record.id() == tap::SEND_POLL {
                                     if !self.query_ready(
@@ -309,8 +579,8 @@ impl SourcePath<'_, '_, '_> {
                                 } else if self
                                     .check_next(
                                         execution::points(&word[..word_len]),
-                                        point,
-                                        word_len / 2,
+                                        (point, word_len / 2),
+                                        |prior| prefix[prior.event()] & prior.bit() != 0,
                                     )
                                     .is_err()
                                 {
@@ -326,7 +596,9 @@ impl SourcePath<'_, '_, '_> {
                             ]
                             .into_iter()
                             .any(|point| {
-                                self.query_ready(
+                                point.query_preconditions(|prior| {
+                                    prefix[prior.event()] & prior.bit() != 0
+                                }) && self.query_ready(
                                     execution::points(&word[..word_len]),
                                     point,
                                     (record.causal_key() >> 8) as u8,
@@ -339,18 +611,36 @@ impl SourcePath<'_, '_, '_> {
                                 && self
                                     .check_next(
                                         execution::points(&word[..word_len]),
-                                        SourcePoint::Accepted(event),
-                                        word_len / 2,
+                                        (SourcePoint::Accepted(event), word_len / 2),
+                                        |prior| prefix[prior.event()] & prior.bit() != 0,
                                     )
                                     .is_err()
                             {
                                 continue;
                             }
                             occurrences[depth] = Some(event);
+                            if matches!(record.id(), tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION)
+                            {
+                                let (span, right) = self
+                                    .route_at(event, (record.arg1() >> 16) as u16)
+                                    .expect("the record matches this route occurrence");
+                                let (_, split) = source
+                                    .indexed_parts(span, self.index)
+                                    .expect("the immutable index contains this checked subtree");
+                                // Read-only attributions within this whole arm
+                                // share one source prefix and every later choice
+                                // constraint. Advance past that entire class.
+                                next_event[depth] = if hinted {
+                                    preference
+                                } else {
+                                    preference + 2 * if right { span[1] } else { split }
+                                };
+                            }
                             if execution::committed(record) {
                                 let point = execution::operation_point(row, record, event).unwrap();
                                 execution::put(&mut word[word_len..word_len + 2], point);
                                 word_len += 2;
+                                prefix[point.event()] |= point.bit();
                             }
                             if accepts {
                                 if accepted == acceptances.len() {
@@ -369,6 +659,10 @@ impl SourcePath<'_, '_, '_> {
                                     SourcePoint::Accepted(event),
                                 );
                                 word_len += 2;
+                                prefix[event] |= SourcePoint::Accepted(event).bit();
+                            }
+                            if execution::operation(record) {
+                                prefix[event] |= ATTRIBUTED;
                             }
                         } else {
                             occurrences[depth] = None;
@@ -391,29 +685,62 @@ impl SourcePath<'_, '_, '_> {
             depth -= 1;
             taken[order[depth].producer] -= 1;
             let (word_cuts, rest) = tail.split_at_mut(count);
-            let (acceptance_cuts, _) = rest.split_at_mut(count);
+            let (acceptance_cuts, rest) = rest.split_at_mut(count);
             word_len = word_cuts[depth];
             accepted = acceptance_cuts[depth];
+            let (word, scratch) = rest.split_at_mut(2 * count);
+            let (_, scratch) = scratch.split_at_mut(protocol.custody_workspace_len(captures));
+            let prefix = &mut scratch[..source.event_count()];
+            prefix.fill(0);
+            for point in execution::points(&word[..word_len]) {
+                prefix[point.event()] |= point.bit();
+            }
+            mark_attributions(
+                captures,
+                &ExecutionWitness {
+                    session,
+                    order: &order[..depth],
+                    occurrences: &occurrences[..depth],
+                    acceptances: &[],
+                },
+                prefix,
+            );
         }
     }
 
     fn prepare_custody(
         &self,
         captures: &[Capture<'_>],
+        order: &[RecordId],
         workspace: &mut [usize],
     ) -> Result<(), InterpretationError> {
         let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
         // The preceding four rows hold cuts and the reconstructed source word.
         // Completion preparation and final checking reuse that region, so
         // restore the immutable roots whenever either has overwritten it.
-        self.unfolding()
-            .protocol()
-            .prepare_custody(captures, &mut workspace[4 * count..])
+        let source = self.unfolding();
+        let protocol = source.protocol();
+        let custody = &mut workspace[4 * count..];
+        protocol
+            .prepare_custody(captures, custody)
             .map_err(|error| {
                 InterpretationError::Evidence(ExecutionError::History(RouteHistoryError::Custody(
                     error,
                 )))
-            })
+            })?;
+        if captures.len() == 1 {
+            protocol
+                .prepared_custody_prefix(captures, order, custody)
+                .map_err(|error| match error {
+                    CustodyError::Unmatched { .. } | CustodyError::Owner { .. } => {
+                        InterpretationError::NoInterpretation
+                    }
+                    other => InterpretationError::Evidence(ExecutionError::History(
+                        RouteHistoryError::Custody(other),
+                    )),
+                })?;
+        }
+        Ok(())
     }
 
     fn prepare_completions(
@@ -524,7 +851,7 @@ impl SourcePath<'_, '_, '_> {
         witness: &ExecutionWitness<'_>,
         workspace: &mut [usize],
     ) -> Result<(), InterpretationError> {
-        self.prepare_custody(captures, workspace)?;
+        self.prepare_custody(captures, witness.order, workspace)?;
         let count = witness.order.len();
         let (word_cuts, rest) = workspace.split_at_mut(count);
         let (acceptance_cuts, rest) = rest.split_at_mut(count);

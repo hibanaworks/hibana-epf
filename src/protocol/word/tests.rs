@@ -8,6 +8,82 @@ use hibana::{
 use std::{vec, vec::Vec};
 
 #[test]
+fn indexed_query_preconditions_match_direct_membership_for_every_small_word() {
+    let global = g::seq(
+        g::send::<0, 1, g::Msg<1, ()>>(),
+        g::send::<0, 0, g::Msg<2, ()>>(),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&[Unfold::Source])];
+    let source = protocol.unfolding(&[Unfold::Source], &mut proof).unwrap();
+    let mut actors = vec![0; source.path_workspace_len().unwrap()];
+    let path = source.select(&[], &mut actors).unwrap();
+    let points: Vec<_> = (0..2)
+        .flat_map(|event| {
+            [
+                SourcePoint::Accepted(event),
+                SourcePoint::Sent(event),
+                SourcePoint::Received(event),
+                SourcePoint::Local(event),
+            ]
+        })
+        .collect();
+    for subset in 0..1usize << points.len() {
+        let word: Vec<_> = points
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &point)| (subset & (1 << i) != 0).then_some(point))
+            .collect();
+        for history in [
+            word.clone(),
+            word.iter().rev().chain(&word).copied().collect(),
+        ] {
+            let mut prefix = [0usize; 3];
+            for point in &history {
+                prefix[point.event()] |= point.bit();
+            }
+            for event in 0..prefix.len() {
+                for point in [
+                    SourcePoint::Accepted(event),
+                    SourcePoint::Sent(event),
+                    SourcePoint::Received(event),
+                    SourcePoint::Local(event),
+                ] {
+                    let finish = if matches!(point, SourcePoint::Accepted(_)) {
+                        SourcePoint::Sent(event)
+                    } else {
+                        point
+                    };
+                    let reference = !history.contains(&finish)
+                        && (!matches!(point, SourcePoint::Sent(_) | SourcePoint::Received(_))
+                            || history.contains(&SourcePoint::Accepted(event)));
+                    assert_eq!(
+                        point.query_preconditions(|prior| history.contains(&prior)),
+                        reference
+                    );
+                    assert_eq!(
+                        point.query_preconditions(|prior| prefix[prior.event()] & prior.bit() != 0),
+                        reference,
+                        "query={point:?} history={history:?}"
+                    );
+                    assert_eq!(
+                        path.check_next(history.iter().copied(), (point, history.len()), |prior| {
+                            prefix[prior.event()] & prior.bit() != 0
+                        }),
+                        path.check_next(history.iter().copied(), (point, history.len()), |prior| {
+                            history.contains(&prior)
+                        }),
+                        "source word/error correspondence query={point:?} history={history:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn impossible_directions_and_fixed_actors_reject_before_choice_search() {
     let global = g::seq(
         g::send::<0, 1, g::Msg<1, ()>>(),

@@ -1,10 +1,20 @@
 # hibana-epf
 
+Development checkpoint `progress-20261112` publishes work in progress, not a
+release or a complete-gate success. Use the same tag of the canonical sibling
+Hibana checkout with this snapshot. Ordinary CI runs on branch pushes and pull
+requests, not progress tags.
+
 EPF observes running Hibana programs and controls registered route decisions.
 Observation programs process events; policy programs return left, right or
 rejection through Hibana's resolver API. The library uses `no_std`, no heap
 allocation and caller-owned storage. The optional command-line tool processes
 live or recorded observations and emits diagnostics.
+
+Development uses the canonical sibling `../hibana` source, including the
+version currently undergoing validation. Keep that source fixed while checking
+EPF; its proof evidence records the selected Git base, dirty patch and source
+hashes. Using this source does not imply that its qualification has finished.
 
 ## Observe a running endpoint
 
@@ -343,6 +353,18 @@ bits, reusable choice/actor arrays, traversal and demand counts, and two child
 links per boundary. Selection reuses that scratch. This removes quadratic
 navigation on skewed source trees; conditional choice search can still be
 exponential.
+Before full choice propagation, an entirely uncommitted sequential sibling
+whose every leaf has a fixed operation by the querying actor already supplies
+a missing predecessor in every selection. The query checks that span through
+the existing immutable boundaries and prefix bits, without another index or
+progress store. A missing fixed-actor leaf that is unavoidable under the exact
+committed prefix also excludes the whole sequential suffix, including mixed
+actors and partly committed spans. This uses the same source ancestor relation;
+an unforced alternative cannot supply the certificate. Conditional bindings and
+uncertified spans still use full readiness. `CompactSource.lean` proves that a valid selected
+subtree is nonempty and retains a source-wide leaf certificate; finite query
+comparisons check the Rust span/binding implementation against complete source
+selection. These are distinct from a general Rust refinement proof.
 Enclosing routes are located through the existing binary-parent index; a live
 occurrence already identifies its selected arm without scanning siblings.
 Native comparisons use complete choice enumeration on fixed left- and
@@ -376,8 +398,6 @@ order, changing arms through nested rolls, shared parallel resets in both
 completion orders and a pending old continuation during elastic reentry.
 They also reject invented acceptance after each transport error, reused dynamic
 occurrences, invalid boundaries and short or malformed correspondence input.
-Defect controls omit the per-poll query or completion-evidence requirement;
-each must fail its named regression.
 
 Success is a source interpretation compatible with the witnessed causal order
 and acceptance intervals under the transport contract. It does not establish
@@ -396,7 +416,14 @@ borrows those outputs and the retained proof and actor workspace.
 
 The first candidate uses observed commit counts to guide repeated bodies.
 Opposite route arms add their visit demands; sequential and parallel children
-share visits, while nested rolls account for their own repetitions. Typed
+share visits, while nested rolls account for their own repetitions.
+Nested roll counts are not divided by enclosing visits that selected another
+arm. A parallel summary of observations outside nested rolls guides each
+selected arm's divisor, using the otherwise unused derivation-rank row.
+Rolls remain explicit during this count-guided construction; flat unchanged
+subtrees can use `Unfold::Source`. Short temporary space declines this seed,
+without changing the complete derivation domain or caller storage contract.
+Typed
 operations can suggest an arm before a later offer records it. The preference
 groups one actor's observations by enclosing resets, rather than counting each
 message as another visit. These are construction hints, never evidence of a visit.
@@ -426,9 +453,7 @@ Execution checking skips prerequisites already present in the history and
 avoids resumption scans when the derivation has no inserted continuation.
 The prerequisite result is compared with the unfactored rule for every subset
 of a request/reply's suffix points in ordinary, before and alongside fixtures,
-with its initial visit either complete or absent. Separate
-controls break scope lookup, source boundaries, visit demand, typed-arm
-preference and resumption pruning; each must fail its regression. These checks
+with its initial visit either complete or absent. These finite comparisons
 supplement the source-execution tests and Lean claims, rather than proving
 general Rust refinement or practical completion for every finite search.
 
@@ -464,9 +489,35 @@ capture suffixes. This codec does not add a runtime permission or progress API.
 
 `SourcePath::interpret(captures, storage, workspace)` constructs a causal record
 order, record attribution and supported acceptance boundaries for an already
-checked source path. `ExecutionStorage` supplies writable output arrays,
+checked source path. `ExecutionStorage::observed_producers` preserves the
+observer's arrival order as producer indices, with producer-local ordinals
+implicit in that sequence. Its inventory must match the complete captures.
+The search prefers the earliest unconsumed arrival and still enumerates every
+producer alternative. Arrival order is neither a distributed clock nor trusted
+causal evidence; the unchanged final checker decides validity. This index adds
+one workspace word per captured record and one per producer.
+`ExecutionStorage` also supplies writable output arrays,
 including one order slot per captured record; their initial contents are ignored.
 The returned `ExecutionWitness` borrows their used portions.
+For a single producer, an already attributed sender of the next same-actor
+commit supplies a first route-observation candidate. An independent view or a
+later visit can make that preference wrong: both preferred variants precede
+the complete original candidate domain, and every candidate uses the same
+readiness checks. No record is reassigned or certified just by this hint.
+Resolver/committed-choice agreement and agreement between a poll and its latest
+resolver decision only read that record's prefix. The proposer applies the
+same predicates before extending that prefix, as well as in final checking.
+An impossible prefix cannot be repaired by a later suffix; record attributions
+are reconsidered when the search rewinds. Forward steps extend the existing
+event/phase and attributed-call membership bits; only a rewind rebuilds them
+from the exact retained word and record prefix. Diagnostics add no bits and
+do not rescan the history. The append identities are checked in
+`CaptureExecution.lean`; storage and the independent final checker are unchanged.
+All 518 words of up to three query,
+selection and poll records on a two-arm source are compared against enumeration
+of every occurrence assignment accepted by the full checker. This finite
+comparison is separate from the general source-prefix lemma in
+`CaptureExecution.lean` and is not a Rust refinement theorem.
 Send polls, publications and FIFO receipts share one search variable. Roll
 reset attribution follows its exact next committed operation, and distinct
 calls cannot reuse an expanded event. The constructor searches the finite
@@ -499,6 +550,26 @@ Opaque diagnostics remain in the witness but have
 one canonical placement between source-relevant records. Each finished
 candidate is validated with `check_execution`.
 It cannot substitute its own acceptance for that check.
+
+Readiness queries retain the already checked committed prefix. While selecting
+an alternative path, each reconstructed actor row must preserve recorded actors
+and introduce no missing predecessor of the query or an already committed
+action. A contradictory row stops selection before unrelated suffix choices;
+later choices cannot repair that source prefix. A missing fixed-actor predecessor
+also remains mandatory when every intervening choice arm is already forced by
+a committed send, receive or local point in that arm. Transport acceptance alone
+does not force an arm. The immutable binary parent index supplies those spans;
+the checker neither adds a progress table nor changes the final execution check.
+The unchanged part of the
+committed word is not rechecked for every alternative. Small source histories,
+including conditional holders, logical self actions and colocated wire halves,
+are compared with complete choice enumeration and direct prefix checking.
+Predecessor scans end at the target event, keeping its same-event send/receive
+edge. Resumption history is consulted only for strictly earlier events, and
+sender publication checks its existing acceptance without another source scan.
+The general forward-dependency claims are checked in `CaptureExecution.lean`.
+The finite comparison's reference still scans the whole expansion with the
+unbounded source relations; it does not share these limits or shortcuts.
 
 Acceptance is proposed after the first poll only for calls with completion
 evidence. When a source stream spans producers, completion alternatives remain
@@ -535,6 +606,29 @@ cannot supply another query, and a controller's poll must agree with its latest
 observed resolver decision in that visit unless committed knowledge already
 determines the arm. This remains retrospective evidence checking, not another
 application permission service.
+
+A sole producer has one complete ordinal-preserving record order. Its custody
+and FIFO correspondence are checked once and reused while source occurrences
+are attributed; multiple producers retain the full causal-order search. A reset
+can be anchored to its next committed receive only when that fixed producer
+order and an already attributed sender call identify the exact occurrence.
+Unanchored resets retain their original candidate domain. Final execution
+checking reconstructs custody independently. Its source-word check indexes
+committed prefix membership rather than rescanning the word per predecessor;
+duplicate detection and error positions are unchanged. This adds one word per
+expanded event to standalone execution-check storage, within the interpreter's
+existing event-index region. It introduces no application state or authority.
+
+The same temporary region marks occurrences already attributed to captured
+operations. A pending poll can name an occurrence without committing a source
+point, so its marker is separate from acceptance and commit membership. Rebuild
+it from the exact ordered prefix after every advance or rewind, then check it
+once per candidate rather than scanning all earlier records for every candidate.
+Controls, absent attributions and other sessions do not mark an occurrence;
+records belonging to the same existing call retain their root correspondence.
+The independent final execution check remains in place. Small exhaustive Rust
+comparison checks both membership and preservation of the source-phase bits;
+Lean proves the corresponding filtered-prefix membership identity.
 
 `CaptureExecution.lean` interprets these per-query selections and source advances
 using the selected core's existing source-occurrence semantics. It proves that a checked

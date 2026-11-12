@@ -88,6 +88,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         let (actors, scratch) = workspace[..required].split_at_mut(self.event_count());
         let (parts, scratch) =
             scratch.split_at_mut(Layout::path_index_words(self.event_count()).unwrap());
+        self.index_source(parts, actors, scratch)?;
         self.select_in(choices, actors, parts, scratch)
     }
 
@@ -95,15 +96,17 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         &self,
         choices: &[RouteChoice],
         actors: &'w mut [usize],
-        parts: &'w mut [usize],
+        parts: &'w [usize],
         scratch: &mut [usize],
     ) -> Result<SourcePath<'p, 'u, 'w>, PathError> {
-        self.index_source(parts, actors, scratch)?;
         for (index, choice) in choices.iter().enumerate() {
             if choices[..index]
                 .iter()
                 .any(|prior| prior.span == choice.span)
-                || !matches!(self.kind(choice.span), Some(NodeKind::Choice(_)))
+                || !matches!(
+                    self.indexed_parts(choice.span, parts),
+                    Some((NodeKind::Choice(_), _))
+                )
             {
                 return Err(PathError::Choice { index });
             }
@@ -120,6 +123,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                     used += 1;
                     Ok(choice.right)
                 },
+                |_, _| true,
                 actors,
                 parts,
                 scratch,
@@ -135,6 +139,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
     pub(super) fn select_by<'w>(
         &self,
         mut choose: impl FnMut([usize; 2], u16, usize) -> Result<bool, PathError>,
+        mut accept: impl FnMut(usize, [u8; 2]) -> bool,
         actors: &'w mut [usize],
         parts: &'w [usize],
         workspace: &mut [usize],
@@ -156,7 +161,8 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         let records = protocol.records;
         let actors = &mut actors[..count];
         let parts = &parts[..Layout::path_index_words(count).unwrap()];
-        let (origins, order) = parts[Layout::binary_words(count).unwrap()..].split_at(count);
+        let locators = &parts[Layout::binary_words(count).unwrap()..][..2 * count];
+        let (origins, order) = locators.split_at(count);
         let (stack, rest) = workspace[..temporary].split_at_mut(2 * count);
         let (owners, rest) = rest.split_at_mut(layout.initial.len());
         let (selected, last) = rest.split_at_mut(layout.choices.len());
@@ -205,6 +211,11 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                         ]
                     };
                     if expected != [sender, receiver] {
+                        return Err(PathError::Binding { event });
+                    }
+                    // A query can reject this already determined actor row
+                    // before constructing unrelated choices in its suffix.
+                    if !accept(event, [sender as u8, receiver as u8]) {
                         return Err(PathError::Binding { event });
                     }
                     actors[event] = sender << 8 | receiver;
@@ -284,7 +295,9 @@ impl<'p, 'u> Unfolded<'p, 'u> {
     }
 
     // One row per binary boundary: parent boundary, subtree end and kind;
-    // followed by source origins and the permutation into proof-leaf order.
+    // followed by source origins, the permutations into proof-leaf and
+    // source-identity order, and outermost route intervals sorted by scope.
+    // All are immutable path data.
     // The actor output is not live yet, so it supplies the DFS's parent slots.
     pub(super) fn index_source(
         &self,
@@ -305,6 +318,9 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         }
         let (parts, locators) = parts[..Layout::path_index_words(count).unwrap()]
             .split_at_mut(Layout::binary_words(count).unwrap());
+        let (locators, routes) = locators.split_at_mut(3 * count);
+        let (route_count, routes) = routes.split_first_mut().unwrap();
+        let mut used_routes = 0;
         stack[..2].copy_from_slice(&[0, count]);
         parents[0] = usize::MAX;
         let mut depth = 2;
@@ -324,11 +340,41 @@ impl<'p, 'u> Unfolded<'p, 'u> {
             };
             let node = split - 1;
             parts[3 * node..3 * node + 3].copy_from_slice(&[parent, span[1], tag]);
+            if let NodeKind::Choice(scope) = kind {
+                routes[4 * used_routes..4 * used_routes + 4].copy_from_slice(&[
+                    usize::from(scope),
+                    span[0],
+                    span[1],
+                    node,
+                ]);
+                used_routes += 1;
+            }
             stack[depth..depth + 4].copy_from_slice(&[split, span[1], span[0], split]);
             parents[depth / 2..depth / 2 + 2].fill(node);
             depth += 4;
         }
-        let (origins, order) = locators.split_at_mut(count);
+        let rows = &mut routes.as_chunks_mut::<4>().0[..used_routes];
+        rows.sort_unstable_by(|a, b| a[0].cmp(&b[0]).then(a[1].cmp(&b[1])).then(b[2].cmp(&a[2])));
+        let mut kept = 0;
+        for index in 0..rows.len() {
+            let row = rows[index];
+            if kept != 0 && rows[kept - 1][0] == row[0] && row[1] < rows[kept - 1][2] {
+                // Same-scope subtrees are laminar. The root descent uses the
+                // outermost matching occurrence, including repeated scope IDs.
+                if row[2] > rows[kept - 1][2] {
+                    return Err(PathError::Structure {
+                        start: row[1],
+                        end: row[2],
+                    });
+                }
+                continue;
+            }
+            rows[kept] = row;
+            kept += 1;
+        }
+        *route_count = kept;
+        let (origins, rest) = locators.split_at_mut(count);
+        let (order, by_origin) = rest.split_at_mut(count);
         order.fill(usize::MAX);
         for (event, origin) in origins.iter_mut().enumerate() {
             *origin = usize::from(self.origin(event).unwrap());
@@ -351,6 +397,10 @@ impl<'p, 'u> Unfolded<'p, 'u> {
             }
             parents[event] = 1;
         }
+        for (event, slot) in by_origin.iter_mut().enumerate() {
+            *slot = event;
+        }
+        by_origin.sort_unstable_by_key(|&event| (origins[event], event));
         Ok(())
     }
 
@@ -584,47 +634,32 @@ impl SourcePath<'_, '_, '_> {
 }
 
 impl SourcePath<'_, '_, '_> {
+    /// The first occurrence of this original message at or after `first`.
+    /// The sorted permutation includes inactive arms and every retained visit;
+    /// matching identity alone never establishes that a call is allowed.
+    pub(super) fn next_origin_event(&self, origin: u16, first: usize) -> Option<usize> {
+        let count = self.source.event_count();
+        let start = Layout::binary_words(count).unwrap();
+        let origins = &self.index[start..start + count];
+        let by_origin = &self.index[start + 2 * count..start + 3 * count];
+        let origin = usize::from(origin);
+        let at = by_origin.partition_point(|&event| (origins[event], event) < (origin, first));
+        let event = *by_origin.get(at)?;
+        (origins[event] == origin).then_some(event)
+    }
+
     /// The concrete visit containing this event, including unselected arms.
     pub(super) fn route_at(&self, event: usize, scope: u16) -> Option<([usize; 2], bool)> {
         let count = self.source.event_count();
         if event >= count || count < 2 {
             return None;
         }
-        // A binary leaf's parent is one of its two adjacent split boundaries.
-        // Both adjacent boundaries are ancestors, so their parent chains cover
-        // every enclosing choice. Keep the outermost matching visit, as in a
-        // descent from the root, including repeated scope IDs.
-        let mut found = None;
-        for mut node in [event.checked_sub(1), (event < count - 1).then_some(event)]
-            .into_iter()
-            .flatten()
-        {
-            loop {
-                let row = &self.index[3 * node..3 * node + 3];
-                if row[2] == usize::from(scope) + 2 {
-                    found = Some((node, row[1]));
-                }
-                if row[0] == usize::MAX {
-                    break;
-                }
-                node = row[0];
-            }
-        }
-        let (node, end) = found?;
-        let mut start = 0;
-        let mut child = node;
-        loop {
-            let parent = self.index[3 * child];
-            if parent == usize::MAX {
-                break;
-            }
-            if child > parent {
-                start = parent + 1;
-                break;
-            }
-            child = parent;
-        }
-        Some(([start, end], event > node))
+        let offset = Layout::binary_words(count).unwrap() + 3 * count;
+        let rows = &self.index[offset + 1..].as_chunks::<4>().0[..self.index[offset]];
+        let scope = usize::from(scope);
+        let next = rows.partition_point(|row| row[0] < scope || row[0] == scope && row[1] <= event);
+        let row = rows.get(next.checked_sub(1)?)?;
+        (row[0] == scope && event < row[2]).then_some(([row[1], row[2]], event > row[3]))
     }
 }
 

@@ -174,6 +174,26 @@ impl Protocol<'_> {
         Ok(())
     }
 
+    // Read only after a complete custody check whose order cannot change.
+    // The interpreter uses this for a sole producer's fixed ordinal order;
+    // multiple-producer candidates must reconstruct their prefix links.
+    pub(super) fn prepared_custody_links<'w>(
+        &self,
+        captures: &[Capture<'_>],
+        workspace: &'w [usize],
+    ) -> Correspondence<'w> {
+        let count: usize = captures.iter().map(|capture| capture.records().len()).sum();
+        let (ranks, rest) = workspace.split_at(count);
+        let (roots, rest) = rest.split_at(count);
+        let (_, rest) = rest.split_at(2 * count);
+        let (offsets, _) = rest.split_at(captures.len() + 1);
+        Correspondence {
+            roots,
+            ranks,
+            offsets,
+        }
+    }
+
     // Only the interpreter's private, disjoint custody region uses prepared
     // roots. Public checks prepare them afresh, as does final witness checking.
     pub(super) fn prepared_custody_prefix<'w>(

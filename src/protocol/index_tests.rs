@@ -69,6 +69,85 @@ fn retained_scope_index_matches_exhaustive_marker_lookup() {
 }
 
 #[test]
+fn attribution_membership_matches_every_small_prefix_and_rewind() {
+    let record = |ordinal: u32, kind: u16, session: u32| {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(&ordinal.to_be_bytes());
+        bytes[4..6].copy_from_slice(&kind.to_be_bytes());
+        bytes[8..12].copy_from_slice(&session.to_be_bytes());
+        TapEvent::from(bytes)
+    };
+    let first = [
+        record(0, tap::SEND_POLL, 1),
+        record(1, tap::ENDPOINT_SEND, 2),
+    ];
+    let second = [
+        record(0, tap::RESOLVER_AUDIT, 1),
+        record(1, tap::ENDPOINT_RECV, 1),
+    ];
+    let captures = [
+        crate::Capture::new(&first, Some(2)).unwrap(),
+        crate::Capture::new(&second, Some(2)).unwrap(),
+    ];
+    // All six producer-preserving orders and every partial attribution of
+    // four records to either event. Controls and other sessions never mark.
+    for producers in [
+        [0, 0, 1, 1],
+        [0, 1, 0, 1],
+        [0, 1, 1, 0],
+        [1, 0, 0, 1],
+        [1, 0, 1, 0],
+        [1, 1, 0, 0],
+    ] {
+        let mut taken = [0; 2];
+        let order = producers.map(|producer| {
+            let id = RecordId {
+                producer,
+                ordinal: taken[producer],
+            };
+            taken[producer] += 1;
+            id
+        });
+        for mut assignment in 0..81 {
+            let occurrences = core::array::from_fn::<_, 4, _>(|_| {
+                let digit = assignment % 3;
+                assignment /= 3;
+                if digit == 0 { None } else { Some(digit - 1) }
+            });
+            for session in [1, 2] {
+                for cut in (0..=4).chain((0..=4).rev()) {
+                    let mut flags = [4 | 8 | 16 | 32, 0];
+                    interpret::mark_attributions(
+                        &captures,
+                        &ExecutionWitness {
+                            session,
+                            order: &order[..cut],
+                            occurrences: &occurrences[..cut],
+                            acceptances: &[],
+                        },
+                        &mut flags,
+                    );
+                    for (event, &flag) in flags.iter().enumerate() {
+                        let expected = order[..cut].iter().enumerate().any(|(at, id)| {
+                            let record = captures[id.producer].records()[id.ordinal];
+                            record.arg0() == session
+                                && matches!(
+                                    record.id(),
+                                    tap::SEND_POLL | tap::ENDPOINT_SEND | tap::ENDPOINT_RECV
+                                )
+                                && occurrences[at] == Some(event)
+                        });
+                        assert_eq!(flag & 1 != 0, expected);
+                    }
+                    assert_eq!(flags[0] & !1, 4 | 8 | 16 | 32);
+                    assert_eq!(flags[1] & !1, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn prepared_custody_matches_fresh_for_every_prefix_and_rewind() {
     let source = g::seq(
         g::send::<0, 1, g::Msg<1, ()>>(),
@@ -149,6 +228,49 @@ fn prepared_custody_matches_fresh_for_every_prefix_and_rewind() {
         }
     }
     assert!(legal > 0 && rejected > 0);
+
+    // A single producer has just one complete order. Its already checked
+    // FIFO links must agree with fresh checks at every prefix and rewind,
+    // including receipt before the sender's delayed local publication.
+    let joined: Vec<_> = [
+        sender[0],
+        receiver[0],
+        sender[1],
+        sender[2],
+        receiver[1],
+        sender[3],
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(ordinal, record)| {
+        let mut bytes: [u8; 16] = record.into();
+        bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+        TapEvent::from(bytes)
+    })
+    .collect();
+    let captures = [crate::Capture::new(&joined, Some(joined.len() as u32)).unwrap()];
+    let order: Vec<_> = (0..joined.len())
+        .map(|ordinal| RecordId {
+            producer: 0,
+            ordinal,
+        })
+        .collect();
+    let mut fixed = vec![usize::MAX; protocol.custody_workspace_len(&captures)];
+    let mut fresh = fixed.clone();
+    protocol
+        .checked_custody(&captures, &order, &mut fixed)
+        .unwrap();
+    for cut in (0..=order.len()).chain((0..order.len()).rev()) {
+        let cached = protocol.prepared_custody_links(&captures, &fixed);
+        let original = protocol
+            .custody_prefix(&captures, &order[..cut], &mut fresh)
+            .unwrap();
+        for &id in &order[..cut] {
+            assert_eq!(cached.root(id), original.root(id));
+            assert_eq!(cached.rank(id), original.rank(id));
+            assert_eq!(cached.root_rank(id), original.root_rank(id));
+        }
+    }
 }
 
 #[test]

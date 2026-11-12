@@ -57,6 +57,7 @@ fn check(
         records.len()
     ];
     let mut scratch = std::vec![0; protocol.audit_workspace_len(&captures, capacity).unwrap()];
+    let observed_producers = vec![0; records.len()];
     let audit = protocol.audit(
         &captures,
         AuditStorage {
@@ -64,6 +65,7 @@ fn check(
             choices: &mut choices,
             execution: ExecutionStorage {
                 session: 1,
+                observed_producers: &observed_producers,
                 order: &mut order,
                 occurrences: &mut occurrences,
                 acceptances: &mut acceptances,
@@ -72,6 +74,69 @@ fn check(
         &mut scratch,
     )?;
     Ok(audit.path().unfolding().event_count())
+}
+
+#[test]
+fn nested_visits_are_not_averaged_over_unselected_enclosing_arms() {
+    let global = g::seq(
+        g::route(
+            g::send::<7, 7, g::Msg<1, ()>>(),
+            g::seq(
+                g::send::<7, 7, g::Msg<2, ()>>().roll(),
+                g::send::<7, 7, g::Msg<3, ()>>(),
+            ),
+        ),
+        g::send::<7, 7, g::Msg<4, ()>>(),
+    )
+    .roll();
+    let snapshot: Vec<_> = tap::projected(&project::<7>(&global)).collect();
+    let scope = |start| {
+        snapshot
+            .iter()
+            .find(|row| {
+                row.id() == tap::PROJECTED_SCOPE
+                    && row.causal_key() >> 13 == 1
+                    && row.arg1() & 3 == 0
+                    && row.arg0() == start
+            })
+            .unwrap()
+            .causal_key()
+    };
+    let reset = |ordinal: usize, scope: u16, origin: u16| {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+        bytes[4..6].copy_from_slice(&tap::SCOPE_REENTRY.to_be_bytes());
+        bytes[6..8].copy_from_slice(&(7u16 << 8 | 7).to_be_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_be_bytes());
+        bytes[12..].copy_from_slice(&(u32::from(scope) << 16 | u32::from(origin)).to_be_bytes());
+        TapEvent::from(bytes)
+    };
+    for repeats in 1..=3 {
+        for revised_first in [false, true] {
+            let revised = std::iter::repeat_n(1u16, repeats)
+                .chain([2, 3])
+                .collect::<Vec<_>>();
+            let visits = if revised_first {
+                [revised, vec![0, 3]]
+            } else {
+                [vec![0, 3], revised]
+            };
+            let mut records = Vec::new();
+            for (visit, word) in visits.iter().enumerate() {
+                if visit != 0 {
+                    records.push(reset(records.len(), scope(0), word[0]));
+                }
+                for (index, &origin) in word.iter().enumerate() {
+                    if origin == 1 && index != 0 {
+                        records.push(reset(records.len(), scope(1), origin));
+                    }
+                    let lane = (snapshot[2 + usize::from(origin)].arg0() >> 8) as u8;
+                    records.push(local(records.len(), origin, lane));
+                }
+            }
+            check(&snapshot, &records, 32).unwrap();
+        }
+    }
 }
 
 #[test]

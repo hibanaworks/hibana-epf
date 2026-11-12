@@ -163,10 +163,32 @@ fn check(condition: bool, index: usize) -> Result<(), ProtocolError> {
 }
 
 impl Layout {
+    #[inline]
     fn checked(protocol: Protocol<'_>) -> Self {
-        match Self::read(protocol.records) {
-            Ok(layout) => layout,
-            Err(_) => unreachable!("Protocol retains checked immutable headers"),
+        // Only `new` constructs Protocol, and both headers remain immutably
+        // borrowed. Decode their checked sizes without validating them again.
+        Self::headers(protocol.records[0], protocol.records[1])
+    }
+
+    #[inline]
+    fn headers(program: TapEvent, role: TapEvent) -> Self {
+        let mut end = 2;
+        let mut section = |count| {
+            let start = end;
+            end += count;
+            start..end
+        };
+        let events = (program.arg0() >> 16) as usize;
+        Self {
+            sources: section(events),
+            scopes: section((program.arg0() & 0xffff) as usize),
+            choices: section(role.arg0() as usize),
+            bindings: section(if program.ts() == 0x1_0001 { events } else { 0 }),
+            decisions: section((program.arg1() >> 16) as usize),
+            initial: section((program.arg1() & 0xffff) as usize),
+            locals: section(role.ts() as usize),
+            key: program.causal_key(),
+            max_role: role.arg1() as u8,
         }
     }
 
@@ -183,9 +205,11 @@ impl Layout {
     }
 
     fn query_words(&self, events: usize) -> Option<usize> {
-        events
-            .checked_mul(3)?
-            .checked_add(self.path_scratch_words(events)?.max(events.checked_mul(4)?))
+        events.checked_mul(3)?.checked_add(
+            self.path_scratch_words(events)?
+                .checked_add(events)?
+                .max(events.checked_mul(4)?),
+        )
     }
 
     fn binary_words(events: usize) -> Option<usize> {
@@ -193,7 +217,10 @@ impl Layout {
     }
 
     fn path_index_words(events: usize) -> Option<usize> {
-        Self::binary_words(events)?.checked_add(events.checked_mul(2)?)
+        Self::binary_words(events)?
+            .checked_add(events.checked_mul(3)?)?
+            .checked_add(events.saturating_sub(1).checked_mul(4)?)?
+            .checked_add(1)
     }
 
     fn path_words(&self, events: usize) -> Option<usize> {
@@ -224,8 +251,6 @@ impl Layout {
             1,
         )?;
         let ownership = program.ts() == 0x1_0001;
-        let events = (program.arg0() >> 16) as usize;
-        let markers = (program.arg0() & 0xffff) as usize;
         let decisions = (program.arg1() >> 16) as usize;
         let initial = (program.arg1() & 0xffff) as usize;
         check(ownership || (decisions == 0 && initial == 0), 0)?;
@@ -233,42 +258,19 @@ impl Layout {
             decisions + 256 <= usize::from(u16::MAX) && initial <= 256,
             0,
         )?;
-        let mut end = 2;
-        let mut section = |count| {
-            let start = end;
-            end += count;
-            start..end
-        };
-        let sources = section(events);
-        let scopes = section(markers);
-        let choices = section(role.arg0() as usize);
-        let bindings = section(if ownership { events } else { 0 });
-        let decisions = section(decisions);
-        let initial = section(initial);
-        let locals = section(role.ts() as usize);
-        if records.len() != end {
+        let layout = Self::headers(program, role);
+        if records.len() != layout.locals.end {
             return Err(ProtocolError::Length {
-                expected: end,
+                expected: layout.locals.end,
                 actual: records.len(),
             });
         }
-        let key = program.causal_key();
-        let max_role = role.arg1() as u8;
         check(
-            (key >> 8) <= u16::from(max_role) && (key & 255) <= u16::from(max_role),
+            (layout.key >> 8) <= u16::from(layout.max_role)
+                && (layout.key & 255) <= u16::from(layout.max_role),
             0,
         )?;
-        Ok(Self {
-            sources,
-            scopes,
-            choices,
-            bindings,
-            decisions,
-            initial,
-            locals,
-            key,
-            max_role,
-        })
+        Ok(layout)
     }
 
     fn check_scopes(

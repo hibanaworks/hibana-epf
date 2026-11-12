@@ -41,6 +41,30 @@ impl SourcePoint {
             | Self::Local(event) => event,
         }
     }
+
+    // Low two bits belong to temporary choice domains in readiness queries.
+    pub(super) fn bit(self) -> usize {
+        match self {
+            Self::Accepted(_) => 4,
+            Self::Sent(_) => 8,
+            Self::Received(_) => 16,
+            Self::Local(_) => 32,
+        }
+    }
+
+    // Necessary prefix conditions only. Full source readiness is checked
+    // separately, including actor bindings, choices and retained visits.
+    pub(super) fn query_preconditions(self, contains: impl Fn(Self) -> bool) -> bool {
+        let finish = match self {
+            Self::Accepted(event) => Self::Sent(event),
+            other => other,
+        };
+        !contains(finish)
+            && match self {
+                Self::Sent(event) | Self::Received(event) => contains(Self::Accepted(event)),
+                _ => true,
+            }
+    }
 }
 
 impl SourcePath<'_, '_, '_> {
@@ -56,7 +80,10 @@ impl SourcePath<'_, '_, '_> {
     /// word. Capture correspondence must establish those boundaries as well.
     pub fn check_word(&self, word: &[SourcePoint]) -> Result<(), WordError> {
         for (index, &point) in word.iter().enumerate() {
-            self.check_next(word[..index].iter().copied(), point, index)?;
+            let prefix = &word[..index];
+            self.check_next(prefix.iter().copied(), (point, index), |prior| {
+                prefix.contains(&prior)
+            })?;
         }
         Ok(())
     }
@@ -64,8 +91,8 @@ impl SourcePath<'_, '_, '_> {
     pub(super) fn check_next(
         &self,
         history: impl Clone + Iterator<Item = SourcePoint>,
-        point: SourcePoint,
-        index: usize,
+        (point, index): (SourcePoint, usize),
+        contains: impl Fn(SourcePoint) -> bool,
     ) -> Result<(), WordError> {
         if self.point_actor(point).is_none() {
             return Err(WordError::Point { index });
@@ -73,9 +100,7 @@ impl SourcePath<'_, '_, '_> {
         if let Some(earlier) = history.clone().position(|prior| prior == point) {
             return Err(WordError::Duplicate { index, earlier });
         }
-        if let Some(prior) = self.missing(history.clone(), point, |prior| {
-            history.clone().any(|entry| entry == prior)
-        }) {
+        if let Some(prior) = self.missing(history, point, contains) {
             return Err(WordError::Predecessor { index, prior });
         }
         Ok(())
@@ -94,9 +119,29 @@ impl SourcePath<'_, '_, '_> {
         {
             return Some(SourcePoint::Accepted(event));
         }
+        // Publication depends only on the already checked acceptance. Source
+        // and resumed-body prerequisites belong to that acceptance, not to
+        // another scan of every event when its sender publishes.
+        if matches!(point, SourcePoint::Sent(_)) {
+            return None;
+        }
         let target_actor = self.point_actor(point);
         let required = self.prerequisite(history.clone(), point);
-        for event in 0..self.unfolding().event_count() {
+        // Both source order and resumption prerequisites point forward in
+        // this expansion. Keep the target itself for the send/receive pair.
+        let end = self
+            .unfolding()
+            .event_count()
+            .min(point.event().saturating_add(1));
+        for event in 0..end {
+            // Most source rows belong to other physical participants. Their
+            // indexed actors suffice to skip all direction/header decoding.
+            if !self
+                .actors(event)
+                .is_some_and(|actors| actors.into_iter().any(|actor| Some(actor) == target_actor))
+            {
+                continue;
+            }
             for prior in [
                 SourcePoint::Local(event),
                 SourcePoint::Sent(event),
@@ -133,15 +178,85 @@ impl SourcePath<'_, '_, '_> {
                     (prior, point),
                     (SourcePoint::Sent(_), SourcePoint::Received(_))
                 ),
-                _ => source.before(prior.event(), point.event()),
+                _ => self.source_before(prior.event(), point.event()),
             };
             ordered
                 || can_resume
+                    && prior.event() < point.event()
                     && history.clone().any(|entry| {
                         !matches!(entry, SourcePoint::Accepted(_))
                             && self.point_actor(entry) == Some(actor)
                             && source.same_resumption(prior.event(), point.event(), entry.event())
                     })
+        }
+    }
+
+    // Boundary `first` separates leaves first and first + 1. Its first
+    // ancestor whose end contains `second` is their lowest common ancestor;
+    // only a sequence boundary contributes source order across its children.
+    pub(super) fn source_before(&self, first: usize, second: usize) -> bool {
+        if first >= second || second >= self.unfolding().event_count() {
+            return false;
+        }
+        let mut boundary = first;
+        loop {
+            let row = &self.index[3 * boundary..3 * boundary + 3];
+            if second < row[1] {
+                return row[2] == 0;
+            }
+            boundary = row[0];
+        }
+    }
+
+    // A predecessor can be omitted only by a choice below the leaves' common
+    // ancestor. Such a choice must retain its arm when that arm already has
+    // a committed point. The caller supplies exact prefix membership; the
+    // current selection alone is never evidence that an arm is forced.
+    pub(super) fn unavoidable_before(
+        &self,
+        first: usize,
+        second: usize,
+        committed: impl Fn([usize; 2]) -> bool,
+    ) -> bool {
+        if first >= second || second >= self.unfolding().event_count() {
+            return false;
+        }
+        // A leaf's parent is one of its adjacent boundaries. The left one is
+        // its direct parent precisely when that subtree ends after this leaf.
+        let mut boundary = if first > 0 && self.index[3 * (first - 1) + 1] == first + 1 {
+            first - 1
+        } else {
+            first
+        };
+        loop {
+            let row = &self.index[3 * boundary..3 * boundary + 3];
+            if second < row[1] {
+                return row[2] == 0;
+            }
+            if row[2] >= 2 {
+                let span = if first > boundary {
+                    [boundary + 1, row[1]]
+                } else {
+                    let mut ancestor = boundary;
+                    let mut start = 0;
+                    loop {
+                        let parent = self.index[3 * ancestor];
+                        if parent == usize::MAX {
+                            break;
+                        }
+                        if ancestor > parent {
+                            start = parent + 1;
+                            break;
+                        }
+                        ancestor = parent;
+                    }
+                    [start, boundary + 1]
+                };
+                if !committed(span) {
+                    return false;
+                }
+            }
+            boundary = row[0];
         }
     }
 

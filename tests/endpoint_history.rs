@@ -500,6 +500,7 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
             witnessed.len()
         ];
         workspace.resize(path.interpretation_workspace_len(&inputs).unwrap(), 0);
+        let observed_producers: Vec<_> = witnessed.iter().map(|id| id.producer).collect();
         let mut inferred_order = vec![
             RecordId {
                 producer: usize::MAX,
@@ -512,6 +513,7 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
                 &inputs,
                 hibana_epf::ExecutionStorage {
                     session: 110,
+                    observed_producers: &observed_producers,
                     order: &mut inferred_order,
                     occurrences: &mut inferred,
                     acceptances: &mut inferred_acceptances,
@@ -554,6 +556,7 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
                     choices: &mut selected,
                     execution: hibana_epf::ExecutionStorage {
                         session: 110,
+                        observed_producers: &observed_producers,
                         order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut inferred_acceptances,
@@ -913,11 +916,13 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
             ];
             workspace.resize(path.interpretation_workspace_len(&[capture]).unwrap(), 0);
             let mut inferred_order = order.clone();
+            let observed_producers = vec![0; order.len()];
             let automatic = path
                 .interpret(
                     &[capture],
                     hibana_epf::ExecutionStorage {
                         session: 98,
+                        observed_producers: &observed_producers,
                         order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut inferred_acceptances,
@@ -931,6 +936,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                     &[capture],
                     hibana_epf::ExecutionStorage {
                         session: 98,
+                        observed_producers: &observed_producers,
                         order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut inferred_acceptances,
@@ -944,6 +950,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                     &[capture],
                     hibana_epf::ExecutionStorage {
                         session: 98,
+                        observed_producers: &observed_producers,
                         order: &mut inferred_order,
                         occurrences: &mut inferred[..order.len() - 1],
                         acceptances: &mut inferred_acceptances,
@@ -957,6 +964,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                     &[capture],
                     hibana_epf::ExecutionStorage {
                         session: 98,
+                        observed_producers: &observed_producers,
                         order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut [],
@@ -1067,6 +1075,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
                     &[invalid],
                     hibana_epf::ExecutionStorage {
                         session: 98,
+                        observed_producers: &observed_producers,
                         order: &mut inferred_order,
                         occurrences: &mut inferred,
                         acceptances: &mut inferred_acceptances,

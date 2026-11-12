@@ -25,6 +25,11 @@ pub(super) fn audit(args: Vec<String>) -> Result<(), String> {
     let protocol =
         Protocol::new(&compiled, &mut source_storage).map_err(|e| format!("protocol: {e:?}"))?;
     let count = captures.iter().map(|capture| capture.records().len()).sum();
+    let observed_producers: Vec<_> = captures
+        .iter()
+        .enumerate()
+        .flat_map(|(producer, capture)| std::iter::repeat_n(producer, capture.records().len()))
+        .collect();
     let mut unfolding = vec![Unfold::Source; capacity];
     let mut choices = vec![
         RouteChoice {
@@ -64,6 +69,7 @@ pub(super) fn audit(args: Vec<String>) -> Result<(), String> {
                 choices: &mut choices,
                 execution: ExecutionStorage {
                     session,
+                    observed_producers: &observed_producers,
                     order: &mut order,
                     occurrences: &mut occurrences,
                     acceptances: &mut acceptances,

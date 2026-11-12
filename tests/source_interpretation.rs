@@ -21,6 +21,561 @@ fn record(ordinal: usize, id: u16, view: u8, detail: u32) -> TapEvent {
 }
 
 #[test]
+fn repeated_resets_keep_the_next_uncommitted_visit_across_producers() {
+    for local in [false, true] {
+        let snapshot: Vec<_> = if local {
+            tap::projected(&project::<7>(&g::send::<7, 7, g::Msg<1, ()>>().roll())).collect()
+        } else {
+            tap::projected(&project::<7>(&g::send::<7, 8, g::Msg<1, ()>>().roll())).collect()
+        };
+        let scope = snapshot
+            .iter()
+            .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
+            .unwrap()
+            .causal_key();
+        let lane = (snapshot[2].arg0() >> 8) as u8;
+        let mut records = [Vec::new(), Vec::new()];
+        for visit in 0..4 {
+            if !local {
+                records[0].push(record(
+                    records[0].len(),
+                    tap::SEND_POLL,
+                    7,
+                    u32::from(if visit == 0 { u16::MAX } else { scope }) << 16,
+                ));
+            }
+            for (producer, captured) in records.iter_mut().enumerate() {
+                let actor = 7 + producer as u8;
+                if local && producer == 1 {
+                    let mut bytes: [u8; 16] =
+                        record(captured.len(), tap::LANE_ACQUIRE, actor, 0).into();
+                    bytes[6] = actor;
+                    captured.push(bytes.into());
+                    continue;
+                }
+                if visit != 0 {
+                    let mut bytes: [u8; 16] = record(
+                        captured.len(),
+                        tap::SCOPE_REENTRY,
+                        actor,
+                        u32::from(scope) << 16,
+                    )
+                    .into();
+                    bytes[6] = actor;
+                    captured.push(bytes.into());
+                }
+                let mut bytes: [u8; 16] = record(
+                    captured.len(),
+                    if producer == 0 {
+                        tap::ENDPOINT_SEND
+                    } else {
+                        tap::ENDPOINT_RECV
+                    },
+                    if producer == 0 { 1 } else { 2 },
+                    u32::from(actor) << 24 | u32::from(lane) << 16,
+                )
+                .into();
+                bytes[6] = actor;
+                captured.push(bytes.into());
+            }
+        }
+        let captures = records
+            .each_ref()
+            .map(|records| Capture::new(records, Some(records.len() as u32)).unwrap());
+        let count = records.iter().map(Vec::len).sum::<usize>();
+        let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+        let steps = [
+            Unfold::Source,
+            Unfold::Once(0),
+            Unfold::More([1, 0]),
+            Unfold::More([2, 0]),
+            Unfold::More([3, 0]),
+        ];
+        let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+        let source = protocol.unfolding(&steps, &mut proof).unwrap();
+        let mut bindings = vec![0; source.path_workspace_len().unwrap()];
+        let path = source.select(&[], &mut bindings).unwrap();
+        let mut scratch = vec![0; path.interpretation_workspace_len(&captures).unwrap()];
+        let mut order = vec![
+            RecordId {
+                producer: 0,
+                ordinal: 0
+            };
+            count
+        ];
+        let mut occurrences = vec![None; count];
+        let mut acceptances = vec![
+            Acceptance {
+                first_poll: order[0],
+                before: 0
+            };
+            count
+        ];
+        for first in [0, 1] {
+            let preference: Vec<_> = [first, 1 - first]
+                .into_iter()
+                .flat_map(|producer| core::iter::repeat_n(producer, records[producer].len()))
+                .collect();
+            let witness = path
+                .interpret(
+                    &captures,
+                    ExecutionStorage {
+                        session: 1,
+                        observed_producers: &preference,
+                        order: &mut order,
+                        occurrences: &mut occurrences,
+                        acceptances: &mut acceptances,
+                    },
+                    &mut scratch,
+                )
+                .unwrap();
+            path.check_execution(&captures, &witness, &mut scratch)
+                .unwrap();
+            let mut changed = witness.occurrences.to_vec();
+            let reset = witness
+                .order
+                .iter()
+                .enumerate()
+                .find(|(at, id)| {
+                    captures[id.producer].records()[id.ordinal].id() == tap::SCOPE_REENTRY
+                        && changed[*at].is_some_and(|event| event > 1)
+                })
+                .unwrap()
+                .0;
+            // The record is unchanged; only its proposed dynamic attribution
+            // is stale. The independent checker must reject that witness.
+            changed[reset] = Some(changed[reset].unwrap() - 1);
+            assert!(
+                path.check_execution(
+                    &captures,
+                    &ExecutionWitness {
+                        occurrences: &changed,
+                        ..witness
+                    },
+                    &mut scratch,
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_next_commit_preference_does_not_remove_an_earlier_route_candidate() {
+    use hibana_epf::RouteChoice;
+    let global = g::par(
+        g::route(
+            g::send::<8, 7, g::Msg<1, ()>>(),
+            g::send::<8, 7, g::Msg<2, ()>>(),
+        ),
+        g::send::<9, 7, g::Msg<3, ()>>(),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<7>(&global)).collect();
+    let scope = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_CHOICE)
+        .unwrap()
+        .causal_key();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let steps = [Unfold::Source];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut bindings = vec![0; source.path_workspace_len().unwrap()];
+    let path = source
+        .select(
+            &[RouteChoice {
+                span: [0, 2],
+                right: false,
+            }],
+            &mut bindings,
+        )
+        .unwrap();
+    let observed = |ordinal, kind, (actor, event): (u8, u32)| {
+        let lane = (snapshot[2 + event as usize].arg0() >> 8) as u8;
+        let (direction, detail) = if kind == tap::SEND_POLL {
+            (actor, u32::from(u16::MAX) << 16 | event)
+        } else {
+            (
+                if kind == tap::ENDPOINT_SEND { 1 } else { 2 },
+                u32::from(actor) << 24 | u32::from(lane) << 16 | event,
+            )
+        };
+        let mut bytes: [u8; 16] = record(ordinal, kind, direction, detail).into();
+        bytes[6] = actor;
+        TapEvent::from(bytes)
+    };
+    let records = [
+        observed(0, tap::SEND_POLL, (8, 0)),
+        observed(1, tap::ENDPOINT_SEND, (8, 0)),
+        observed(2, tap::SEND_POLL, (9, 2)),
+        observed(3, tap::ENDPOINT_SEND, (9, 2)),
+        record(4, tap::ROUTE_ARM_SELECTION, 3, u32::from(scope) << 16),
+        observed(5, tap::ENDPOINT_RECV, (7, 2)),
+        observed(6, tap::ENDPOINT_RECV, (7, 0)),
+    ];
+    let captures = [Capture::new(&records, Some(7)).unwrap()];
+    let mut order = [RecordId {
+        producer: 0,
+        ordinal: 0,
+    }; 7];
+    let mut occurrences = [None; 7];
+    let mut acceptances = [Acceptance {
+        first_poll: order[0],
+        before: 0,
+    }; 2];
+    let mut scratch = vec![0; path.interpretation_workspace_len(&captures).unwrap()];
+    let witness = path
+        .interpret(
+            &captures,
+            ExecutionStorage {
+                session: 1,
+                observed_producers: &[0; 7],
+                order: &mut order,
+                occurrences: &mut occurrences,
+                acceptances: &mut acceptances,
+            },
+            &mut scratch,
+        )
+        .unwrap();
+    // The later sibling's known send gives the first preference (event 2),
+    // but this route can only name event 0. The original domain remains.
+    assert_eq!(witness.occurrences[4], Some(0));
+    assert_eq!(witness.occurrences[5], Some(2));
+    path.check_execution(&captures, &witness, &mut scratch)
+        .unwrap();
+}
+
+#[test]
+fn arrival_order_prefers_independent_steps_and_rejects_invalid_inventory() {
+    let first = g::send::<7, 7, g::Msg<1, ()>>();
+    let second = g::send::<8, 8, g::Msg<2, ()>>();
+    let snapshot: Vec<_> = tap::projected(&project::<7>(&g::par(first, second))).collect();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let steps = [Unfold::Source];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut bindings = vec![0; source.path_workspace_len().unwrap()];
+    let path = source.select(&[], &mut bindings).unwrap();
+    let first = [record(
+        0,
+        tap::ENDPOINT_SEND,
+        1,
+        7u32 << 24 | ((snapshot[2].arg0() >> 8) & 0xff) << 16,
+    )];
+    let mut second: [u8; 16] = record(
+        0,
+        tap::ENDPOINT_SEND,
+        1,
+        8u32 << 24 | ((snapshot[3].arg0() >> 8) & 0xff) << 16 | 1,
+    )
+    .into();
+    second[6] = 8;
+    let second = [TapEvent::from(second)];
+    let captures = [
+        Capture::new(&first, Some(1)).unwrap(),
+        Capture::new(&second, Some(1)).unwrap(),
+    ];
+    let mut order = [RecordId {
+        producer: 0,
+        ordinal: 0,
+    }; 2];
+    let mut occurrences = [None; 2];
+    let mut scratch = vec![0; path.interpretation_workspace_len(&captures).unwrap()];
+    for observations in [[0, 1], [1, 0]] {
+        let witness = path
+            .interpret(
+                &captures,
+                ExecutionStorage {
+                    session: 1,
+                    observed_producers: &observations,
+                    order: &mut order,
+                    occurrences: &mut occurrences,
+                    acceptances: &mut [],
+                },
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(witness.order[0].producer, observations[0]);
+        path.check_execution(&captures, &witness, &mut scratch)
+            .unwrap();
+    }
+    for observations in [&[0][..], &[0, 0], &[0, 2], &[0, 1, 0]] {
+        assert!(matches!(
+            path.interpret(
+                &captures,
+                ExecutionStorage {
+                    session: 1,
+                    observed_producers: observations,
+                    order: &mut order,
+                    occurrences: &mut occurrences,
+                    acceptances: &mut [],
+                },
+                &mut scratch
+            ),
+            Err(hibana_epf::InterpretationError::ObservationOrder { .. })
+        ));
+    }
+    // Eager opaque diagnostics must not turn the next array position into
+    // a false arrival preference. The actual earliest remaining record is
+    // producer 1's operation, even after producer 0's diagnostic is moved.
+    let diagnostic = record(0, tap::LANE_ACQUIRE, 7, 0);
+    let mut later: [u8; 16] = first[0].into();
+    later[..4].copy_from_slice(&1u32.to_be_bytes());
+    let first = [diagnostic, TapEvent::from(later)];
+    let captures = [Capture::new(&first, Some(2)).unwrap(), captures[1]];
+    scratch.resize(path.interpretation_workspace_len(&captures).unwrap(), 0);
+    let mut order = [order[0]; 3];
+    let mut occurrences = [None; 3];
+    let witness = path
+        .interpret(
+            &captures,
+            ExecutionStorage {
+                session: 1,
+                observed_producers: &[1, 0, 0],
+                order: &mut order,
+                occurrences: &mut occurrences,
+                acceptances: &mut [],
+            },
+            &mut scratch,
+        )
+        .unwrap();
+    assert_eq!(
+        witness
+            .order
+            .iter()
+            .map(|id| id.producer)
+            .collect::<Vec<_>>(),
+        [0, 1, 0]
+    );
+    path.check_execution(&captures, &witness, &mut scratch)
+        .unwrap();
+}
+
+#[test]
+fn equivalent_choice_attributions_keep_the_same_source_suffix() {
+    use hibana_epf::RouteChoice;
+    let global = g::route(
+        g::par(
+            g::send::<7, 7, g::Msg<1, ()>>(),
+            g::send::<7, 7, g::Msg<2, ()>>(),
+        ),
+        g::par(
+            g::send::<7, 7, g::Msg<3, ()>>(),
+            g::send::<7, 7, g::Msg<4, ()>>(),
+        ),
+    )
+    .resolve::<77>();
+    let snapshot: Vec<_> = tap::projected(&project::<7>(&global)).collect();
+    let scope = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 0)
+        .unwrap()
+        .causal_key();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let steps = [Unfold::Source];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut rows = vec![0; source.path_workspace_len().unwrap()];
+    let path = source
+        .select(
+            &[RouteChoice {
+                span: [0, 4],
+                right: false,
+            }],
+            &mut rows,
+        )
+        .unwrap();
+    let prefix = [
+        record(0, tap::RESOLVER_AUDIT, 0, u32::from(scope) << 16 | 77),
+        record(1, tap::ROUTE_ARM_SELECTION, 2, u32::from(scope) << 16),
+    ];
+    let captures = [Capture::new(&prefix, Some(2)).unwrap()];
+    let order = [
+        RecordId {
+            producer: 0,
+            ordinal: 0,
+        },
+        RecordId {
+            producer: 0,
+            ordinal: 1,
+        },
+    ];
+    for query in [0, 1] {
+        for selection in [0, 1] {
+            let occurrences = [Some(query), Some(selection)];
+            let witness = ExecutionWitness {
+                session: 1,
+                order: &order,
+                occurrences: &occurrences,
+                acceptances: &[],
+            };
+            let mut scratch = vec![0; path.execution_workspace_len(&captures, &witness).unwrap()];
+            path.check_execution(&captures, &witness, &mut scratch)
+                .unwrap();
+        }
+    }
+    // The suffix contradicts the committed Left visit. Changing the earlier
+    // valid row attributions cannot repair it; each names the same visit/arm.
+    let mut records: Vec<_> = (0..12)
+        .map(|ordinal| record(ordinal, tap::RESOLVER_AUDIT, 0, u32::from(scope) << 16 | 77))
+        .collect();
+    records.push(record(
+        12,
+        tap::ROUTE_ARM_SELECTION,
+        2,
+        u32::from(scope) << 16,
+    ));
+    records.push(record(
+        13,
+        tap::RESOLVER_AUDIT,
+        1,
+        u32::from(scope) << 16 | 77,
+    ));
+    let captures = [Capture::new(&records, Some(14)).unwrap()];
+    let mut order = vec![
+        RecordId {
+            producer: 0,
+            ordinal: 0
+        };
+        records.len()
+    ];
+    let mut occurrences = vec![None; records.len()];
+    let mut scratch = vec![0; path.interpretation_workspace_len(&captures).unwrap()];
+    let observed_producers = vec![0; records.len()];
+    assert!(matches!(
+        path.interpret(
+            &captures,
+            ExecutionStorage {
+                session: 1,
+                observed_producers: &observed_producers,
+                order: &mut order,
+                occurrences: &mut occurrences,
+                acceptances: &mut []
+            },
+            &mut scratch,
+        ),
+        Err(hibana_epf::InterpretationError::NoInterpretation)
+    ));
+}
+
+#[cfg(not(miri))]
+#[test]
+fn prefix_choice_pruning_preserves_every_small_checked_attribution() {
+    use hibana_epf::RouteChoice;
+    let global = g::route(
+        g::send::<7, 8, g::Msg<1, ()>>(),
+        g::send::<7, 8, g::Msg<2, ()>>(),
+    )
+    .resolve::<77>();
+    let snapshot: Vec<_> = tap::projected(&project::<7>(&global)).collect();
+    let scope = snapshot
+        .iter()
+        .find(|r| r.id() == tap::PROJECTED_SCOPE && r.causal_key() >> 13 == 0)
+        .unwrap()
+        .causal_key();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let steps = [Unfold::Source];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut bindings = vec![0; source.path_workspace_len().unwrap()];
+    let mut checked = 0;
+    let mut accepted = 0;
+    for right in [false, true] {
+        let choices = [RouteChoice {
+            span: [0, 2],
+            right,
+        }];
+        let path = source.select(&choices, &mut bindings).unwrap();
+        for length in 0..=3 {
+            for mut sequence in 0..6usize.pow(length) {
+                let records: Vec<_> = (0..length)
+                    .map(|ordinal| {
+                        let kind = sequence % 6;
+                        sequence /= 6;
+                        let arm = (kind % 2) as u8;
+                        match kind / 2 {
+                            0 => record(
+                                ordinal as usize,
+                                tap::RESOLVER_AUDIT,
+                                arm,
+                                u32::from(scope) << 16 | 77,
+                            ),
+                            1 => record(
+                                ordinal as usize,
+                                tap::ROUTE_ARM_SELECTION,
+                                2,
+                                u32::from(scope) << 16 | u32::from(arm),
+                            ),
+                            _ => record(
+                                ordinal as usize,
+                                tap::SEND_POLL,
+                                7,
+                                ((snapshot[2 + usize::from(arm)].arg0() >> 8) & 0xff) << 16
+                                    | u32::from(arm),
+                            ),
+                        }
+                    })
+                    .collect();
+                let captures = [Capture::new(&records, Some(length)).unwrap()];
+                let order: Vec<_> = (0..records.len())
+                    .map(|ordinal| RecordId {
+                        producer: 0,
+                        ordinal,
+                    })
+                    .collect();
+                let mut scratch = vec![0; path.interpretation_workspace_len(&captures).unwrap()];
+                let mut expected = false;
+                for assignment in 0..1usize << length {
+                    let occurrences: Vec<_> =
+                        (0..length).map(|at| Some(assignment >> at & 1)).collect();
+                    let witness = ExecutionWitness {
+                        session: 1,
+                        order: &order,
+                        occurrences: &occurrences,
+                        acceptances: &[],
+                    };
+                    expected |= path
+                        .check_execution(&captures, &witness, &mut scratch)
+                        .is_ok();
+                }
+                let observations = vec![0; records.len()];
+                let mut output = order;
+                let mut occurrences = vec![None; records.len()];
+                let actual = path.interpret(
+                    &captures,
+                    ExecutionStorage {
+                        session: 1,
+                        observed_producers: &observations,
+                        order: &mut output,
+                        occurrences: &mut occurrences,
+                        acceptances: &mut [],
+                    },
+                    &mut scratch,
+                );
+                assert_eq!(
+                    actual.is_ok(),
+                    expected,
+                    "length={length}, selected_right={right}, records={records:?}"
+                );
+                if let Ok(witness) = actual {
+                    path.check_execution(&captures, &witness, &mut scratch)
+                        .unwrap();
+                    accepted += 1;
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 518);
+    assert!(accepted > 0 && accepted < checked);
+}
+
+#[test]
 fn a_committed_route_selection_cannot_name_an_unselected_query_occurrence() {
     use hibana_epf::RouteChoice;
     let global = g::route(
@@ -117,6 +672,7 @@ fn a_committed_route_selection_cannot_name_an_unselected_query_occurrence() {
             &captures,
             ExecutionStorage {
                 session: 1,
+                observed_producers: &[0; 3],
                 order: &mut inferred,
                 occurrences: &mut occurrences,
                 acceptances: &mut [],
@@ -224,6 +780,11 @@ fn interleaved_captures_resolve_open_call_completion_without_a_static_fifo_order
     path.check_execution(&captures, &reference, &mut reference_workspace)
         .unwrap();
     for captures in [captures, [captures[2], captures[1], captures[0]]] {
+        let observed_producers: Vec<_> = captures
+            .iter()
+            .enumerate()
+            .flat_map(|(producer, capture)| std::iter::repeat_n(producer, capture.records().len()))
+            .collect();
         let mut workspace = vec![0; path.interpretation_workspace_len(&captures).unwrap()];
         assert!(matches!(
             protocol.deliveries(&captures, &mut workspace),
@@ -243,6 +804,7 @@ fn interleaved_captures_resolve_open_call_completion_without_a_static_fifo_order
                 &captures,
                 ExecutionStorage {
                     session: 1,
+                    observed_producers: &observed_producers,
                     order: &mut order,
                     occurrences: &mut occurrences,
                     acceptances: &mut acceptances,
@@ -366,6 +928,7 @@ fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
                         .is_ok();
                 }
                 let mut occurrences = vec![None; records.len()];
+                let observed_producers = vec![0; records.len()];
                 let mut acceptances: [Acceptance; 0] = [];
                 let mut inferred_order = vec![
                     RecordId {
@@ -378,6 +941,7 @@ fn finite_attribution_search_matches_enumeration_of_every_small_assignment() {
                     &[capture],
                     ExecutionStorage {
                         session: 1,
+                        observed_producers: &observed_producers,
                         order: &mut inferred_order,
                         occurrences: &mut occurrences,
                         acceptances: &mut acceptances,
@@ -458,6 +1022,7 @@ fn causal_order_search_matches_every_interleaving_and_rejects_an_early_reply() {
         for captures in [captures, [captures[1], captures[0]]] {
             workspace.resize(path.interpretation_workspace_len(&captures).unwrap(), 0);
             let mut valid_orders = Vec::new();
+            let mut preferences = Vec::new();
             let mut checked = 0;
             for mask in (0u32..64).filter(|word| word.count_ones() == 3) {
                 let mut ordinals = [0; 2];
@@ -475,6 +1040,7 @@ fn causal_order_search_matches_every_interleaving_and_rejects_an_early_reply() {
                         Some(captures[id.producer].records()[id.ordinal].arg1() as u16 as usize)
                     })
                     .collect();
+                preferences.push(order.iter().map(|id| id.producer).collect::<Vec<_>>());
                 let acceptances: Vec<_> = order
                     .iter()
                     .enumerate()
@@ -514,26 +1080,29 @@ fn causal_order_search_matches_every_interleaving_and_rejects_an_early_reply() {
                 },
                 before: 0,
             }; 2];
-            let result = path.interpret(
-                &captures,
-                ExecutionStorage {
-                    session: 1,
-                    order: &mut order,
-                    occurrences: &mut occurrences,
-                    acceptances: &mut acceptances,
-                },
-                &mut workspace,
-            );
-            if early {
-                assert!(matches!(
-                    result,
-                    Err(hibana_epf::InterpretationError::NoInterpretation)
-                ));
-            } else {
-                let witness = result.unwrap();
-                assert!(valid_orders.iter().any(|order| order == witness.order));
-                path.check_execution(&captures, &witness, &mut workspace)
-                    .unwrap();
+            for observations in &preferences {
+                let result = path.interpret(
+                    &captures,
+                    ExecutionStorage {
+                        session: 1,
+                        observed_producers: observations,
+                        order: &mut order,
+                        occurrences: &mut occurrences,
+                        acceptances: &mut acceptances,
+                    },
+                    &mut workspace,
+                );
+                if early {
+                    assert!(matches!(
+                        result,
+                        Err(hibana_epf::InterpretationError::NoInterpretation)
+                    ));
+                } else {
+                    let witness = result.unwrap();
+                    assert!(valid_orders.iter().any(|order| order == witness.order));
+                    path.check_execution(&captures, &witness, &mut workspace)
+                        .unwrap();
+                }
             }
             let mut short = [RecordId {
                 producer: usize::MAX,
@@ -544,6 +1113,7 @@ fn causal_order_search_matches_every_interleaving_and_rejects_an_early_reply() {
                     &captures,
                     ExecutionStorage {
                         session: 1,
+                        observed_producers: &[0, 0, 0, 1, 1, 1],
                         order: &mut short,
                         occurrences: &mut occurrences,
                         acceptances: &mut acceptances,
@@ -585,6 +1155,7 @@ fn causal_order_search_matches_every_interleaving_and_rejects_an_early_reply() {
                 &padded,
                 ExecutionStorage {
                     session: 1,
+                    observed_producers: &[0, 0, 0, 0, 1, 1, 1, 1, 2, 2],
                     order: &mut order,
                     occurrences: &mut occurrences,
                     acceptances: &mut acceptances,

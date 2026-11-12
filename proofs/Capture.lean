@@ -40,6 +40,15 @@ theorem a_checked_prefix_contains_every_ordinal
   have count : ordinals.length = checkpoint := Nat.eq_of_beq_eq_true fields.1
   simpa only [count] using numbered_is_range ordinals 0 fields.2
 
+/-- With a single producer there is no second ordinal-preserving complete
+order to search. Immutable call/FIFO correspondence may therefore be checked
+once; dynamic source attribution and the independent final check still apply. -/
+theorem a_single_producer_has_one_complete_order
+    (first : complete firstOrder checkpoint = true)
+    (second : complete secondOrder checkpoint = true) : firstOrder = secondOrder :=
+  (a_checked_prefix_contains_every_ordinal first).trans
+    (a_checked_prefix_contains_every_ordinal second).symm
+
 theorem every_exact_prefix_passes (checkpoint : Nat) :
     complete (List.range' 0 checkpoint) checkpoint = true := by
   simp only [complete, List.length_range', Nat.beq_refl, Bool.true_and]

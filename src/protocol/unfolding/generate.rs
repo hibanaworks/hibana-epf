@@ -25,7 +25,13 @@ pub(crate) fn seed(
     let (frames, rest) = workspace.split_at_mut(5 * capacity);
     let (factors, rest) = rest.split_at_mut(capacity);
     let (first, rest) = rest.split_at_mut(capacity);
-    let (counts, receives) = rest[capacity..].split_at_mut(layout.sources.len());
+    // This seed may need both observed demand and demand outside nested
+    // rolls. Reuse the derivation-rank row, which the seed otherwise leaves
+    // untouched. Short temporary storage only declines this preference; the
+    // complete derivation enumeration is unchanged.
+    let (direct, rest) = rest.split_at_mut(capacity);
+    let direct = direct.get_mut(..layout.sources.len())?;
+    let (counts, receives) = rest.split_at_mut(layout.sources.len());
     counts.fill(0);
     receives.fill(0);
     for row in captures.iter().flat_map(|c| c.records()) {
@@ -58,7 +64,20 @@ pub(crate) fn seed(
         let region = layout.canonical(protocol, get(frames, depth));
         let head = layout.head(protocol, region)?;
         let phase = frames[5 * depth + 4];
-        let factor = factors[depth];
+        let mut factor = factors[depth];
+        if phase == 0 && depth != 0 {
+            let parent = layout.canonical(protocol, get(frames, depth - 1));
+            if matches!(layout.head(protocol, parent), Some(Head::Choice(_, _))) {
+                // An arm may occur in only some enclosing visits. Its
+                // nonnested observations guide that arm's divisor; dividing
+                // an inner retry by every enclosing visit loses repetitions.
+                let (_, anchors) = visits(&layout, protocol, region, counts, 1, receives, direct);
+                if anchors != 0 {
+                    factor = factor.min(anchors);
+                    factors[depth] = factor;
+                }
+            }
+        }
         let append = |step, output: &mut usize, steps: &mut [Unfold]| {
             let slot = *output;
             *steps.get_mut(slot)? = step;
@@ -70,19 +89,7 @@ pub(crate) fn seed(
                 .iter()
                 .all(|&n| n <= factor)
             && (region.first..region.last).all(|marker| {
-                let row = protocol.records[layout.scopes.start + marker];
-                if row.causal_key() >> 13 != 1 || row.arg1() & 3 != 0 {
-                    return true;
-                }
-                let scope = protocol.scope(row.causal_key()).expect("checked scope");
-                let body = Region {
-                    start: scope.start as usize,
-                    end: scope.end as usize,
-                    first: marker + 1,
-                    last: scope.last - layout.scopes.start,
-                    rolled: false,
-                };
-                visits(&layout, protocol, body, counts, factor, receives) == 1
+                protocol.records[layout.scopes.start + marker].causal_key() >> 13 != 1
             });
         let result = match (phase, head) {
             (0, _) if compact => Some(append(Unfold::Source, &mut output, steps)?),
@@ -137,7 +144,7 @@ pub(crate) fn seed(
                 if child >= capacity {
                     return None;
                 }
-                let visits = visits(&layout, protocol, body, counts, factor, receives);
+                let (visits, _) = visits(&layout, protocol, body, counts, factor, receives, direct);
                 first[depth] = visits;
                 put(frames, child, layout.canonical(protocol, body));
                 frames[5 * child + 4] = 0;
@@ -170,11 +177,15 @@ fn visits(
     counts: &[usize],
     factor: usize,
     scratch: &mut [usize],
-) -> usize {
+    direct: &mut [usize],
+) -> (usize, usize) {
     // Collapse completed source subtrees in marker order. A sequence or par
     // shares visits; opposite route arms need separate visits. A nested roll
-    // can account for its own repetitions within one enclosing visit.
+    // can account for its own repetitions within one enclosing visit. The
+    // second summary excludes those repetitions and retains only observations
+    // outside nested rolls, for the selective-arm factor above.
     scratch[body.start..body.end].copy_from_slice(&counts[body.start..body.end]);
+    direct[body.start..body.end].copy_from_slice(&counts[body.start..body.end]);
     for marker in body.first..body.last {
         let index = layout.scopes.start + marker;
         let row = protocol.records[index];
@@ -188,25 +199,41 @@ fn visits(
         }
         let start = scope.start as usize;
         let end = scope.end as usize;
-        let value = match row.causal_key() >> 13 {
+        let (value, anchors) = match row.causal_key() >> 13 {
             0 => {
                 let split = scope.split.unwrap() as usize;
-                scratch[start..split].iter().max().copied().unwrap_or(0)
-                    + scratch[split..end].iter().max().copied().unwrap_or(0)
+                (
+                    scratch[start..split].iter().max().copied().unwrap_or(0)
+                        + scratch[split..end].iter().max().copied().unwrap_or(0),
+                    direct[start..split].iter().max().copied().unwrap_or(0)
+                        + direct[split..end].iter().max().copied().unwrap_or(0),
+                )
             }
-            1 => usize::from(scratch[start..end].iter().any(|&n| n != 0)),
-            _ => scratch[start..end].iter().max().copied().unwrap_or(0),
+            1 => (usize::from(scratch[start..end].iter().any(|&n| n != 0)), 0),
+            _ => (
+                scratch[start..end].iter().max().copied().unwrap_or(0),
+                direct[start..end].iter().max().copied().unwrap_or(0),
+            ),
         };
         scratch[start..end].fill(0);
         scratch[start] = value;
+        direct[start..end].fill(0);
+        direct[start] = anchors;
     }
-    scratch[body.start..body.end]
-        .iter()
-        .max()
-        .copied()
-        .unwrap_or(0)
-        .div_ceil(factor)
-        .max(1)
+    (
+        scratch[body.start..body.end]
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0)
+            .div_ceil(factor)
+            .max(1),
+        direct[body.start..body.end]
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0),
+    )
 }
 
 pub(crate) struct Derivations<'p, 'w> {
@@ -446,6 +473,67 @@ mod tests {
     use std::vec;
 
     #[test]
+    fn a_selective_outer_arm_keeps_both_of_its_inner_visits() {
+        let global = g::seq(
+            g::route(
+                g::send::<7, 7, g::Msg<1, ()>>(),
+                g::seq(
+                    g::send::<7, 7, g::Msg<2, ()>>().roll(),
+                    g::send::<7, 7, g::Msg<3, ()>>(),
+                ),
+            ),
+            g::send::<7, 7, g::Msg<4, ()>>(),
+        )
+        .roll();
+        let snapshot = tap::projected(&project::<7>(&global)).collect::<std::vec::Vec<_>>();
+        let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+        let expected = [1u16, 1, 2, 3, 0, 3];
+        let records = expected
+            .iter()
+            .enumerate()
+            .map(|(ordinal, &origin)| {
+                let lane = (snapshot[2 + usize::from(origin)].arg0() >> 8) as u8;
+                let mut bytes = [0; 16];
+                bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+                bytes[4..6].copy_from_slice(&tap::ENDPOINT_SEND.to_be_bytes());
+                bytes[6..8].copy_from_slice(&(7u16 << 8 | 1).to_be_bytes());
+                bytes[8..12].copy_from_slice(&1u32.to_be_bytes());
+                bytes[12..].copy_from_slice(
+                    &(7u32 << 24 | u32::from(lane) << 16 | u32::from(origin)).to_be_bytes(),
+                );
+                tap::TapEvent::from(bytes)
+            })
+            .collect::<std::vec::Vec<_>>();
+        let captures = [Capture::new(&records, Some(6)).unwrap()];
+        let mut steps = [Unfold::Source; 16];
+        let mut scratch = vec![0; 8 * steps.len() + 2 * 4];
+        let count = seed(protocol, &captures, 1, &mut steps, &mut scratch).unwrap();
+        let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps[..count])];
+        let source = protocol.unfolding(&steps[..count], &mut proof).unwrap();
+        let mut workspace = vec![0; source.path_workspace_len().unwrap()];
+        let (actors, rest) = workspace.split_at_mut(source.event_count());
+        let (parts, scratch) =
+            rest.split_at_mut(Layout::path_index_words(source.event_count()).unwrap());
+        source.index_source(parts, actors, scratch).unwrap();
+        let mut arms = [true, false].into_iter();
+        let path = source
+            .select_by(
+                |_, _, _| Ok(arms.next().unwrap()),
+                |_, _| true,
+                actors,
+                parts,
+                scratch,
+            )
+            .unwrap();
+        let selected = (0..source.event_count())
+            .filter(|&event| path.actors(event).is_some())
+            .map(|event| source.origin(event).unwrap())
+            .collect::<std::vec::Vec<_>>();
+        assert_eq!(selected, expected);
+    }
+
+    #[test]
     fn branch_demands_add_while_sequence_parallel_and_nested_roll_share_visits() {
         let global = g::par(
             g::route(
@@ -476,13 +564,30 @@ mod tests {
             panic!("outer roll");
         };
         let mut scratch = [0; 5];
+        let mut direct = [0; 5];
         assert_eq!(
-            visits(&layout, protocol, body, &[3, 3, 2, 2, 100], 1, &mut scratch),
-            5
+            visits(
+                &layout,
+                protocol,
+                body,
+                &[3, 3, 2, 2, 100],
+                1,
+                &mut scratch,
+                &mut direct
+            ),
+            (5, 5)
         );
         assert_eq!(
-            visits(&layout, protocol, body, &[3, 3, 2, 2, 100], 2, &mut scratch),
-            3
+            visits(
+                &layout,
+                protocol,
+                body,
+                &[3, 3, 2, 2, 100],
+                2,
+                &mut scratch,
+                &mut direct
+            ),
+            (3, 5)
         );
     }
 }

@@ -2,6 +2,7 @@ name: Quality
 
 on:
   push:
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 
@@ -17,8 +18,23 @@ jobs:
     runs-on: macos-15
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      core: ${{ steps.core.outputs.commit }}
+    defaults:
+      run:
+        working-directory: hibana-epf
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: hibana-epf
+      - name: Select the current core once for every stage
+        uses: actions/checkout@v7
+        with:
+          repository: hibanaworks/hibana
+          ref: main
+          path: hibana
+      - name: Record the selected core
+        id: core
+        run: printf 'commit=%s\n' "$(git -C ../hibana rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Assign every actual integration target
@@ -34,8 +50,19 @@ jobs:
       fail-fast: true
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     timeout-minutes: ${{ matrix.stage == 'miri-unit' && 45 || 30 }}
+    defaults:
+      run:
+        working-directory: hibana-epf
     steps:
       - uses: actions/checkout@v7
+        with:
+          path: hibana-epf
+      - name: Use the same core as the assignment plan
+        uses: actions/checkout@v7
+        with:
+          repository: hibanaworks/hibana
+          ref: ${{ needs.plan.outputs.core }}
+          path: hibana
       - name: Install the stable compiler
         run: rustup toolchain install stable --profile minimal
       - name: Install native checks and the embedded target
@@ -87,8 +114,8 @@ jobs:
         with:
           name: epf-${{ matrix.stage }}
           path: |
-            target/validation-${{ matrix.stage }}.log
-            target/commit-observation-proof/
+            hibana-epf/target/validation-${{ matrix.stage }}.log
+            hibana-epf/target/commit-observation-proof/
 
   required:
     name: epf-contract
