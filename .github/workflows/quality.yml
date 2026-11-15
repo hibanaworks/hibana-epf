@@ -32,6 +32,7 @@ jobs:
           repository: hibanaworks/hibana
           ref: main
           path: hibana
+      - uses: ./hibana/.github/actions/checkout-runtime
       - name: Record the selected core
         id: core
         run: printf 'commit=%s\n' "$(git -C ../hibana rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -63,6 +64,7 @@ jobs:
           repository: hibanaworks/hibana
           ref: ${{ needs.plan.outputs.core }}
           path: hibana
+      - uses: ./hibana/.github/actions/checkout-runtime
       - name: Install the stable compiler
         run: rustup toolchain install stable --profile minimal
       - name: Install native checks and the embedded target
