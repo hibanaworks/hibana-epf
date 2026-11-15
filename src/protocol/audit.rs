@@ -11,8 +11,6 @@ use hibana::runtime::tap;
 pub struct AuditStorage<'a> {
     /// Maximum number of source-derivation nodes to search.
     pub unfolding: &'a mut [Unfold],
-    /// Space for route occurrences in the largest searched expansion.
-    pub choices: &'a mut [RouteChoice],
     /// Complete capture ordering, occurrence and acceptance outputs.
     pub execution: ExecutionStorage<'a>,
 }
@@ -52,8 +50,6 @@ impl<'p, 'a> Audit<'p, 'a> {
 pub enum AuditError {
     /// Temporary and retained caller storage is too short.
     Workspace { required: usize, actual: usize },
-    /// Route output cannot hold the largest searched expansion's choices.
-    Choices { required: usize, actual: usize },
     /// Invalid capture evidence or insufficient execution output storage.
     Evidence(InterpretationError),
     /// No derivation within the caller's capacity yielded a checked execution.
@@ -63,8 +59,7 @@ pub enum AuditError {
 }
 
 impl<'p> Protocol<'p> {
-    /// Maximum expanded message count for trees of this many proof nodes.
-    pub fn audit_choice_capacity(&self, derivation_capacity: usize) -> Result<usize, AuditError> {
+    fn audit_event_capacity(&self, derivation_capacity: usize) -> Result<usize, AuditError> {
         Layout::checked(*self)
             .sources
             .len()
@@ -75,7 +70,8 @@ impl<'p> Protocol<'p> {
     /// Eight search words and five retained words per derivation node, one
     /// actor word and three immutable locators per possible message, three per
     /// binary source boundary, four per route interval plus its count, and
-    /// reusable checking workspace.
+    /// reusable checking workspace and three words per possible route choice.
+    /// Route candidates are temporary search data, not retained audit outputs.
     /// All capacities derive from the supplied source, captures and proof size.
     pub fn audit_workspace_len(
         &self,
@@ -83,7 +79,7 @@ impl<'p> Protocol<'p> {
         derivation_capacity: usize,
     ) -> Result<usize, AuditError> {
         let layout = Layout::checked(*self);
-        let events = self.audit_choice_capacity(derivation_capacity)?;
+        let events = self.audit_event_capacity(derivation_capacity)?;
         let parts = Layout::path_index_words(events).ok_or(AuditError::Overflow)?;
         let query = layout.query_words(events).ok_or(AuditError::Overflow)?;
         // Also ensure every insertion interval's enumeration is representable.
@@ -106,6 +102,7 @@ impl<'p> Protocol<'p> {
             .and_then(|n| n.checked_add(layout.sources.len().checked_mul(2)?))
             .and_then(|n| n.checked_add(events))
             .and_then(|n| n.checked_add(parts))
+            .and_then(|n| n.checked_add(events.checked_mul(3)?))
             .and_then(|n| n.checked_add(execution.max(events.checked_mul(2)?)))
             .ok_or(AuditError::Overflow)
     }
@@ -130,17 +127,10 @@ impl<'p> Protocol<'p> {
     ) -> Result<Audit<'p, 'a>, AuditError> {
         let AuditStorage {
             unfolding,
-            choices,
             execution,
         } = storage;
         let capacity = unfolding.len();
-        let events = self.audit_choice_capacity(capacity)?;
-        if choices.len() < events {
-            return Err(AuditError::Choices {
-                required: events,
-                actual: choices.len(),
-            });
-        }
+        let events = self.audit_event_capacity(capacity)?;
         let required = self.audit_workspace_len(captures, capacity)?;
         if workspace.len() < required {
             return Err(AuditError::Workspace {
@@ -154,6 +144,7 @@ impl<'p> Protocol<'p> {
         let (proof, rest) = rest.split_at_mut(5 * capacity);
         let (actors, scratch) = rest.split_at_mut(events);
         let (parts, scratch) = scratch.split_at_mut(Layout::path_index_words(events).unwrap());
+        let (choices, scratch) = scratch.split_at_mut(3 * events);
         let ExecutionStorage {
             session,
             observed_producers,
@@ -190,8 +181,12 @@ impl<'p> Protocol<'p> {
                 loop {
                     let selected =
                         route_choices(source, parts, choices, retained, captures, session, scratch);
-                    if let Ok(path) = source.select_in(&choices[..selected], actors, parts, scratch)
-                    {
+                    if let Ok(path) = source.select_in(
+                        read_choices(&choices[..3 * selected]),
+                        actors,
+                        parts,
+                        scratch,
+                    ) {
                         match path.interpret(
                             captures,
                             ExecutionStorage {
@@ -211,19 +206,19 @@ impl<'p> Protocol<'p> {
                         }
                     }
                     let Some(index) = (0..selected).rev().find(|&i| {
-                        choices[i].right
+                        (choices[3 * i + 2] != 0)
                             == route_preference(
                                 source,
                                 parts,
-                                &choices[..i],
-                                choices[i].span,
+                                read_choices(&choices[..3 * i]),
+                                [choices[3 * i], choices[3 * i + 1]],
                                 captures,
                                 session,
                             )
                     }) else {
                         break;
                     };
-                    choices[index].right = !choices[index].right;
+                    choices[3 * index + 2] ^= 1;
                     retained = index + 1;
                 }
             }
@@ -234,7 +229,12 @@ impl<'p> Protocol<'p> {
             .unfolding(&unfolding[..size], proof)
             .expect("checked derivation");
         let path = source
-            .select_in(&choices[..selected], actors, parts, scratch)
+            .select_in(
+                read_choices(&choices[..3 * selected]),
+                actors,
+                parts,
+                scratch,
+            )
             .expect("checked selections");
         let execution = ExecutionWitness {
             session,
@@ -286,10 +286,17 @@ fn enough_occurrences(
     true
 }
 
+fn read_choices(words: &[usize]) -> impl ExactSizeIterator<Item = RouteChoice> + Clone {
+    words.as_chunks::<3>().0.iter().map(|row| RouteChoice {
+        span: [row[0], row[1]],
+        right: row[2] != 0,
+    })
+}
+
 fn route_choices(
     source: Unfolded<'_, '_>,
     parts: &[usize],
-    choices: &mut [RouteChoice],
+    choices: &mut [usize],
     retained: usize,
     captures: &[Capture<'_>],
     session: u32,
@@ -308,11 +315,22 @@ fn route_choices(
             NodeKind::Message => {}
             NodeKind::Choice(_) => {
                 let right = if count < retained {
-                    choices[count].right
+                    choices[3 * count + 2] != 0
                 } else {
-                    route_preference(source, parts, &choices[..count], span, captures, session)
+                    route_preference(
+                        source,
+                        parts,
+                        read_choices(&choices[..3 * count]),
+                        span,
+                        captures,
+                        session,
+                    )
                 };
-                choices[count] = RouteChoice { span, right };
+                choices[3 * count..3 * count + 3].copy_from_slice(&[
+                    span[0],
+                    span[1],
+                    usize::from(right),
+                ]);
                 count += 1;
                 stack[depth..depth + 2].copy_from_slice(&if right {
                     [split, span[1]]
@@ -340,7 +358,7 @@ fn route_choices(
 fn route_preference(
     source: Unfolded<'_, '_>,
     parts: &[usize],
-    earlier: &[RouteChoice],
+    earlier: impl Iterator<Item = RouteChoice>,
     span: [usize; 2],
     captures: &[Capture<'_>],
     session: u32,
@@ -348,7 +366,7 @@ fn route_preference(
     let Some((NodeKind::Choice(key), _)) = source.indexed_parts(span, parts) else {
         return false;
     };
-    let visit = earlier.iter().filter(|choice|
+    let visit = earlier.filter(|choice|
         matches!(source.indexed_parts(choice.span, parts), Some((NodeKind::Choice(prior), _)) if prior == key)
     ).count();
     let protocol = source.protocol();
@@ -519,16 +537,13 @@ mod tests {
         source
             .index_source(&mut parts, &mut actors, &mut search)
             .unwrap();
-        let mut choices = [RouteChoice {
-            span: [0, 0],
-            right: false,
-        }; 4];
+        let mut choices = [0; 12];
         assert_eq!(
             route_choices(source, &parts, &mut choices, 0, &captures, 1, &mut search),
             2
         );
-        assert!(choices[0].right);
-        assert!(!choices[1].right);
+        assert!(read_choices(&choices).next().unwrap().right);
+        assert!(!read_choices(&choices).nth(1).unwrap().right);
     }
 
     #[test]
@@ -555,10 +570,7 @@ mod tests {
         bytes[12..].copy_from_slice(&(u32::from(key) << 16 | 1).to_be_bytes());
         let records = [bytes.into()];
         let captures = [Capture::new(&records, Some(1)).unwrap()];
-        let mut choices = [RouteChoice {
-            span: [0, 0],
-            right: false,
-        }; 2];
+        let mut choices = [0; 6];
         let mut stack = [0; 4];
         let mut parts = vec![0; Layout::path_index_words(source.event_count()).unwrap()];
         let mut actors = vec![0; source.event_count()];
@@ -569,20 +581,36 @@ mod tests {
             route_choices(source, &parts, &mut choices, 0, &captures, 1, &mut stack),
             1
         );
-        assert!(choices[0].right);
+        let first = read_choices(&choices).next().unwrap();
+        assert!(first.right);
         assert_eq!(
-            choices[0].right,
-            route_preference(source, &parts, &[], choices[0].span, &captures, 1)
+            first.right,
+            route_preference(
+                source,
+                &parts,
+                core::iter::empty(),
+                first.span,
+                &captures,
+                1
+            )
         );
-        choices[0].right = !choices[0].right;
+        choices[2] ^= 1;
         assert_eq!(
             route_choices(source, &parts, &mut choices, 1, &captures, 1, &mut stack),
             1
         );
-        assert!(!choices[0].right);
+        let first = read_choices(&choices).next().unwrap();
+        assert!(!first.right);
         assert_ne!(
-            choices[0].right,
-            route_preference(source, &parts, &[], choices[0].span, &captures, 1)
+            first.right,
+            route_preference(
+                source,
+                &parts,
+                core::iter::empty(),
+                first.span,
+                &captures,
+                1
+            )
         );
     }
 }

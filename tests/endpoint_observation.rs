@@ -112,9 +112,9 @@ fn supplied_source_witness_checks_real_endpoint_visits_and_rejects_mutations() {
             order[index][2] = order[next][2];
         }
     }
-    let mut bytes = b"HEPC\0\0\0\x01".to_vec();
+    let mut bytes = b"HEPC\0\0\0\x02".to_vec();
     bytes.extend_from_slice(&1u32.to_be_bytes());
-    let steps = [[0u64; 7], [4, 0, 0, 0, 0, 0, 0], [5, 1, 0, 0, 0, 0, 0]];
+    let steps = [[0u64; 6], [4, 0, 0, 0, 0, 0], [5, 1, 0, 0, 0, 0]];
     let choices = [[0u64, 4, 0], [4, 8, 1]];
     for count in [steps.len(), choices.len(), order.len(), 0] {
         bytes.extend_from_slice(&(count as u64).to_be_bytes());
@@ -147,7 +147,7 @@ fn supplied_source_witness_checks_real_endpoint_visits_and_rejects_mutations() {
     };
     let valid = check(&bytes);
     assert!(valid.status.success(), "{valid:?}");
-    let order_offset = 44 + steps.len() * 56 + choices.len() * 24;
+    let order_offset = 44 + steps.len() * 48 + choices.len() * 24;
     let first_commit = records
         .iter()
         .position(|row| row.id() == tap::ENDPOINT_SEND)
@@ -157,7 +157,7 @@ fn supplied_source_witness_checks_real_endpoint_visits_and_rejects_mutations() {
     invalid[44..52].copy_from_slice(&99u64.to_be_bytes());
     mutations.push(invalid);
     let mut invalid = bytes.clone();
-    invalid[44 + steps.len() * 56 + 16..44 + steps.len() * 56 + 24]
+    invalid[44 + steps.len() * 48 + 16..44 + steps.len() * 48 + 24]
         .copy_from_slice(&1u64.to_be_bytes());
     mutations.push(invalid);
     let mut invalid = bytes.clone();
@@ -227,21 +227,13 @@ fn audit_capture(
     checkpoint: Option<u32>,
 ) -> Result<usize, hibana_epf::AuditError> {
     use hibana_epf::{
-        Acceptance, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId, RouteChoice,
-        Unfold,
+        Acceptance, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId, Unfold,
     };
     let captures = [Capture::new(captured, checkpoint).unwrap()];
     let mut source_storage = vec![0; Protocol::workspace_len(snapshot).unwrap()];
     let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
     let capacity = 2 * captured.len() + 1;
     let mut unfolding = vec![Unfold::Source; capacity];
-    let mut choices = vec![
-        RouteChoice {
-            span: [0, 0],
-            right: false
-        };
-        protocol.audit_choice_capacity(capacity).unwrap()
-    ];
     let mut order = vec![
         RecordId {
             producer: 0,
@@ -270,7 +262,6 @@ fn audit_capture(
         &captures,
         AuditStorage {
             unfolding: &mut unfolding,
-            choices: &mut choices,
             execution: ExecutionStorage {
                 session: 1,
                 observed_producers: &observed_producers,

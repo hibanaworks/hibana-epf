@@ -3,6 +3,62 @@ import Hibana.SourceOccurrenceProgress
 namespace Hibana.Epf.CompactSource
 open EndpointDelegation
 
+private def composedResumptions (first second tail : Message) :
+    SourceUnfolding
+      (.seq (.par (.roll (.send first)) (.roll (.send second))) (.send tail))
+      (.seq (.seq (.seq (.par (.send first) (.send second)) (.send tail)) (.send first))
+        (.send second)) :=
+  .resumeAfterContinuation (.parRight (.roll (.send first)) .hole)
+    (.resumeAfterContinuation (.parLeft .hole (.roll (.send second)))
+      (.seq (.par (.rollOnce (.send first)) (.rollOnce (.send second))) (.send tail))
+      (.send first))
+    (.send second)
+
+theorem composed_resumptions_retain_both_distinct_anchors (first second tail : Message) :
+    ((composedResumptions first second tail).resumptions 0).map (·.anchor) =
+      [some [1], some [0]] := by rfl
+
+theorem composed_resumptions_preserve_source_identities (first second tail : Message) :
+    (composedResumptions first second tail).origins 0 = [0, 1, 2, 0, 1] := by rfl
+
+private def composedInsertions (first second before after : Message) :
+    SourceUnfolding
+      (.seq (.par (.roll (.send first)) (.roll (.send second)))
+        (.seq (.send before) (.send after)))
+      (.seq (.par (.send first) (.send second))
+        (.seq (.send before) (.par (.send first) (.par (.send second) (.send after))))) :=
+  .resumeAlongsideContinuation (.parRight (.roll (.send first)) .hole)
+    (.seqRight (.par (.send first) (.send second))
+      (.seqRight (.send before) (.parRight (.send first) .hole)))
+    (.resumeAlongsideContinuation (.parLeft .hole (.roll (.send second)))
+      (.seqRight (.par (.send first) (.send second)) (.seqRight (.send before) .hole))
+      (.seq (.par (.rollOnce (.send first)) (.rollOnce (.send second)))
+        (.seq (.send before) (.send after)))
+      (.rollOnce (.send first)))
+    (.rollOnce (.send second))
+
+theorem composed_insertions_keep_both_anchors_and_the_same_continuation
+    (first second before after : Message) :
+    ((composedInsertions first second before after).resumptions 0).map
+      (fun scope => (scope.body, scope.tail, scope.anchor)) =
+      [([4], [5], some [1]), ([3], [5], some [0])] := by rfl
+
+theorem composed_insertions_preserve_source_identities (first second before after : Message) :
+    (composedInsertions first second before after).origins 0 = [0, 1, 2, 0, 1, 3] := by rfl
+
+private def futureAnchor (first before after : Message) :
+    SourceUnfolding (.seq (.roll (.send first)) (.seq (.send before) (.send after)))
+      (.seq (.seq (.send first) (.seq (.send before) (.seq (.send first) (.send after))))
+        (.send first)) :=
+  .resumeBeforeContinuation .hole
+    (.seqLeft (.seqRight (.send first) (.seqRight (.send before) .hole)) (.send first))
+    (.resumeAfterContinuation .hole
+      (.seq (.rollOnce (.send first)) (.seq (.send before) (.send after))) (.send first))
+    (.rollOnce (.send first))
+
+theorem a_future_visit_cannot_supply_an_insertion_anchor (first before after : Message) :
+    ((futureAnchor first before after).resumptions 0).head?.bind (·.anchor) = none := by rfl
+
 /-- Borrowing an unchanged subtree denotes the existing one-copy unfolding,
 not a new rule for enabling or permanently closing a roll. -/
 def witness (source : Source) : SourceUnfolding source source.oneCopy :=
@@ -599,5 +655,74 @@ theorem a_retained_route_message_fixes_its_arm
         have bound := source_message_is_within_its_subtree original
         have afterSplit : ¬ event < start + left.eventCount := by omega
         simpa only [if_neg afterSplit] using armAt
+
+/-- The closest in-order boundary containing a fixed target. The binary
+interval index records each boundary's end and whether it is a sequence. -/
+def boundaryOrder (rows : List (Nat × Bool)) (target : Nat) : Bool :=
+  match rows.find? (fun row => target < row.1) with
+  | some row => row.2
+  | none => false
+
+/-- A backwards sweep reuses the suffix result when the current boundary
+does not contain the target. Rust stores this bit alongside the query's
+existing observation/choice bits; it does not allocate another array. -/
+def beforeSweep (rows : List (Nat × Bool)) (target : Nat) : List Bool :=
+  match rows with
+  | [] => []
+  | row :: rest =>
+      let tail := beforeSweep rest target
+      (if target < row.1 then row.2 else tail.headD false) :: tail
+
+theorem before_sweep_length (rows : List (Nat × Bool)) (target : Nat) :
+    (beforeSweep rows target).length = rows.length := by
+  induction rows <;> simp_all [beforeSweep]
+
+theorem before_sweep_head (rows : List (Nat × Bool)) (target : Nat) :
+    (beforeSweep rows target).headD false = boundaryOrder rows target := by
+  induction rows with
+  | nil => simp [beforeSweep, boundaryOrder]
+  | cons row rest ih =>
+      by_cases contains : target < row.1
+      · simp [beforeSweep, boundaryOrder, contains]
+      · simp [beforeSweep, boundaryOrder, contains] at ih ⊢
+        exact ih
+
+/-- Every cached entry equals an independent nearest-containing-boundary
+search, for arbitrary binary-boundary data and arbitrary list length. The
+Rust tree/index correspondence is additionally checked against recursive
+source order and the retained parent-walking implementation. -/
+theorem before_sweep_exact (rows : List (Nat × Bool)) (target first : Nat) :
+    (beforeSweep rows target)[first]? =
+      if first < rows.length then some (boundaryOrder (rows.drop first) target)
+      else none := by
+  induction rows generalizing first with
+  | nil => simp [beforeSweep]
+  | cons row rest ih =>
+      cases first with
+      | zero =>
+          have head := before_sweep_head (row :: rest) target
+          simpa [beforeSweep] using congrArg some head
+      | succ first =>
+          simpa [beforeSweep] using ih first
+
+/-- Filling successive ancestor intervals is the transpose of the boundary
+lookup. The lower endpoint is the end already covered by earlier ancestors. -/
+def afterSweep (rows : List (Nat × Bool)) (lower target : Nat) : Bool :=
+  match rows with
+  | [] => false
+  | row :: rest =>
+      if lower ≤ target ∧ target < row.1 then row.2
+      else afterSweep rest row.1 target
+
+theorem after_sweep_exact (rows : List (Nat × Bool)) (lower target : Nat)
+    (inside : lower ≤ target) :
+    afterSweep rows lower target = boundaryOrder rows target := by
+  induction rows generalizing lower with
+  | nil => simp [afterSweep, boundaryOrder]
+  | cons row rest ih =>
+      by_cases contains : target < row.1
+      · simp [afterSweep, boundaryOrder, inside, contains]
+      · simp [afterSweep, boundaryOrder, inside, contains]
+        exact ih row.1 (by omega)
 
 end Hibana.Epf.CompactSource

@@ -303,9 +303,8 @@ impl SourcePath<'_, '_, '_> {
             if let Some(point) = operation_point(row, record, event) {
                 if record.id() == tap::SEND_POLL {
                     if !self.query_ready(
-                        points(&word[..used]),
-                        point,
-                        (record.causal_key() >> 8) as u8,
+                        (points(&word[..used]), prefix),
+                        (point, (record.causal_key() >> 8) as u8),
                         query,
                     ) {
                         if let Some(prior) = self.missing(points(&word[..used]), point, |prior| {
@@ -332,7 +331,9 @@ impl SourcePath<'_, '_, '_> {
                     SourcePoint::Received(event),
                 ]
                 .into_iter()
-                .any(|point| self.query_ready(points(&word[..used]), point, actor, query));
+                .any(|point| {
+                    self.query_ready((points(&word[..used]), prefix), (point, actor), query)
+                });
                 if !candidate {
                     return Err(ExecutionError::Record { position });
                 }

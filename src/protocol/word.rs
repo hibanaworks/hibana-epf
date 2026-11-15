@@ -1,6 +1,9 @@
 //! Check occurrence words using source actor order and retained-body dependencies.
 use super::{Layout, SourcePath};
 
+// Query-local structural order, separate from choice and observation bits.
+pub(super) const SOURCE_ORDER: usize = 64;
+
 #[cfg(test)]
 mod tests;
 
@@ -114,6 +117,15 @@ impl SourcePath<'_, '_, '_> {
         point: SourcePoint,
         contains: impl Fn(SourcePoint) -> bool,
     ) -> Option<SourcePoint> {
+        self.missing_with(point, contains, self.prerequisite(history, point))
+    }
+
+    pub(super) fn missing_with(
+        &self,
+        point: SourcePoint,
+        contains: impl Fn(SourcePoint) -> bool,
+        required: impl Fn(SourcePoint, u8) -> bool,
+    ) -> Option<SourcePoint> {
         if let SourcePoint::Sent(event) | SourcePoint::Received(event) = point
             && !contains(SourcePoint::Accepted(event))
         {
@@ -126,7 +138,6 @@ impl SourcePath<'_, '_, '_> {
             return None;
         }
         let target_actor = self.point_actor(point);
-        let required = self.prerequisite(history.clone(), point);
         // Both source order and resumption prerequisites point forward in
         // this expansion. Keep the target itself for the send/receive pair.
         let end = self
@@ -169,16 +180,31 @@ impl SourcePath<'_, '_, '_> {
         history: impl Clone + Iterator<Item = SourcePoint>,
         point: SourcePoint,
     ) -> impl Fn(SourcePoint, u8) -> bool {
-        let source = self.unfolding();
-        let can_resume = matches!(point, SourcePoint::Accepted(_)) && source.has_insertions();
+        let required = self.prerequisite_ordered(history, point);
         move |prior, actor| {
+            let ordered = !matches!(point, SourcePoint::Sent(_))
+                && prior.event() != point.event()
+                && self.source_before(prior.event(), point.event());
+            required(prior, actor, ordered)
+        }
+    }
+
+    pub(super) fn prerequisite_ordered(
+        &self,
+        history: impl Clone + Iterator<Item = SourcePoint>,
+        point: SourcePoint,
+    ) -> impl Fn(SourcePoint, u8, bool) -> bool {
+        let source = self.unfolding();
+        let can_resume =
+            matches!(point, SourcePoint::Accepted(_)) && source.resumption_target(point.event());
+        move |prior, actor, source_before| {
             let ordered = match point {
                 SourcePoint::Sent(_) => false,
                 _ if prior.event() == point.event() => matches!(
                     (prior, point),
                     (SourcePoint::Sent(_), SourcePoint::Received(_))
                 ),
-                _ => self.source_before(prior.event(), point.event()),
+                _ => source_before,
             };
             ordered
                 || can_resume
@@ -188,6 +214,50 @@ impl SourcePath<'_, '_, '_> {
                             && self.point_actor(entry) == Some(actor)
                             && source.same_resumption(prior.event(), point.event(), entry.event())
                     })
+        }
+    }
+
+    // For a fixed target, the nearest boundary at or after `first` whose
+    // subtree contains the target is their lowest common ancestor. Sweep
+    // backwards once instead of climbing the same parent chain per pair.
+    // All paths of this unfolding share this immutable structural relation.
+    pub(super) fn mark_source_before(&self, target: usize, rows: &mut [usize]) {
+        let mut ordered = false;
+        for first in (0..rows.len()).rev() {
+            if first >= target {
+                ordered = false;
+            } else if target < self.index[3 * first + 1] {
+                ordered = self.index[3 * first + 2] == 0;
+            }
+            rows[first] = (rows[first] & !SOURCE_ORDER) | if ordered { SOURCE_ORDER } else { 0 };
+        }
+    }
+
+    // Transpose of the same relation. Ancestors extend the covered suffix in
+    // disjoint intervals; each interval inherits its first containing node's
+    // sequence/par/route kind. Used before the backwards query sweep so both
+    // directions share one temporary bit in the existing observation words.
+    pub(super) fn mark_source_after(&self, target: usize, rows: &mut [usize]) {
+        for row in rows.iter_mut() {
+            *row &= !SOURCE_ORDER;
+        }
+        let mut start = target + 1;
+        if start == rows.len() {
+            return;
+        }
+        let mut boundary = target;
+        loop {
+            let row = &self.index[3 * boundary..3 * boundary + 3];
+            if row[2] == 0 {
+                for point in &mut rows[start..row[1]] {
+                    *point |= SOURCE_ORDER;
+                }
+            }
+            start = row[1];
+            if row[0] == usize::MAX {
+                return;
+            }
+            boundary = row[0];
         }
     }
 

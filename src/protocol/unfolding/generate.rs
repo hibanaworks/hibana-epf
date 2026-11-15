@@ -3,7 +3,7 @@
 //! Every child occupies a contiguous postorder interval. Shared derivations
 //! have an equivalent tree, so this covers the unfolding grammar without
 //! enumerating arbitrary DAG references or unrelated source constructors.
-use super::{Head, Layout, Protocol, Region, Unfold, get, put};
+use super::{Head, InsertPart, Layout, Protocol, Region, Unfold, get, insertion_part, put};
 use crate::Capture;
 use hibana::runtime::tap;
 
@@ -164,10 +164,458 @@ pub(crate) fn seed(
         };
         returned = result;
         if depth == 0 {
-            return Some(output);
+            return Some(retained_seed(
+                protocol, captures, session, steps, output, workspace,
+            ));
         }
         depth -= 1;
     }
+}
+
+// A producer can observe one actor in a roll, then in its continuation, then
+// in the roll again. Counts alone put every visit before the continuation.
+// Prefer checked grafts for its later visits in that case. This only constructs
+// a candidate: source placement, selected ownership and every record are still
+// checked by the same independent path/execution checks as every other tree.
+fn retained_seed(
+    protocol: Protocol<'_>,
+    captures: &[Capture<'_>],
+    session: u32,
+    steps: &mut [Unfold],
+    size: usize,
+    workspace: &mut [usize],
+) -> usize {
+    let capacity = steps.len();
+    let layout = Layout::checked(protocol);
+    let (rows, rest) = workspace.split_at_mut(5 * capacity);
+    let (mapped, rest) = rest.split_at_mut(capacity);
+    let (counts, rest) = rest.split_at_mut(capacity);
+    let targets = &mut rest[..capacity];
+    targets.fill(usize::MAX);
+    {
+        let Ok(source) = protocol.unfolding(&steps[..size], rows) else {
+            return size;
+        };
+        for parent in 0..size {
+            let Unfold::Sequence([left, _]) = steps[parent] else {
+                continue;
+            };
+            let Some(Head::Sequence([region, tail])) =
+                layout.head(protocol, get(source.rows, parent))
+            else {
+                continue;
+            };
+            let retained = |at: usize| {
+                if !matches!(steps[at], Unfold::More(_)) {
+                    return None;
+                }
+                let node = get(source.rows, at);
+                if node.rolled {
+                    return None;
+                }
+                let marker = protocol.records.get(layout.scopes.start + node.first)?;
+                let key = marker.causal_key();
+                if layout.retained(protocol, region, key)? != node {
+                    return None;
+                }
+                // Nested visits have their own per-enclosing-visit demand.
+                // Leave that preference to the ordinary structural seed.
+                if protocol.records[layout.scopes.clone()].iter().any(|row| {
+                    row.causal_key() >> 13 == 1
+                        && row.arg1() & 3 == 0
+                        && protocol.scope(row.causal_key()).is_some_and(|outer| {
+                            outer.first < layout.scopes.start + node.first
+                                && layout.scopes.start + node.last - 1 < outer.last
+                        })
+                }) {
+                    return None;
+                }
+                if (at + 1..=left).any(|later| {
+                    matches!(steps[later], Unfold::More(_)) && get(source.rows, later) == node
+                }) {
+                    return None;
+                }
+                Some((key, node))
+            };
+            if !(0..=left).filter_map(retained).any(|(_, body)| {
+                captures.iter().any(|capture| {
+                    // Actor IDs are u8, so each set is exactly 256 bits.
+                    let mut inside = [0u64; 4];
+                    let mut crossed = [0u64; 4];
+                    for record in capture.records() {
+                        if record.arg0() != session
+                            || !matches!(record.id(), tap::ENDPOINT_SEND | tap::ENDPOINT_RECV)
+                        {
+                            continue;
+                        }
+                        let actor = usize::from(record.causal_key() >> 8);
+                        let (word, bit) = (actor / 64, 1u64 << (actor % 64));
+                        let origin = usize::from(record.arg1() as u16);
+                        if body.start <= origin && origin < body.end {
+                            if crossed[word] & bit != 0 {
+                                return true;
+                            }
+                            inside[word] |= bit;
+                        } else if tail.start <= origin
+                            && origin < tail.end
+                            && inside[word] & bit != 0
+                        {
+                            crossed[word] |= bit;
+                        }
+                    }
+                    false
+                })
+            }) {
+                continue;
+            }
+            for (at, target) in targets[..=left].iter_mut().enumerate() {
+                if retained(at).is_some() {
+                    *target = parent;
+                }
+            }
+        }
+    }
+    if targets[..size].iter().all(|&parent| parent == usize::MAX) {
+        return size;
+    }
+    let mut pending = size;
+    while pending != 0 {
+        pending -= 1;
+        if targets[pending] != usize::MAX
+            && let Unfold::More([earlier, _]) = steps[pending]
+            && matches!(steps[earlier], Unfold::More(_))
+        {
+            targets[earlier] = targets[pending];
+        }
+    }
+    // Keep the original candidate intact until its replacement fits. The same
+    // caller storage holds the new postorder tree and the remapping; no source
+    // AST, task state or additional permission representation is introduced.
+    let append = |step, count, output: &mut usize, steps: &mut [Unfold], counts: &mut [usize]| {
+        let at = *output;
+        *steps.get_mut(at)? = step;
+        counts[at] = count;
+        *output += 1;
+        Some(at)
+    };
+    let mut output = size;
+    for at in 0..size {
+        if targets[at] != usize::MAX {
+            let Unfold::More([earlier, _]) = steps[at] else {
+                unreachable!();
+            };
+            mapped[at] = mapped[earlier];
+            continue;
+        }
+        let (step, count) = match steps[at] {
+            Unfold::Source => (Unfold::Source, rows[5 * at + 4]),
+            Unfold::Once(body) => (Unfold::Once(mapped[body]), counts[mapped[body]]),
+            Unfold::Sequence([a, b])
+            | Unfold::Parallel([a, b])
+            | Unfold::Choice([a, b])
+            | Unfold::More([a, b])
+            | Unfold::Independent([a, b]) => {
+                let children = [mapped[a], mapped[b]];
+                let Some(count) = counts[children[0]].checked_add(counts[children[1]]) else {
+                    return size;
+                };
+                let step = match steps[at] {
+                    Unfold::Sequence(_) => Unfold::Sequence(children),
+                    Unfold::Parallel(_) => Unfold::Parallel(children),
+                    Unfold::Choice(_) => Unfold::Choice(children),
+                    Unfold::More(_) => Unfold::More(children),
+                    Unfold::Independent(_) => Unfold::Independent(children),
+                    _ => unreachable!(),
+                };
+                (step, count)
+            }
+            Unfold::After { .. } | Unfold::Alongside { .. } | Unfold::Before { .. } => {
+                unreachable!("the uniform seed has no retained insertions")
+            }
+        };
+        let Some(node) = append(step, count, &mut output, steps, counts) else {
+            return size;
+        };
+        mapped[at] = node;
+        let Unfold::Sequence([_, right]) = steps[at] else {
+            continue;
+        };
+        let continuation = get(rows, right);
+        while let Some(retained) = (0..at)
+            .filter(|&index| targets[index] == at)
+            .min_by(|&a, &b| {
+                let visit = |index| {
+                    let region = get(rows, index);
+                    (
+                        protocol.records[layout.scopes.start + region.first].causal_key(),
+                        more_visit(steps, index),
+                        [region.start, region.end],
+                    )
+                };
+                observed_before(captures, session, visit(a), visit(b))
+                    .map(|before| {
+                        if before {
+                            core::cmp::Ordering::Less
+                        } else {
+                            core::cmp::Ordering::Greater
+                        }
+                    })
+                    .unwrap_or_else(|| a.cmp(&b))
+            })
+        {
+            targets[retained] = usize::MAX;
+            let Unfold::More([_, body]) = steps[retained] else {
+                unreachable!();
+            };
+            let visit = more_visit(steps, retained);
+            let key =
+                protocol.records[layout.scopes.start + get(rows, retained).first].causal_key();
+            let region = get(rows, retained);
+            let count = counts[mapped[body]];
+            let mut focus: Option<[usize; 2]> = None;
+            for pivot in 0..=right {
+                let Unfold::More([_, pivot_body]) = steps[pivot] else {
+                    continue;
+                };
+                let node = get(rows, pivot);
+                if node.rolled {
+                    continue;
+                }
+                let Some(marker) = protocol.records.get(layout.scopes.start + node.first) else {
+                    continue;
+                };
+                if layout.retained(protocol, continuation, marker.causal_key()) != Some(node) {
+                    continue;
+                }
+                let mut rank = 0;
+                while let Some(span) =
+                    visit_range((steps, counts), (mapped[at], mapped[pivot_body]), rank)
+                {
+                    let preferred = observed_before(
+                        captures,
+                        session,
+                        (key, visit, [region.start, region.end]),
+                        (marker.causal_key(), rank, [node.start, node.end]),
+                    )
+                    .unwrap_or(rank == visit);
+                    if preferred && focus.is_none_or(|current| span[0] < current[0]) {
+                        focus = Some(span);
+                    }
+                    rank += 1;
+                }
+            }
+            let step = if let Some(focus) = focus {
+                let Some(next) = append(
+                    Unfold::Once(mapped[body]),
+                    count,
+                    &mut output,
+                    steps,
+                    counts,
+                ) else {
+                    return size;
+                };
+                Unfold::Before {
+                    retained: key,
+                    earlier: mapped[at],
+                    next,
+                    focus,
+                }
+            } else {
+                Unfold::After {
+                    retained: key,
+                    earlier: mapped[at],
+                    next: mapped[body],
+                }
+            };
+            let Some(total) = counts[mapped[at]].checked_add(count) else {
+                return size;
+            };
+            let Some(node) = append(step, total, &mut output, steps, counts) else {
+                return size;
+            };
+            mapped[at] = node;
+        }
+    }
+    // A removed More node can leave only its unused wrapper behind; each body
+    // remains reachable through its resumed Once. Discard the original prefix.
+    let count = output - size;
+    steps.copy_within(size..output, 0);
+    for step in &mut steps[..count] {
+        match step {
+            Unfold::Source => (),
+            Unfold::Once(body) => *body -= size,
+            Unfold::Sequence(children)
+            | Unfold::Parallel(children)
+            | Unfold::Choice(children)
+            | Unfold::More(children)
+            | Unfold::Independent(children) => {
+                children[0] -= size;
+                children[1] -= size;
+            }
+            Unfold::After { earlier, next, .. }
+            | Unfold::Alongside { earlier, next, .. }
+            | Unfold::Before { earlier, next, .. } => {
+                *earlier -= size;
+                *next -= size;
+            }
+        }
+    }
+    count
+}
+
+fn more_visit(steps: &[Unfold], index: usize) -> usize {
+    let Unfold::More([mut earlier, _]) = steps[index] else {
+        unreachable!("a retained visit is a More node");
+    };
+    let mut visit = 1;
+    while let Unfold::More([previous, _]) = steps[earlier] {
+        visit += 1;
+        earlier = previous;
+    }
+    visit
+}
+
+// Only compare visits witnessed by the same actor. Different senders can enter
+// in one order while a shared receiver consumes their frames in the other.
+// Producer ordinals never order different streams. Conflicting or missing
+// hints leave the source preference intact; the independent checker still
+// decides every proposal.
+fn observed_before(
+    captures: &[Capture<'_>],
+    session: u32,
+    prior: (u16, usize, [usize; 2]),
+    next: (u16, usize, [usize; 2]),
+) -> Option<bool> {
+    let mut preference = None;
+    for capture in captures {
+        let inside = |record: &tap::TapEvent, range: [usize; 2]| {
+            let origin = usize::from(record.arg1() as u16);
+            record.arg0() == session
+                && range[0] <= origin
+                && origin < range[1]
+                && (record.id() == tap::SEND_POLL || super::super::execution::committed(*record))
+        };
+        let mut actors = [0u64; 4];
+        for record in capture
+            .records()
+            .iter()
+            .filter(|record| inside(record, prior.2))
+        {
+            let actor = usize::from(record.causal_key() >> 8);
+            actors[actor / 64] |= 1 << (actor % 64);
+        }
+        for record in capture
+            .records()
+            .iter()
+            .filter(|record| inside(record, next.2))
+        {
+            let actor = record.causal_key() >> 8;
+            let word = usize::from(actor / 64);
+            let bit = 1 << (actor % 64);
+            if actors[word] & bit == 0 {
+                continue;
+            }
+            actors[word] &= !bit;
+            let entry = |(key, visit, range): (u16, usize, [usize; 2])| {
+                if visit == 0 {
+                    capture
+                        .records()
+                        .iter()
+                        .find(|record| inside(record, range) && record.causal_key() >> 8 == actor)
+                } else {
+                    capture
+                        .records()
+                        .iter()
+                        .filter(|record| {
+                            record.arg0() == session
+                                && record.id() == tap::SCOPE_REENTRY
+                                && record.arg1() >> 16 == u32::from(key)
+                                && record.causal_key() >> 8 == actor
+                        })
+                        .nth(visit - 1)
+                }
+            };
+            if let (Some(a), Some(b)) = (entry(prior), entry(next)) {
+                let observed = a.ts() < b.ts();
+                if preference.is_some_and(|previous| previous != observed) {
+                    return None;
+                }
+                preference = Some(observed);
+            }
+        }
+    }
+    preference
+}
+
+// Locate an invocation of an immutable body in the candidate just constructed.
+// Whole-body grafts keep that body's leaves contiguous. Walk its existing
+// proof coordinates without recursion, another source tree or a task cursor.
+fn visit_range(
+    (steps, counts): (&[Unfold], &[usize]),
+    (root, body): (usize, usize),
+    mut visit: usize,
+) -> Option<[usize; 2]> {
+    let mut event = 0;
+    while event < counts[root] {
+        let (mut at, mut local) = (root, event);
+        loop {
+            if at == body {
+                let start = event - local;
+                if visit == 0 {
+                    return Some([start, start + counts[body]]);
+                }
+                visit -= 1;
+                event = start + counts[body];
+                break;
+            }
+            match steps[at] {
+                Unfold::Source => {
+                    event += 1;
+                    break;
+                }
+                Unfold::Once(child) => at = child,
+                Unfold::Sequence([a, b])
+                | Unfold::Parallel([a, b])
+                | Unfold::Choice([a, b])
+                | Unfold::More([a, b])
+                | Unfold::Independent([a, b])
+                | Unfold::After {
+                    earlier: a,
+                    next: b,
+                    ..
+                } => {
+                    if local < counts[a] {
+                        at = a;
+                    } else {
+                        local -= counts[a];
+                        at = b;
+                    }
+                }
+                Unfold::Alongside {
+                    earlier,
+                    next,
+                    focus,
+                    ..
+                }
+                | Unfold::Before {
+                    earlier,
+                    next,
+                    focus,
+                    ..
+                } => match insertion_part(local, focus[0], counts[next]) {
+                    InsertPart::Earlier(position) => {
+                        local = position;
+                        at = earlier;
+                    }
+                    InsertPart::Resumed(position) => {
+                        local = position;
+                        at = next;
+                    }
+                },
+            }
+        }
+    }
+    None
 }
 
 fn visits(
@@ -410,53 +858,40 @@ fn configuration(
                     ));
                 }
                 rank -= partitions;
-                for earlier_size in 1..size.saturating_sub(2) {
-                    for next_size in 1..size - earlier_size - 1 {
-                        let tail_size = size - 1 - earlier_size - next_size;
-                        // A tree has at most this many messages in its tail.
-                        // Invalid intervals are rejected by Protocol::unfolding.
-                        let bound = tail_size.checked_mul(layout.sources.len())?;
-                        let intervals = bound.checked_mul(bound.checked_add(1)?)? / 2;
-                        for before in [false, true] {
-                            if rank >= intervals {
-                                rank -= intervals;
-                                continue;
-                            }
-                            let mut start = 0;
-                            while rank >= bound - start {
-                                rank -= bound - start;
-                                start += 1;
-                            }
-                            let focus = [start, start + 1 + rank];
-                            let earlier = begin + earlier_size - 1;
-                            let next = earlier + next_size;
-                            let tail = end - 1;
-                            let rows = [
-                                Some((earlier, begin, left)),
-                                Some((next, earlier + 1, source)),
-                                Some((tail, next + 1, right)),
-                            ];
-                            return Some((
-                                if before {
-                                    Unfold::Before {
-                                        retained,
-                                        earlier,
-                                        next,
-                                        tail,
-                                        focus,
-                                    }
-                                } else {
-                                    Unfold::Alongside {
-                                        retained,
-                                        earlier,
-                                        next,
-                                        tail,
-                                        focus,
-                                    }
-                                },
-                                rows,
-                            ));
+                for earlier_size in 1..size - 1 {
+                    let bound = earlier_size.checked_mul(layout.sources.len())?;
+                    let intervals = bound.checked_mul(bound.checked_add(1)?)? / 2;
+                    for before in [false, true] {
+                        if rank >= intervals {
+                            rank -= intervals;
+                            continue;
                         }
+                        let mut start = 0;
+                        while rank >= bound - start {
+                            rank -= bound - start;
+                            start += 1;
+                        }
+                        let focus = [start, start + 1 + rank];
+                        let ([earlier, next], rows) =
+                            binary(begin, end, earlier_size, [region, source]);
+                        return Some((
+                            if before {
+                                Unfold::Before {
+                                    retained,
+                                    earlier,
+                                    next,
+                                    focus,
+                                }
+                            } else {
+                                Unfold::Alongside {
+                                    retained,
+                                    earlier,
+                                    next,
+                                    focus,
+                                }
+                            },
+                            rows,
+                        ));
                     }
                 }
             }
@@ -471,6 +906,83 @@ mod tests {
     use super::*;
     use hibana::{g, runtime::program::project};
     use std::vec;
+
+    #[test]
+    fn shared_receiver_order_guides_visits_independently_of_sender_entry_order() {
+        for receiver_first in [0, 1] {
+            let fields = [
+                (tap::ENDPOINT_SEND, 0, 0),
+                (tap::ENDPOINT_SEND, 1, 1),
+                (tap::ENDPOINT_RECV, 2, 0),
+                (tap::ENDPOINT_RECV, 2, 1),
+                (tap::SCOPE_REENTRY, 0, 20 << 16),
+                (tap::SEND_POLL, 0, 0),
+                (tap::SCOPE_REENTRY, 1, 21 << 16 | 1),
+                (tap::SEND_POLL, 1, 1),
+                (
+                    tap::SCOPE_REENTRY,
+                    2,
+                    (20 + receiver_first) << 16 | receiver_first,
+                ),
+                (tap::ENDPOINT_RECV, 2, receiver_first),
+                (
+                    tap::SCOPE_REENTRY,
+                    2,
+                    (21 - receiver_first) << 16 | (1 - receiver_first),
+                ),
+                (tap::ENDPOINT_RECV, 2, 1 - receiver_first),
+            ];
+            let rows: std::vec::Vec<_> = fields
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, (kind, actor, detail))| {
+                    let mut bytes = [0; 16];
+                    bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+                    bytes[4..6].copy_from_slice(&kind.to_be_bytes());
+                    bytes[6..8].copy_from_slice(&((actor as u16) << 8).to_be_bytes());
+                    bytes[8..12].copy_from_slice(&1u32.to_be_bytes());
+                    bytes[12..].copy_from_slice(&(detail as u32).to_be_bytes());
+                    tap::TapEvent::from(bytes)
+                })
+                .collect();
+            let captures = [Capture::new(&rows, Some(rows.len() as u32)).unwrap()];
+            assert_eq!(
+                observed_before(&captures, 1, (20, 0, [0, 1]), (21, 0, [1, 2])),
+                Some(true)
+            );
+            assert_eq!(
+                observed_before(&captures, 1, (20, 1, [0, 1]), (21, 1, [1, 2])),
+                Some(receiver_first == 0)
+            );
+            // A missing visit supplies no order constraint.
+            assert_eq!(
+                observed_before(&captures, 1, (20, 2, [0, 1]), (21, 1, [1, 2])),
+                None
+            );
+            // Neither another session nor independent producer counters order these visits.
+            assert_eq!(
+                observed_before(&captures, 2, (20, 1, [0, 1]), (21, 1, [1, 2])),
+                None
+            );
+            let split: std::vec::Vec<_> = [0, 1]
+                .into_iter()
+                .map(|origin| {
+                    let row = rows[origin];
+                    let mut bytes: [u8; 16] = row.into();
+                    bytes[..4].copy_from_slice(&0u32.to_be_bytes());
+                    [tap::TapEvent::from(bytes)]
+                })
+                .collect();
+            let separate: std::vec::Vec<_> = split
+                .iter()
+                .map(|records| Capture::new(records, Some(1)).unwrap())
+                .collect();
+            assert_eq!(
+                observed_before(&separate, 1, (20, 0, [0, 1]), (21, 0, [1, 2])),
+                None
+            );
+        }
+    }
 
     #[test]
     fn a_selective_outer_arm_keeps_both_of_its_inner_visits() {

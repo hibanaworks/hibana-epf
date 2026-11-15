@@ -535,13 +535,6 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
         // snapshot and the three actual runtime capture prefixes. Neither the
         // hand-written unfolding above nor its record order is supplied.
         let mut generated = [hibana_epf::Unfold::Source; 7];
-        let mut selected = vec![
-            hibana_epf::RouteChoice {
-                span: [0, 0],
-                right: false
-            };
-            protocol.audit_choice_capacity(generated.len()).unwrap()
-        ];
         workspace.resize(
             protocol
                 .audit_workspace_len(&inputs, generated.len())
@@ -553,7 +546,6 @@ fn separate_producer_captures_match_real_loans_and_rolled_receipts_before_public
                 &inputs,
                 hibana_epf::AuditStorage {
                     unfolding: &mut generated,
-                    choices: &mut selected,
                     execution: hibana_epf::ExecutionStorage {
                         session: 110,
                         observed_producers: &observed_producers,
@@ -800,7 +792,7 @@ fn source_order_is_checked_before_a_pending_transport_send_can_expose_its_frame(
             let Poll::Ready(Err(error)) = operation.poll(&mut cx) else {
                 panic!("an early send must fail before transport admission")
             };
-            assert!(format!("{error:?}").contains("OutOfOrder"));
+            assert!(error.is_unavailable(), "pre-admission rejection: {error:?}");
             let operation = core::pin::pin!(receiver.recv::<Message>());
             assert!(!matches!(operation.poll(&mut cx), Poll::Ready(Ok(()))));
             captured.extend(records.by_ref());
@@ -1402,12 +1394,12 @@ fn a_pending_continuation_can_publish_after_the_other_view_reenters_its_roll() {
         hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Sequence([2, 3]),
+        hibana_epf::Unfold::Sequence([1, 4]),
         hibana_epf::Unfold::Alongside {
             retained,
-            earlier: 1,
+            earlier: 5,
             next: 1,
-            tail: 4,
-            focus: [0, 1],
+            focus: [1, 2],
         },
     ];
     let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
@@ -1612,12 +1604,12 @@ fn an_old_send_keeps_one_call_while_another_view_finishes_reentry() {
         hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Source,
         hibana_epf::Unfold::Sequence([4, 5]),
+        hibana_epf::Unfold::Sequence([3, 6]),
         hibana_epf::Unfold::Alongside {
             retained,
-            earlier: 3,
+            earlier: 7,
             next: 3,
-            tail: 6,
-            focus: [0, 1],
+            focus: [2, 3],
         },
     ];
     let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
@@ -2088,6 +2080,417 @@ fn conditional_resource_holders_keep_their_own_call_before_loan_publication() {
             protocol.check_custody(&[invalid], &order, &mut workspace),
             Err(CustodyError::Owner { role: 3, .. })
         ));
+    }
+}
+
+#[test]
+fn actual_local_rolls_resume_after_or_within_a_shared_continuation() {
+    type First = Msg<1, ()>;
+    type Second = Msg<2, ()>;
+    type Tail = Msg<3, ()>;
+    type End = Msg<4, ()>;
+    let global = g::seq(
+        g::par(
+            g::send::<7, 7, First>().roll(),
+            g::send::<7, 7, Second>().roll(),
+        ),
+        g::seq(g::send::<7, 7, Tail>(), g::send::<7, 7, End>()),
+    );
+    let program = project::<7>(&global);
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    let roll = |start| {
+        snapshot
+            .iter()
+            .find(|row| {
+                row.id() == tap::PROJECTED_SCOPE
+                    && row.causal_key() >> 13 == 1
+                    && row.arg1() == 0
+                    && row.arg0() == start
+            })
+            .unwrap()
+            .causal_key()
+    };
+    for (insertion, reverse) in [None, Some(false), Some(true)]
+        .into_iter()
+        .flat_map(|insertion| [false, true].map(|reverse| (insertion, reverse)))
+    {
+        let mut slab = [0; 8192];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                DelayedPublication {
+                    inbox: Cell::new(Ok(None)),
+                    reader: Cell::new(None),
+                    resource: None,
+                    backpressured_receiver: None,
+                },
+            )
+            .unwrap();
+        let mut endpoint = kit.enter(SessionId::new(207), &program).unwrap();
+        let mut tap = kit.tap();
+        let mut captured: Vec<_> = tap.by_ref().collect();
+        let mut cx = Context::from_waker(Waker::noop());
+        let labels = match (insertion, reverse) {
+            (None, false) => [1, 2, 3, 4, 1, 2],
+            (None, true) => [1, 2, 3, 4, 2, 1],
+            (Some(_), false) => [1, 2, 3, 1, 2, 4],
+            (Some(_), true) => [1, 2, 3, 2, 1, 4],
+        };
+        for label in labels {
+            let result = match label {
+                1 => core::pin::pin!(endpoint.send::<First>(&())).poll(&mut cx),
+                2 => core::pin::pin!(endpoint.send::<Second>(&())).poll(&mut cx),
+                3 => core::pin::pin!(endpoint.send::<Tail>(&())).poll(&mut cx),
+                4 => core::pin::pin!(endpoint.send::<End>(&())).poll(&mut cx),
+                _ => unreachable!(),
+            };
+            assert!(matches!(result, Poll::Ready(Ok(()))), "{label}: {result:?}");
+            captured.extend(tap.by_ref());
+        }
+        let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+        let bodies = if reverse { [2, 0] } else { [0, 2] };
+        let retained = if reverse {
+            [roll(1), roll(0)]
+        } else {
+            [roll(0), roll(1)]
+        };
+        let steps = [
+            hibana_epf::Unfold::Source,
+            hibana_epf::Unfold::Once(0),
+            hibana_epf::Unfold::Source,
+            hibana_epf::Unfold::Once(2),
+            hibana_epf::Unfold::Parallel([1, 3]),
+            hibana_epf::Unfold::Source,
+            hibana_epf::Unfold::Sequence([4, 5]),
+            match insertion {
+                None => hibana_epf::Unfold::After {
+                    retained: retained[0],
+                    earlier: 6,
+                    next: bodies[0],
+                },
+                Some(false) => hibana_epf::Unfold::Alongside {
+                    retained: retained[0],
+                    earlier: 6,
+                    next: bodies[0] + 1,
+                    focus: [3, 4],
+                },
+                Some(true) => hibana_epf::Unfold::Before {
+                    retained: retained[0],
+                    earlier: 6,
+                    next: bodies[0] + 1,
+                    focus: [3, 4],
+                },
+            },
+            match insertion {
+                None => hibana_epf::Unfold::After {
+                    retained: retained[1],
+                    earlier: 7,
+                    next: bodies[1],
+                },
+                Some(false) => hibana_epf::Unfold::Alongside {
+                    retained: retained[1],
+                    earlier: 7,
+                    next: bodies[1] + 1,
+                    focus: [4, 5],
+                },
+                Some(true) => hibana_epf::Unfold::Before {
+                    retained: retained[1],
+                    earlier: 7,
+                    next: bodies[1] + 1,
+                    focus: [4, 5],
+                },
+            },
+        ];
+        let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+        let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+        let mut actors = vec![0; unfolded.path_workspace_len().unwrap()];
+        let path = unfolded.select(&[], &mut actors).unwrap();
+        let capture = Capture::new(&captured, tap.checkpoint()).unwrap();
+        let mut order = vec![
+            RecordId {
+                producer: 0,
+                ordinal: 0
+            };
+            captured.len()
+        ];
+        let mut occurrences = vec![None; captured.len()];
+        let mut acceptances = vec![
+            hibana_epf::Acceptance {
+                first_poll: order[0],
+                before: 0
+            };
+            captured.len()
+        ];
+        let producers = vec![0; captured.len()];
+        let mut workspace = vec![0; path.interpretation_workspace_len(&[capture]).unwrap()];
+        let witness = path
+            .interpret(
+                &[capture],
+                hibana_epf::ExecutionStorage {
+                    session: 207,
+                    observed_producers: &producers,
+                    order: &mut order,
+                    occurrences: &mut occurrences,
+                    acceptances: &mut acceptances,
+                },
+                &mut workspace,
+            )
+            .unwrap();
+        path.check_execution(&[capture], &witness, &mut workspace)
+            .unwrap();
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|row| row.id() == tap::ENDPOINT_SEND)
+                .count(),
+            6
+        );
+        let capacity = 2 * captured.len() + 1;
+        let mut generated = vec![hibana_epf::Unfold::Source; capacity];
+        workspace.resize(
+            protocol.audit_workspace_len(&[capture], capacity).unwrap(),
+            0,
+        );
+        let audit = protocol
+            .audit(
+                &[capture],
+                hibana_epf::AuditStorage {
+                    unfolding: &mut generated,
+                    execution: hibana_epf::ExecutionStorage {
+                        session: 207,
+                        observed_producers: &producers,
+                        order: &mut order,
+                        occurrences: &mut occurrences,
+                        acceptances: &mut acceptances,
+                    },
+                },
+                &mut workspace,
+            )
+            .unwrap();
+        assert_eq!(audit.execution().order.len(), captured.len());
+    }
+}
+
+#[test]
+fn repeated_retained_visits_can_interleave_with_repeated_continuation_visits() {
+    type First = Msg<1, ()>;
+    type Second = Msg<2, ()>;
+    type Tail = Msg<3, ()>;
+    let global = g::seq(
+        g::par(
+            g::send::<7, 7, First>().roll(),
+            g::send::<7, 7, Second>().roll(),
+        ),
+        g::send::<7, 7, Tail>().roll(),
+    );
+    let program = project::<7>(&global);
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    for visits in [2, 3, 5] {
+        let mut slab = [0; 8192];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                DelayedPublication {
+                    inbox: Cell::new(Ok(None)),
+                    reader: Cell::new(None),
+                    resource: None,
+                    backpressured_receiver: None,
+                },
+            )
+            .unwrap();
+        let mut endpoint = kit.enter(SessionId::new(208), &program).unwrap();
+        let mut tap = kit.tap();
+        let mut captured: Vec<_> = tap.by_ref().collect();
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..visits {
+            for label in [1, 2, 3] {
+                let result = match label {
+                    1 => core::pin::pin!(endpoint.send::<First>(&())).poll(&mut cx),
+                    2 => core::pin::pin!(endpoint.send::<Second>(&())).poll(&mut cx),
+                    3 => core::pin::pin!(endpoint.send::<Tail>(&())).poll(&mut cx),
+                    _ => unreachable!(),
+                };
+                assert!(matches!(result, Poll::Ready(Ok(()))), "{label}: {result:?}");
+                captured.extend(tap.by_ref());
+            }
+        }
+        let mut protocol_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut protocol_storage).unwrap();
+        let capture = Capture::new(&captured, tap.checkpoint()).unwrap();
+        // Include the source as well as its observations: a tiny local
+        // trace can need more structural nodes than observation records.
+        let capacity = 2 * (captured.len() + snapshot.len()) + 1;
+        let mut unfolding = vec![hibana_epf::Unfold::Source; capacity];
+        let mut order = vec![
+            RecordId {
+                producer: 0,
+                ordinal: 0
+            };
+            captured.len()
+        ];
+        let mut occurrences = vec![None; captured.len()];
+        let mut acceptances = vec![
+            hibana_epf::Acceptance {
+                first_poll: order[0],
+                before: 0
+            };
+            captured.len()
+        ];
+        let producers = vec![0; captured.len()];
+        let mut workspace = vec![0; protocol.audit_workspace_len(&[capture], capacity).unwrap()];
+        let audit = protocol
+            .audit(
+                &[capture],
+                hibana_epf::AuditStorage {
+                    unfolding: &mut unfolding,
+                    execution: hibana_epf::ExecutionStorage {
+                        session: 208,
+                        observed_producers: &producers,
+                        order: &mut order,
+                        occurrences: &mut occurrences,
+                        acceptances: &mut acceptances,
+                    },
+                },
+                &mut workspace,
+            )
+            .unwrap();
+        let actual: Vec<_> = audit
+            .execution()
+            .order
+            .iter()
+            .zip(audit.execution().occurrences)
+            .filter(|(id, _)| captured[id.ordinal].id() == tap::ENDPOINT_SEND)
+            .map(|(_, occurrence)| {
+                audit
+                    .path()
+                    .unfolding()
+                    .origin(occurrence.unwrap())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(actual, [0, 1, 2].repeat(visits));
+    }
+}
+
+#[test]
+fn retained_cohorts_can_reenter_in_a_different_order_from_the_source() {
+    type A = Msg<1, ()>;
+    type B = Msg<2, ()>;
+    type C = Msg<3, ()>;
+    type D = Msg<4, ()>;
+    type G = Msg<5, ()>;
+    let global = g::seq(
+        g::seq(
+            g::par(g::send::<7, 7, A>().roll(), g::send::<7, 7, C>().roll()),
+            g::par(g::send::<7, 7, B>().roll(), g::send::<7, 7, D>().roll()),
+        ),
+        g::send::<7, 7, G>().roll(),
+    );
+    let program = project::<7>(&global);
+    let snapshot: Vec<_> = tap::projected(&program).collect();
+    for labels in [
+        [1, 3, 2, 4, 5, 4, 1, 2, 3, 5],
+        [1, 3, 2, 4, 5, 3, 2, 1, 4, 5],
+    ] {
+        let mut slab = [0; 8192];
+        let mut storage = SessionKitStorage::uninit();
+        let kit = storage
+            .init()
+            .rendezvous(
+                &mut slab,
+                DelayedPublication {
+                    inbox: Cell::new(Ok(None)),
+                    reader: Cell::new(None),
+                    resource: None,
+                    backpressured_receiver: None,
+                },
+            )
+            .unwrap();
+        let mut endpoint = kit.enter(SessionId::new(209), &program).unwrap();
+        let mut tap = kit.tap();
+        let mut captured: Vec<_> = tap.by_ref().collect();
+        let mut cx = Context::from_waker(Waker::noop());
+        for label in labels {
+            let result = match label {
+                1 => core::pin::pin!(endpoint.send::<A>(&())).poll(&mut cx),
+                2 => core::pin::pin!(endpoint.send::<B>(&())).poll(&mut cx),
+                3 => core::pin::pin!(endpoint.send::<C>(&())).poll(&mut cx),
+                4 => core::pin::pin!(endpoint.send::<D>(&())).poll(&mut cx),
+                5 => core::pin::pin!(endpoint.send::<G>(&())).poll(&mut cx),
+                _ => unreachable!(),
+            };
+            assert!(matches!(result, Poll::Ready(Ok(()))), "{label}: {result:?}");
+            captured.extend(tap.by_ref());
+        }
+        let mut protocol_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut protocol_storage).unwrap();
+        let capture = Capture::new(&captured, tap.checkpoint()).unwrap();
+        let capacity = 2 * (captured.len() + snapshot.len()) + 1;
+        let mut unfolding = vec![hibana_epf::Unfold::Source; capacity];
+        let mut order = vec![
+            RecordId {
+                producer: 0,
+                ordinal: 0
+            };
+            captured.len()
+        ];
+        let mut occurrences = vec![None; captured.len()];
+        let mut acceptances = vec![
+            hibana_epf::Acceptance {
+                first_poll: order[0],
+                before: 0
+            };
+            captured.len()
+        ];
+        let producers = vec![0; captured.len()];
+        let mut workspace = vec![0; protocol.audit_workspace_len(&[capture], capacity).unwrap()];
+        let audit = protocol
+            .audit(
+                &[capture],
+                hibana_epf::AuditStorage {
+                    unfolding: &mut unfolding,
+                    execution: hibana_epf::ExecutionStorage {
+                        session: 209,
+                        observed_producers: &producers,
+                        order: &mut order,
+                        occurrences: &mut occurrences,
+                        acceptances: &mut acceptances,
+                    },
+                },
+                &mut workspace,
+            )
+            .unwrap();
+        let actual: Vec<_> = audit
+            .execution()
+            .order
+            .iter()
+            .zip(audit.execution().occurrences)
+            .filter(|(id, _)| captured[id.ordinal].id() == tap::ENDPOINT_SEND)
+            .map(|(_, occurrence)| {
+                audit
+                    .path()
+                    .unfolding()
+                    .origin(occurrence.unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let expected: Vec<_> = labels
+            .into_iter()
+            .map(|label| match label {
+                1 => 0,
+                3 => 1,
+                2 => 2,
+                4 => 3,
+                5 => 4,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(actual, expected);
     }
 }
 

@@ -188,12 +188,12 @@ fn retained_visits_can_follow_precede_or_overlap_the_continuation() {
             Unfold::Source,
             Unfold::Once(0),
             Unfold::Source,
+            Unfold::Sequence([1, 2]),
             Unfold::Alongside {
                 retained,
-                earlier: 1,
+                earlier: 3,
                 next: 1,
-                tail: 2,
-                focus: [0, 1],
+                focus: [1, 2],
             },
         ],
         (&[0, 0, 1], &[(0, 1), (0, 2)]),
@@ -204,16 +204,95 @@ fn retained_visits_can_follow_precede_or_overlap_the_continuation() {
             Unfold::Source,
             Unfold::Once(0),
             Unfold::Source,
+            Unfold::Sequence([1, 2]),
             Unfold::Before {
                 retained,
-                earlier: 1,
+                earlier: 3,
                 next: 1,
-                tail: 2,
-                focus: [0, 1],
+                focus: [1, 2],
             },
         ],
         (&[0, 0, 1], &[(0, 1), (0, 2), (1, 2)]),
     );
+}
+
+#[test]
+fn a_resumption_cannot_be_inserted_into_its_original_predecessor() {
+    let global = g::seq(
+        g::send::<0, 0, g::Msg<1, ()>>().roll(),
+        g::seq(
+            g::send::<0, 0, g::Msg<2, ()>>(),
+            g::send::<0, 0, g::Msg<3, ()>>(),
+        ),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
+    let retained = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
+        .unwrap()
+        .causal_key();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let steps = [
+        Unfold::Source,
+        Unfold::Once(0),
+        Unfold::Source,
+        Unfold::Sequence([1, 2]),
+        Unfold::Alongside {
+            retained,
+            earlier: 3,
+            next: 1,
+            focus: [0, 1],
+        },
+    ];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    assert!(matches!(
+        protocol.unfolding(&steps, &mut proof),
+        Err(UnfoldingError::Step { index: 4 })
+    ));
+}
+
+#[test]
+fn a_future_visit_cannot_anchor_an_earlier_insertion() {
+    let global = g::seq(
+        g::send::<0, 0, g::Msg<1, ()>>().roll(),
+        g::seq(
+            g::send::<0, 0, g::Msg<2, ()>>(),
+            g::send::<0, 0, g::Msg<3, ()>>(),
+        ),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
+    let retained = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
+        .unwrap()
+        .causal_key();
+    let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut source_storage).unwrap();
+    let steps = [
+        Unfold::Source,
+        Unfold::Once(0),
+        Unfold::Source,
+        Unfold::Sequence([1, 2]),
+        Unfold::After {
+            retained,
+            earlier: 3,
+            next: 0,
+        },
+        Unfold::Before {
+            retained,
+            earlier: 4,
+            next: 1,
+            focus: [2, 3],
+        },
+    ];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let unfolded = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut path = vec![0; unfolded.path_workspace_len().unwrap()];
+    assert!(matches!(
+        unfolded.select(&[], &mut path),
+        Err(hibana_epf::PathError::Anchor { .. })
+    ));
 }
 
 #[test]
@@ -242,19 +321,19 @@ fn an_inserted_subtree_remains_an_insertion_point_for_another_retained_roll() {
             Unfold::Source,
             Unfold::Once(2),
             Unfold::Source,
+            Unfold::Sequence([3, 4]),
             Unfold::Alongside {
                 retained: rolls[1],
-                earlier: 3,
+                earlier: 5,
                 next: 3,
-                tail: 4,
-                focus: [0, 1],
+                focus: [1, 2],
             },
+            Unfold::Sequence([1, 6]),
             Unfold::Alongside {
                 retained: rolls[0],
-                earlier: 1,
+                earlier: 7,
                 next: 1,
-                tail: 5,
-                focus: [1, 3],
+                focus: [2, 4],
             },
         ],
         (
@@ -293,18 +372,18 @@ fn a_range_that_crosses_subtrees_cannot_remove_source_dependencies() {
         Unfold::Source,
         Unfold::Parallel([3, 4]),
         Unfold::Sequence([2, 5]),
+        Unfold::Sequence([1, 6]),
         Unfold::Alongside {
             retained,
-            earlier: 1,
+            earlier: 7,
             next: 1,
-            tail: 6,
-            focus: [0, 2],
+            focus: [1, 3],
         },
     ];
     let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(&steps)];
     assert!(matches!(
         protocol.unfolding(&steps, &mut scratch),
-        Err(UnfoldingError::Step { index: 7 })
+        Err(UnfoldingError::Step { index: 8 })
     ));
 }
 

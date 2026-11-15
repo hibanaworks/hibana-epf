@@ -209,12 +209,12 @@ fn a_retained_visit_cannot_transfer_the_same_resource_as_its_parallel_continuati
         Unfold::Sequence([0, 3]),
         Unfold::Once(4),
         Unfold::Source,
+        Unfold::Sequence([5, 6]),
         Unfold::Alongside {
             retained,
-            earlier: 5,
+            earlier: 7,
             next: 5,
-            tail: 6,
-            focus: [0, 1],
+            focus: [3, 4],
         },
     ];
     let mut source_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];

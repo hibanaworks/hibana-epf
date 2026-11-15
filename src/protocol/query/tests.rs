@@ -11,6 +11,25 @@ use hibana::{
 };
 use std::{vec, vec::Vec};
 
+impl SourcePath<'_, '_, '_> {
+    // Tests construct words directly. Production callers supply the index
+    // they already maintain when appending or restoring that same word.
+    pub(in crate::protocol) fn query_from_word(
+        &self,
+        history: impl Clone + Iterator<Item = SourcePoint>,
+        (point, actor): (SourcePoint, u8),
+        workspace: &mut [usize],
+    ) -> bool {
+        let mut prefix = vec![0; self.unfolding().event_count()];
+        for prior in history.clone() {
+            if let Some(row) = prefix.get_mut(prior.event()) {
+                *row |= prior.bit();
+            }
+        }
+        self.query_ready((history, &prefix), (point, actor), workspace)
+    }
+}
+
 #[test]
 fn an_unfinished_fixed_actor_in_a_mixed_parallel_prefix_blocks_the_whole_suffix() {
     let global = g::seq(
@@ -45,10 +64,9 @@ fn an_unfinished_fixed_actor_in_a_mixed_parallel_prefix_blocks_the_whole_suffix(
         );
     }
     let mut scratch = vec![usize::MAX; path.query_workspace_len().unwrap()];
-    assert!(!path.query_ready(
+    assert!(!path.query_from_word(
         history.into_iter(),
-        SourcePoint::Accepted(2),
-        0,
+        (SourcePoint::Accepted(2), 0),
         &mut scratch
     ));
     assert!(
@@ -88,10 +106,9 @@ fn a_mixed_parallel_prefix_does_not_require_the_other_actors_completion() {
         None
     );
     let mut scratch = vec![0; path.query_workspace_len().unwrap()];
-    assert!(path.query_ready(
+    assert!(path.query_from_word(
         history.into_iter(),
-        SourcePoint::Accepted(2),
-        0,
+        (SourcePoint::Accepted(2), 0),
         &mut scratch
     ));
 }
@@ -142,7 +159,7 @@ fn a_committed_route_arm_keeps_its_missing_receive_mandatory() {
     let history = [SourcePoint::Accepted(0), SourcePoint::Sent(0)];
     path.check_word(&history).unwrap();
     scratch.fill(usize::MAX);
-    assert!(!path.query_ready(history.into_iter(), point, 0, &mut scratch));
+    assert!(!path.query_from_word(history.into_iter(), (point, 0), &mut scratch));
     assert!(
         scratch[source.event_count()..]
             .iter()
@@ -154,7 +171,7 @@ fn a_committed_route_arm_keeps_its_missing_receive_mandatory() {
     // publication must not prevent its peer's legitimate continuation.
     let history = [SourcePoint::Accepted(0), SourcePoint::Received(0)];
     path.check_word(&history).unwrap();
-    assert!(path.query_ready(history.into_iter(), point, 0, &mut scratch));
+    assert!(path.query_from_word(history.into_iter(), (point, 0), &mut scratch));
     #[cfg(not(miri))]
     compare(&snapshot, &[Unfold::Source]);
 }
@@ -191,10 +208,9 @@ fn an_inactive_reply_cannot_skip_its_mandatory_request() {
         let mut scratch = vec![usize::MAX; path.query_workspace_len().unwrap()];
         let reply = if right { 1 } else { 3 };
         assert!(path.actors(reply).is_none());
-        assert!(!path.query_ready(
+        assert!(!path.query_from_word(
             [].into_iter(),
-            SourcePoint::Accepted(reply),
-            1,
+            (SourcePoint::Accepted(reply), 1),
             &mut scratch
         ));
         assert!(
@@ -250,28 +266,26 @@ fn a_missing_prefix_receive_skips_every_unrelated_suffix_choice() {
         reads.set(reads.get() + 1);
         None::<SourcePoint>
     });
-    assert!(!path.query_ready(history, SourcePoint::Accepted(2), 1, &mut scratch));
+    assert!(!path.query_from_word(history, (SourcePoint::Accepted(2), 1), &mut scratch));
     // Source conditions are propagated once. Unrelated choices must not
     // multiply reads of the supplied history.
     assert_eq!(reads.get(), 2);
     scratch.fill(usize::MAX);
-    assert!(!path.query_ready([].into_iter(), SourcePoint::Accepted(1), 1, &mut scratch));
+    assert!(!path.query_from_word([].into_iter(), (SourcePoint::Accepted(1), 1), &mut scratch));
     assert!(
         scratch[source.event_count()..]
             .iter()
             .all(|word| *word == usize::MAX),
         "a missing mandatory predecessor must reject before choice propagation"
     );
-    assert!(path.query_ready(
+    assert!(path.query_from_word(
         [SourcePoint::Accepted(0), SourcePoint::Received(0)].into_iter(),
-        SourcePoint::Accepted(2),
-        1,
+        (SourcePoint::Accepted(2), 1),
         &mut scratch
     ));
-    assert!(!path.query_ready(
+    assert!(!path.query_from_word(
         [SourcePoint::Accepted(0), SourcePoint::Sent(0)].into_iter(),
-        SourcePoint::Accepted(2),
-        1,
+        (SourcePoint::Accepted(2), 1),
         &mut scratch
     ));
 }
@@ -332,7 +346,11 @@ fn query_history_bounds_include_the_highest_physical_actor() {
                 ] {
                     for actor in [0, 1, 255] {
                         assert_eq!(
-                            path.query_ready(word.iter().copied(), point, actor, &mut scratch),
+                            path.query_from_word(
+                                word.iter().copied(),
+                                (point, actor),
+                                &mut scratch
+                            ),
                             reference(path, &paths, word, point, actor),
                             "point={point:?} actor={actor} history={word:?}"
                         );
@@ -381,10 +399,9 @@ fn opposite_committed_arms_reject_before_searching_unrelated_choices() {
     let history = [SourcePoint::Accepted(2), SourcePoint::Sent(2)];
     path.check_word(&history).unwrap();
     let mut scratch = vec![0; path.query_workspace_len().unwrap()];
-    assert!(!path.query_ready(
+    assert!(!path.query_from_word(
         history.into_iter(),
-        SourcePoint::Accepted(3),
-        0,
+        (SourcePoint::Accepted(3), 0),
         &mut scratch
     ));
 }
@@ -436,10 +453,9 @@ fn a_past_inactive_arm_cannot_add_a_predecessor_to_a_committed_receive() {
     ];
     path.check_word(&history).unwrap();
     let mut scratch = vec![usize::MAX; path.query_workspace_len().unwrap()];
-    assert!(!path.query_ready(
+    assert!(!path.query_from_word(
         history.into_iter(),
-        SourcePoint::Accepted(1),
-        0,
+        (SourcePoint::Accepted(1), 0),
         &mut scratch
     ));
     assert!(
@@ -490,7 +506,7 @@ fn an_uncommitted_fixed_actor_visit_blocks_later_visits_before_choice_search() {
                 Some(source.event_count())
             );
             let mut scratch = vec![usize::MAX; path.query_workspace_len().unwrap()];
-            assert!(!path.query_ready([].into_iter(), point, 0, &mut scratch));
+            assert!(!path.query_from_word([].into_iter(), (point, 0), &mut scratch));
             assert!(
                 scratch[source.event_count()..]
                     .iter()
@@ -506,7 +522,7 @@ fn an_uncommitted_fixed_actor_visit_blocks_later_visits_before_choice_search() {
             path.check_word(&history).unwrap();
             prefix[first] |= SourcePoint::Sent(first).bit();
             assert_eq!(path.fixed_prefix_blocked_until(point, 0, &prefix), None);
-            assert!(path.query_ready(history.into_iter(), point, 0, &mut scratch));
+            assert!(path.query_from_word(history.into_iter(), (point, 0), &mut scratch));
         }
     }
     #[cfg(not(miri))]
@@ -600,7 +616,11 @@ fn an_earlier_commit_does_not_hide_a_later_mandatory_child() {
                         pruned.then_some(source.event_count()),
                     );
                     let mut scratch = vec![usize::MAX; path.query_workspace_len().unwrap()];
-                    assert!(!path.query_ready(history.iter().copied(), point, 0, &mut scratch));
+                    assert!(!path.query_from_word(
+                        history.iter().copied(),
+                        (point, 0),
+                        &mut scratch
+                    ));
                     if pruned {
                         assert!(
                             scratch[source.event_count()..]
@@ -614,10 +634,10 @@ fn an_earlier_commit_does_not_hide_a_later_mandatory_child() {
                 history.push(SourcePoint::Received(second));
                 path.check_word(&history).unwrap();
                 let mut scratch = vec![0; path.query_workspace_len().unwrap()];
-                assert!(!path.query_ready(history.iter().copied(), point, 0, &mut scratch));
+                assert!(!path.query_from_word(history.iter().copied(), (point, 0), &mut scratch));
                 history.push(SourcePoint::Sent(second));
                 path.check_word(&history).unwrap();
-                assert!(path.query_ready(history.iter().copied(), point, 0, &mut scratch));
+                assert!(path.query_from_word(history.iter().copied(), (point, 0), &mut scratch));
             }
         }
         #[cfg(not(miri))]
@@ -667,7 +687,7 @@ fn blocked_candidate_spans_stop_before_an_independent_parallel_sibling() {
             None,
         );
         let mut scratch = vec![0; path.query_workspace_len().unwrap()];
-        assert!(path.query_ready([].into_iter(), SourcePoint::Accepted(3), 0, &mut scratch));
+        assert!(path.query_from_word([].into_iter(), (SourcePoint::Accepted(3), 0), &mut scratch));
     }
     #[cfg(not(miri))]
     compare(&snapshot, &steps);
@@ -712,10 +732,9 @@ fn a_missing_visit_excludes_the_remaining_sequence_of_visits() {
             Some(source.event_count()),
         );
         let mut scratch = vec![0; path.query_workspace_len().unwrap()];
-        assert!(path.query_ready(
+        assert!(path.query_from_word(
             history.into_iter(),
-            SourcePoint::Accepted(2),
-            0,
+            (SourcePoint::Accepted(2), 0),
             &mut scratch
         ));
         #[cfg(not(miri))]
@@ -786,10 +805,9 @@ fn blocked_candidate_spans_do_not_cross_a_choice_into_a_legal_continuation() {
             Some(end),
         );
         let mut scratch = vec![0; path.query_workspace_len().unwrap()];
-        assert!(path.query_ready(
+        assert!(path.query_from_word(
             history.into_iter(),
-            SourcePoint::Accepted(3),
-            0,
+            (SourcePoint::Accepted(3), 0),
             &mut scratch
         ));
         #[cfg(not(miri))]
@@ -852,10 +870,9 @@ fn conditional_queries_require_the_actual_loan_before_unrelated_suffix_choices()
             .unwrap();
         let mut scratch = vec![0; path.query_workspace_len().unwrap()];
         for actor in [1, 4] {
-            assert!(!path.query_ready(
+            assert!(!path.query_from_word(
                 core::iter::empty(),
-                SourcePoint::Accepted(4),
-                actor,
+                (SourcePoint::Accepted(4), actor),
                 &mut scratch
             ));
         }
@@ -871,10 +888,9 @@ fn conditional_queries_require_the_actual_loan_before_unrelated_suffix_choices()
         path.check_word(&history).unwrap();
         for actor in [1, 4] {
             assert_eq!(
-                path.query_ready(
+                path.query_from_word(
                     history.into_iter(),
-                    SourcePoint::Accepted(4),
-                    actor,
+                    (SourcePoint::Accepted(4), actor),
                     &mut scratch
                 ),
                 actor == if right { 4 } else { 1 }
@@ -912,19 +928,17 @@ fn a_fixed_missing_receive_rejects_without_searching_prior_unrelated_choices() {
         )
         .unwrap();
     let mut scratch = vec![0; path.query_workspace_len().unwrap()];
-    assert!(!path.query_ready(
+    assert!(!path.query_from_word(
         core::iter::empty(),
-        SourcePoint::Accepted(3),
-        0,
+        (SourcePoint::Accepted(3), 0),
         &mut scratch
     ));
     // Receipt suffices; delayed sender publication is still allowed.
     let history = [SourcePoint::Accepted(0), SourcePoint::Received(0)];
     path.check_word(&history).unwrap();
-    assert!(path.query_ready(
+    assert!(path.query_from_word(
         history.into_iter(),
-        SourcePoint::Accepted(3),
-        0,
+        (SourcePoint::Accepted(3), 0),
         &mut scratch
     ));
 }
@@ -995,7 +1009,6 @@ fn ready_from_source(path: &SourcePath, history: &[SourcePoint], point: SourcePo
                 _ => source.before(prior.event(), point.event()),
             };
             let resumed = matches!(point, SourcePoint::Accepted(_))
-                && source.has_insertions()
                 && history.iter().copied().any(|entry| {
                     !matches!(entry, SourcePoint::Accepted(_))
                         && path.point_actor(entry) == Some(actor)
@@ -1281,7 +1294,11 @@ fn compare(snapshot: &[tap::TapEvent], steps: &[Unfold]) {
                                 }
                             }
                             assert_eq!(
-                                path.query_ready(word.iter().copied(), point, actor, &mut scratch),
+                                path.query_from_word(
+                                    word.iter().copied(),
+                                    (point, actor),
+                                    &mut scratch
+                                ),
                                 reference(path, &paths, &word, point, actor),
                                 "point={point:?} actor={actor} history={word:?}"
                             );
@@ -1401,18 +1418,16 @@ fn prefix_pruning_matches_complete_search_after_retained_body_reentry() {
         let step = if before {
             Unfold::Before {
                 retained,
-                earlier: 3,
+                earlier: 7,
                 next: 3,
-                tail: 6,
-                focus: [0, 2],
+                focus: [2, 4],
             }
         } else {
             Unfold::Alongside {
                 retained,
-                earlier: 3,
+                earlier: 7,
                 next: 3,
-                tail: 6,
-                focus: [0, 2],
+                focus: [2, 4],
             }
         };
         compare(
@@ -1425,6 +1440,7 @@ fn prefix_pruning_matches_complete_search_after_retained_body_reentry() {
                 Unfold::Source,
                 Unfold::Source,
                 Unfold::Choice([4, 5]),
+                Unfold::Sequence([3, 6]),
                 step,
             ],
         );

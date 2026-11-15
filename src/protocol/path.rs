@@ -89,19 +89,20 @@ impl<'p, 'u> Unfolded<'p, 'u> {
         let (parts, scratch) =
             scratch.split_at_mut(Layout::path_index_words(self.event_count()).unwrap());
         self.index_source(parts, actors, scratch)?;
-        self.select_in(choices, actors, parts, scratch)
+        self.select_in(choices.iter().copied(), actors, parts, scratch)
     }
 
     pub(super) fn select_in<'w>(
         &self,
-        choices: &[RouteChoice],
+        choices: impl ExactSizeIterator<Item = RouteChoice> + Clone,
         actors: &'w mut [usize],
         parts: &'w [usize],
         scratch: &mut [usize],
     ) -> Result<SourcePath<'p, 'u, 'w>, PathError> {
-        for (index, choice) in choices.iter().enumerate() {
-            if choices[..index]
-                .iter()
+        for (index, choice) in choices.clone().enumerate() {
+            if choices
+                .clone()
+                .take(index)
                 .any(|prior| prior.span == choice.span)
                 || !matches!(
                     self.indexed_parts(choice.span, parts),
@@ -112,22 +113,21 @@ impl<'p, 'u> Unfolded<'p, 'u> {
             }
         }
         let mut used = 0;
-        let path =
-            self.select_by(
-                |span, _, _| {
-                    let choice = choices.iter().find(|choice| choice.span == span).ok_or(
-                        PathError::Choice {
-                            index: choices.len(),
-                        },
-                    )?;
-                    used += 1;
-                    Ok(choice.right)
-                },
-                |_, _| true,
-                actors,
-                parts,
-                scratch,
-            )?;
+        let path = self.select_by(
+            |span, _, _| {
+                let choice = choices.clone().find(|choice| choice.span == span).ok_or(
+                    PathError::Choice {
+                        index: choices.len(),
+                    },
+                )?;
+                used += 1;
+                Ok(choice.right)
+            },
+            |_, _| true,
+            actors,
+            parts,
+            scratch,
+        )?;
         if used != choices.len() {
             return Err(PathError::Choice {
                 index: choices.len(),
@@ -525,19 +525,8 @@ impl SourcePath<'_, '_, '_> {
                     Unfold::After { earlier, .. } if local >= source.count(earlier) => {
                         Some(source.count(earlier))
                     }
-                    Unfold::Alongside {
-                        earlier,
-                        next,
-                        focus,
-                        ..
-                    }
-                    | Unfold::Before {
-                        earlier,
-                        next,
-                        focus,
-                        ..
-                    } => {
-                        let start = source.count(earlier) + focus[0];
+                    Unfold::Alongside { next, focus, .. } | Unfold::Before { next, focus, .. } => {
+                        let start = focus[0];
                         if start <= local && local - start < source.count(next) {
                             source
                                 .copy_range(next, local - start)
@@ -551,22 +540,31 @@ impl SourcePath<'_, '_, '_> {
                 let Some(body) = body else {
                     return true;
                 };
-                let Some(anchor) = source.resumption_anchor(proof) else {
+                let Some(anchor) = (0..source.count(proof))
+                    .find(|&candidate| source.resumption_anchor_contains(proof, candidate))
+                else {
                     result = Err(PathError::Anchor { event });
                     return false;
                 };
-                let selected = (0..source.event_count()).any(|candidate| {
-                    self.actors(candidate).is_some()
-                        && source
-                            .local_position(candidate, proof, base)
-                            .is_some_and(|position| anchor[0] <= position && position < anchor[1])
-                });
+                if (body..source.count(proof))
+                    .any(|candidate| source.resumption_anchor_contains(proof, candidate))
+                {
+                    result = Err(PathError::Anchor { event });
+                    return false;
+                }
+                let selected =
+                    (0..source.event_count()).any(|candidate| {
+                        self.actors(candidate).is_some()
+                            && source.local_position(candidate, proof, base).is_some_and(
+                                |position| source.resumption_anchor_contains(proof, position),
+                            )
+                    });
                 if !selected {
                     result = Err(PathError::Anchor { event });
                     return false;
                 }
                 let (Some(first), Some(next)) = (
-                    source.global_position(proof, base, anchor[0]),
+                    source.global_position(proof, base, anchor),
                     source.global_position(proof, base, body),
                 ) else {
                     result = Err(PathError::Anchor { event });

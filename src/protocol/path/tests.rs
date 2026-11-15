@@ -5,6 +5,129 @@ use crate::Protocol;
 use hibana::{g, runtime::program::project, runtime::tap};
 use std::{vec, vec::Vec};
 
+#[test]
+#[cfg(not(miri))]
+fn predecessor_sweep_matches_recursive_order_for_every_six_leaf_binary_tree() {
+    use std::boxed::Box;
+    #[derive(Clone)]
+    enum Tree {
+        Leaf,
+        Branch(usize, Box<Tree>, Box<Tree>),
+    }
+    impl Tree {
+        fn leaves(&self) -> usize {
+            match self {
+                Self::Leaf => 1,
+                Self::Branch(_, left, right) => left.leaves() + right.leaves(),
+            }
+        }
+        fn index(&self, start: usize, parent: usize, rows: &mut [usize]) {
+            if let Self::Branch(kind, left, right) = self {
+                let node = start + left.leaves() - 1;
+                rows[3 * node..3 * node + 3].copy_from_slice(&[
+                    parent,
+                    start + self.leaves(),
+                    *kind,
+                ]);
+                left.index(start, node, rows);
+                right.index(node + 1, node, rows);
+            }
+        }
+        fn before(&self, first: usize, second: usize) -> bool {
+            match self {
+                Self::Leaf => false,
+                Self::Branch(kind, left, right) => {
+                    let split = left.leaves();
+                    if second < split {
+                        left.before(first, second)
+                    } else if first >= split {
+                        right.before(first - split, second - split)
+                    } else {
+                        first < second && *kind == 0
+                    }
+                }
+            }
+        }
+    }
+    fn trees(leaves: usize) -> Vec<Tree> {
+        if leaves == 1 {
+            return vec![Tree::Leaf];
+        }
+        let mut result = Vec::new();
+        for split in 1..leaves {
+            for left in trees(split) {
+                for right in trees(leaves - split) {
+                    for kind in 0..3 {
+                        result.push(Tree::Branch(
+                            kind,
+                            Box::new(left.clone()),
+                            Box::new(right.clone()),
+                        ));
+                    }
+                }
+            }
+        }
+        result
+    }
+    // Borrow a real selected six-event path. Each synthetic immutable index
+    // enumerates one whole binary interval tree, including inactive routes;
+    // structural order does not depend on the selected actors or route arms.
+    let global = g::seq(
+        g::seq(
+            g::send::<0, 0, g::Msg<1, ()>>(),
+            g::send::<0, 0, g::Msg<2, ()>>(),
+        ),
+        g::seq(
+            g::seq(
+                g::send::<0, 0, g::Msg<3, ()>>(),
+                g::send::<0, 0, g::Msg<4, ()>>(),
+            ),
+            g::seq(
+                g::send::<0, 0, g::Msg<5, ()>>(),
+                g::send::<0, 0, g::Msg<6, ()>>(),
+            ),
+        ),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let steps = [Unfold::Source];
+    let mut expansion = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut expansion).unwrap();
+    let mut selection = vec![0; source.path_workspace_len().unwrap()];
+    let path = source.select(&[], &mut selection).unwrap();
+    let mut checked = 0;
+    for leaves in 1..=6 {
+        for tree in trees(leaves) {
+            let mut index = vec![usize::MAX; 3 * (leaves - 1)];
+            tree.index(0, usize::MAX, &mut index);
+            let path = SourcePath {
+                index: &index,
+                ..path
+            };
+            let mut rows = vec![usize::MAX; leaves];
+            for second in (0..leaves).chain((0..leaves).rev()) {
+                path.mark_source_before(second, &mut rows);
+                for (first, row) in rows.iter().enumerate() {
+                    let expected = first < second && tree.before(first, second);
+                    assert_eq!(path.source_before(first, second), expected);
+                    assert_eq!(row & super::super::word::SOURCE_ORDER != 0, expected);
+                    assert_eq!(row | super::super::word::SOURCE_ORDER, usize::MAX);
+                }
+                path.mark_source_after(second, &mut rows);
+                for (other, row) in rows.iter().enumerate() {
+                    let expected = second < other && tree.before(second, other);
+                    assert_eq!(path.source_before(second, other), expected);
+                    assert_eq!(row & super::super::word::SOURCE_ORDER != 0, expected);
+                    assert_eq!(row | super::super::word::SOURCE_ORDER, usize::MAX);
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 11497);
+}
+
 fn pairwise_conflict(source: &Unfolded, actors: &[usize]) -> Option<(usize, usize)> {
     for first in 0..actors.len() {
         if actors[first] == usize::MAX {
@@ -127,35 +250,31 @@ fn nested_insertions_preserve_the_independent_subtrees_proof_order() {
         let inner = if before {
             Unfold::Before {
                 retained: retained(1, 2),
-                earlier: 1,
+                earlier: 7,
                 next: 1,
-                tail: 6,
-                focus: [1, 2],
+                focus: [2, 3],
             }
         } else {
             Unfold::Alongside {
                 retained: retained(1, 2),
-                earlier: 1,
+                earlier: 7,
                 next: 1,
-                tail: 6,
-                focus: [1, 2],
+                focus: [2, 3],
             }
         };
         let outer = if before {
             Unfold::Before {
                 retained: retained(0, 1),
-                earlier: 9,
-                next: 9,
-                tail: 7,
-                focus: [1, 2],
+                earlier: 11,
+                next: 10,
+                focus: [2, 3],
             }
         } else {
             Unfold::Alongside {
                 retained: retained(0, 1),
-                earlier: 9,
-                next: 9,
-                tail: 7,
-                focus: [1, 2],
+                earlier: 11,
+                next: 10,
+                focus: [2, 3],
             }
         };
         let steps = [
@@ -166,9 +285,11 @@ fn nested_insertions_preserve_the_independent_subtrees_proof_order() {
             Unfold::Source,
             Unfold::Once(4),
             Unfold::Independent([3, 5]),
+            Unfold::Sequence([1, 6]),
             inner,
             Unfold::Source,
-            Unfold::Once(8),
+            Unfold::Once(9),
+            Unfold::Sequence([10, 8]),
             outer,
         ];
         compare_actor_subsets(&snapshot, &steps);
@@ -249,21 +370,20 @@ fn an_inserted_occurrence_cannot_hide_a_conflict_between_tail_visits() {
                 Unfold::Source,
                 Unfold::Once(4),
                 Unfold::Independent([3, 5]),
+                Unfold::Sequence([1, 6]),
                 if before {
                     Unfold::Before {
                         retained,
-                        earlier: 1,
+                        earlier: 7,
                         next: 1,
-                        tail: 6,
-                        focus,
+                        focus: [focus[0] + 1, focus[1] + 1],
                     }
                 } else {
                     Unfold::Alongside {
                         retained,
-                        earlier: 1,
+                        earlier: 7,
                         next: 1,
-                        tail: 6,
-                        focus,
+                        focus: [focus[0] + 1, focus[1] + 1],
                     }
                 },
             ];
@@ -295,7 +415,9 @@ fn an_inserted_occurrence_cannot_hide_a_conflict_between_tail_visits() {
                 assert!(!source.independent_between(left, inserted));
                 assert!(!source.independent_between(inserted, right));
                 assert!(source.independent_between(left, right));
-                assert_eq!(order, [0, 2, 1, 3]);
+                // The complete earlier proof stays contiguous around its
+                // independent tail; the resumed proof is a separate block.
+                assert_eq!(order, [2, 0, 1, 3]);
             }
         }
     }

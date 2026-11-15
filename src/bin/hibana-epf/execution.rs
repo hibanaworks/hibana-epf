@@ -31,15 +31,6 @@ pub(super) fn audit(args: Vec<String>) -> Result<(), String> {
         .flat_map(|(producer, capture)| std::iter::repeat_n(producer, capture.records().len()))
         .collect();
     let mut unfolding = vec![Unfold::Source; capacity];
-    let mut choices = vec![
-        RouteChoice {
-            span: [0, 0],
-            right: false
-        };
-        protocol
-            .audit_choice_capacity(capacity)
-            .map_err(|e| format!("audit: {e:?}"))?
-    ];
     let mut order = vec![
         RecordId {
             producer: 0,
@@ -66,7 +57,6 @@ pub(super) fn audit(args: Vec<String>) -> Result<(), String> {
             &captures,
             AuditStorage {
                 unfolding: &mut unfolding,
-                choices: &mut choices,
                 execution: ExecutionStorage {
                     session,
                     observed_producers: &observed_producers,
@@ -153,8 +143,8 @@ pub(super) fn check(args: Vec<String>) -> Result<(), String> {
     write_execution(unfolding, &witness)
 }
 
-// Big-endian host evidence format, version 1: magic, session:u32, four u64
-// counts; then seven-u64 unfolding rows and three-u64 choice/order/acceptance
+// Big-endian host evidence format, version 2: magic, session:u32, four u64
+// counts; then six-u64 unfolding rows and three-u64 choice/order/acceptance
 // rows. An absent occurrence is u64::MAX. Counts must exactly fit the file.
 // This codec grants no authority; the library checks every proposed relation.
 struct Candidate {
@@ -168,7 +158,7 @@ struct Candidate {
 
 impl Candidate {
     fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() < 44 || &bytes[..8] != b"HEPC\0\0\0\x01" {
+        if bytes.len() < 44 || &bytes[..8] != b"HEPC\0\0\0\x02" {
             return Err("invalid execution-witness header".into());
         }
         let session = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
@@ -185,7 +175,7 @@ impl Candidate {
         let length =
             counts
                 .iter()
-                .zip([56usize, 24, 24, 24])
+                .zip([48usize, 24, 24, 24])
                 .try_fold(44usize, |total, (count, stride)| {
                     count
                         .checked_mul(stride)
@@ -202,8 +192,8 @@ impl Candidate {
         };
         let mut unfolding = Vec::with_capacity(counts[0]);
         for _ in 0..counts[0] {
-            let values = row(7);
-            let [tag, a, b, c, d, e, f] = values[..] else {
+            let values = row(6);
+            let [tag, a, b, c, d, e] = values[..] else {
                 unreachable!()
             };
             unfolding.push(match tag {
@@ -223,7 +213,7 @@ impl Candidate {
                 7..=9 => {
                     let retained = u16::try_from(a).map_err(|_| "invalid retained scope")?;
                     match tag {
-                        7 if [d, e, f] == [0; 3] => Unfold::After {
+                        7 if [d, e] == [0; 2] => Unfold::After {
                             retained,
                             earlier: number(b)?,
                             next: number(c)?,
@@ -232,15 +222,13 @@ impl Candidate {
                             retained,
                             earlier: number(b)?,
                             next: number(c)?,
-                            tail: number(d)?,
-                            focus: [number(e)?, number(f)?],
+                            focus: [number(d)?, number(e)?],
                         },
                         9 => Unfold::Before {
                             retained,
                             earlier: number(b)?,
                             next: number(c)?,
-                            tail: number(d)?,
-                            focus: [number(e)?, number(f)?],
+                            focus: [number(d)?, number(e)?],
                         },
                         _ => return Err("invalid unfolding row".into()),
                     }

@@ -6,8 +6,7 @@ use hibana::{
     },
 };
 use hibana_epf::{
-    Acceptance, AuditError, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId,
-    RouteChoice, Unfold,
+    Acceptance, AuditError, AuditStorage, Capture, ExecutionStorage, Protocol, RecordId, Unfold,
 };
 
 fn local(ordinal: usize, source: u16, lane: u8) -> TapEvent {
@@ -31,13 +30,6 @@ fn check(
     let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
     let captures = [Capture::new(records, Some(records.len() as u32)).unwrap()];
     let mut steps = vec![Unfold::Source; capacity];
-    let mut choices = vec![
-        RouteChoice {
-            span: [0, 0],
-            right: false
-        };
-        protocol.audit_choice_capacity(capacity).unwrap()
-    ];
     let mut order = vec![
         RecordId {
             producer: usize::MAX,
@@ -62,7 +54,6 @@ fn check(
         &captures,
         AuditStorage {
             unfolding: &mut steps,
-            choices: &mut choices,
             execution: ExecutionStorage {
                 session: 1,
                 observed_producers: &observed_producers,

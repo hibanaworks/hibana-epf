@@ -125,7 +125,7 @@ fn impossible_directions_and_fixed_actors_reject_before_choice_search() {
                 {
                     // An impossible direction or constant actor cannot be fixed
                     // by changing thousands of unrelated future route choices.
-                    assert!(!path.query_ready(core::iter::empty(), point, actor, &mut []));
+                    assert!(!path.query_from_word(core::iter::empty(), (point, actor), &mut []));
                 }
             }
         }
@@ -169,7 +169,7 @@ fn completed_points_reject_without_searching_unrelated_choices() {
         for actor in [0, 1, 255] {
             // A completed occurrence needs no alternate-path workspace,
             // even though this unfolding contains a different route.
-            assert!(!path.query_ready(history.into_iter(), point, actor, &mut []));
+            assert!(!path.query_from_word(history.into_iter(), (point, actor), &mut []));
         }
     }
 }
@@ -248,21 +248,20 @@ fn prerequisite_factoring_matches_the_unfactored_rule_for_every_point_subset() {
                 Unfold::Source,
                 Unfold::Once(0),
                 Unfold::Source,
+                Unfold::Sequence([1, 2]),
                 if before {
                     Unfold::Before {
                         retained,
-                        earlier: 1,
+                        earlier: 3,
                         next: 1,
-                        tail: 2,
-                        focus: [0, 1],
+                        focus: [2, 3],
                     }
                 } else {
                     Unfold::Alongside {
                         retained,
-                        earlier: 1,
+                        earlier: 3,
                         next: 1,
-                        tail: 2,
-                        focus: [0, 1],
+                        focus: [2, 3],
                     }
                 },
             ];

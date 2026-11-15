@@ -569,9 +569,8 @@ impl SourcePath<'_, '_, '_> {
                             if let Some(point) = execution::operation_point(row, record, event) {
                                 if record.id() == tap::SEND_POLL {
                                     if !self.query_ready(
-                                        execution::points(&word[..word_len]),
-                                        point,
-                                        (record.causal_key() >> 8) as u8,
+                                        (execution::points(&word[..word_len]), prefix),
+                                        (point, (record.causal_key() >> 8) as u8),
                                         query,
                                     ) {
                                         continue;
@@ -599,9 +598,8 @@ impl SourcePath<'_, '_, '_> {
                                 point.query_preconditions(|prior| {
                                     prefix[prior.event()] & prior.bit() != 0
                                 }) && self.query_ready(
-                                    execution::points(&word[..word_len]),
-                                    point,
-                                    (record.causal_key() >> 8) as u8,
+                                    (execution::points(&word[..word_len]), prefix),
+                                    (point, (record.causal_key() >> 8) as u8),
                                     query,
                                 )
                             }) {

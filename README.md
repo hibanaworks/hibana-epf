@@ -306,7 +306,11 @@ compiled source. Its postorder steps preserve sequence, parallel composition,
 both choice arms, repeated and independently unfolded rolls, and resumption
 before, alongside or after the continuation. Source regions are derived from
 the compiled root. A shared proof step must refer to the same source region;
-an insertion must name an actual subtree. No catalogue of fixed visit counts
+an insertion must name an actual continuation subtree in the complete earlier
+expansion. Several retained rolls can therefore resume within the same
+continuation without discarding earlier insertions. An earlier visit must
+precede the inserted body; a future visit cannot supply its anchor.
+No catalogue of fixed visit counts
 limits the witness. The unfolding witness retains five words per proof step;
 the selected path's expanded lookup storage is sized separately.
 
@@ -409,12 +413,19 @@ existing Lean claims below do not prove the entire Rust implementation.
 `Protocol::audit(captures, storage, workspace)` constructs the unfolding,
 per-visit route selections, causal order, source attributions and supported
 acceptance intervals. Its only protocol input is the checked compiled snapshot.
-`AuditStorage` holds the output derivation, route choices and execution evidence;
-`audit_choice_capacity` and `audit_workspace_len` derive storage sizes from that
+`AuditStorage` holds the output derivation and execution evidence;
+`audit_workspace_len` derives temporary storage, including route candidates, from that
 capacity, the compiled source and the complete captures. The returned `Audit`
 borrows those outputs and the retained proof and actor workspace.
 
 The first candidate uses observed commit counts to guide repeated bodies.
+Retained visits use entry observations from actors participating in both bodies
+to suggest their position among continuation visits. Different senders can begin
+in one order while a shared receiver consumes their frames in the other. Only
+the same actor's observations within one producer supply an order preference;
+missing or conflicting hints preserve the source preference. Ordinals do not
+order different producers. The source, actor, ownership and
+execution checks still decide whether any proposed tree is acceptable.
 Opposite route arms add their visit demands; sequential and parallel children
 share visits, while nested rolls account for their own repetitions.
 Nested roll counts are not divided by enclosing visits that selected another

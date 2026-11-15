@@ -1,5 +1,5 @@
 //! Readiness of an uncommitted attempt against the committed source prefix.
-use super::{Layout, PathError, SourcePath, SourcePoint, unfolding::NodeKind};
+use super::{Layout, PathError, SourcePath, SourcePoint, unfolding::NodeKind, word::SOURCE_ORDER};
 
 impl SourcePath<'_, '_, '_> {
     pub(super) fn query_workspace_len(&self) -> Option<usize> {
@@ -144,9 +144,8 @@ impl SourcePath<'_, '_, '_> {
     /// Search only constructs retrospective evidence; it never drives a view.
     pub(super) fn query_ready(
         &self,
-        history: impl Clone + Iterator<Item = SourcePoint>,
-        point: SourcePoint,
-        actor: u8,
+        (history, prefix): (impl Clone + Iterator<Item = SourcePoint>, &[usize]),
+        (point, actor): (SourcePoint, u8),
         workspace: &mut [usize],
     ) -> bool {
         let Some((side, binding)) = self.point_binding(point) else {
@@ -157,7 +156,11 @@ impl SourcePath<'_, '_, '_> {
         }
         // A different choice cannot undo publication or repeat a committed
         // point of this same unfolding. Acceptance alone is not publication.
-        if !point.query_preconditions(|prior| history.clone().any(|entry| entry == prior)) {
+        if !point.query_preconditions(|prior| {
+            prefix
+                .get(prior.event())
+                .is_some_and(|points| points & prior.bit() != 0)
+        }) {
             return false;
         }
         let mandatory = |prior: SourcePoint, prefix: Option<&[usize]>| {
@@ -184,12 +187,13 @@ impl SourcePath<'_, '_, '_> {
                 SourcePoint::Received(event),
             ]
             .into_iter()
-            .any(|prior| mandatory(prior, None) && !history.clone().any(|entry| entry == prior))
+            .any(|prior| mandatory(prior, None) && prefix[prior.event()] & prior.bit() == 0)
         {
             return false;
         }
         let source = self.unfolding();
         let count = source.event_count();
+        assert_eq!(prefix.len(), count, "checked source word index length");
         let (domains, storage) = workspace.split_at_mut(count);
         let (choices, storage) = storage.split_at_mut(count);
         let (actors, scratch) = storage.split_at_mut(count);
@@ -209,20 +213,31 @@ impl SourcePath<'_, '_, '_> {
         let introduced = (binding == u32::from(actor)
             && self.point_actor(introduced) != Some(actor))
         .then_some(introduced);
-        domains.fill(0);
-        for prior in history.clone() {
-            if let Some(row) = domains.get_mut(prior.event()) {
-                *row |= bit(prior);
-            }
-            if let Some(introduced) = introduced
-                && matches!(prior, SourcePoint::Local(_) | SourcePoint::Received(_))
-                && prior.event() >= introduced.event()
-                && self.point_actor(prior) == Some(actor)
-                && self.prerequisite(history.clone(), prior)(introduced, actor)
-            {
-                return false;
+        // The interpreter and final checker already maintain exact membership
+        // of this checked word. Copy only point bits; attribution and choice
+        // bookkeeping are not committed source points. Keep the full word
+        // for the independent resumption/conditional-actor checks below.
+        for (domain, points) in domains.iter_mut().zip(prefix) {
+            *domain = points & 60;
+        }
+        if let Some(introduced) = introduced {
+            self.mark_source_after(introduced.event(), domains);
+            for prior in history.clone() {
+                if matches!(prior, SourcePoint::Local(_) | SourcePoint::Received(_))
+                    && prior.event() >= introduced.event()
+                    && self.prerequisite_ordered(history.clone(), prior)(
+                        introduced,
+                        actor,
+                        domains[prior.event()] & SOURCE_ORDER != 0,
+                    )
+                    && self.point_actor(prior) == Some(actor)
+                {
+                    return false;
+                }
             }
         }
+        self.mark_source_before(point.event(), domains);
+        let required = self.prerequisite_ordered(history.clone(), point);
         if self
             .fixed_prefix_blocked_until(point, actor, domains)
             .is_some()
@@ -230,11 +245,11 @@ impl SourcePath<'_, '_, '_> {
             return false;
         }
         if self.point_actor(point) == Some(actor) {
-            let missing = self.missing(history.clone(), point, |prior| {
-                domains
-                    .get(prior.event())
-                    .is_some_and(|row| row & bit(prior) != 0)
-            });
+            let missing = self.missing_with(
+                point,
+                |prior| domains[prior.event()] & bit(prior) != 0,
+                |prior, actor| required(prior, actor, domains[prior.event()] & SOURCE_ORDER != 0),
+            );
             let Some(prior) = missing else {
                 return true;
             };
@@ -254,7 +269,6 @@ impl SourcePath<'_, '_, '_> {
         // force their containing arms. Sequence/par need both children, while
         // a choice needs one viable child. Conditional holders are left to
         // full selection and execution checking below.
-        let required = self.prerequisite(history.clone(), point);
         let mut viable = false;
         {
             // Reuse the future choice/actor arrays and selection scratch as a
@@ -326,7 +340,11 @@ impl SourcePath<'_, '_, '_> {
                             self.point_binding(prior).is_some_and(|(_, binding)| {
                                 binding == u32::from(actor)
                                     && domains[prior.event()] & bit(prior) == 0
-                                    && required(prior, actor)
+                                    && required(
+                                        prior,
+                                        actor,
+                                        domains[prior.event()] & SOURCE_ORDER != 0,
+                                    )
                             })
                         });
                     depth -= 1;
@@ -433,11 +451,17 @@ impl SourcePath<'_, '_, '_> {
         let available = |path: &SourcePath<'_, '_, '_>| {
             path.point_actor(point) == Some(actor)
                 && path
-                    .missing(history.clone(), point, |prior| {
-                        domains
-                            .get(prior.event())
-                            .is_some_and(|row| row & bit(prior) != 0)
-                    })
+                    .missing_with(
+                        point,
+                        |prior| domains[prior.event()] & bit(prior) != 0,
+                        |prior, actor| {
+                            path.prerequisite_ordered(history.clone(), point)(
+                                prior,
+                                actor,
+                                domains[prior.event()] & SOURCE_ORDER != 0,
+                            )
+                        },
+                    )
                     .is_none()
         };
         choices.fill(0);
@@ -483,7 +507,7 @@ impl SourcePath<'_, '_, '_> {
                             }
                         } else if (actual[side] == actor
                             && event <= point.event()
-                            && required(prior, actor))
+                            && required(prior, actor, domains[prior.event()] & SOURCE_ORDER != 0))
                             || (self.point_actor(prior) != Some(actual[side])
                                 && newly_required(prior, actual[side]))
                         {

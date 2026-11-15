@@ -37,7 +37,7 @@ pub enum Unfold {
         retained: u16,
         earlier: usize,
         next: usize,
-        tail: usize,
+        /// Subtree in the complete earlier expansion, including prior insertions.
         focus: [usize; 2],
     },
     /// Insert a resumed roll before one subtree of its continuation.
@@ -45,7 +45,6 @@ pub enum Unfold {
         retained: u16,
         earlier: usize,
         next: usize,
-        tail: usize,
         focus: [usize; 2],
     },
 }
@@ -96,7 +95,16 @@ enum Head {
 enum InsertPart {
     Earlier(usize),
     Resumed(usize),
-    Continuation(usize),
+}
+
+fn insertion_part(event: usize, start: usize, added: usize) -> InsertPart {
+    if event < start {
+        InsertPart::Earlier(event)
+    } else if event - start < added {
+        InsertPart::Resumed(event - start)
+    } else {
+        InsertPart::Earlier(event - added)
+    }
 }
 
 impl<'p> Protocol<'p> {
@@ -206,24 +214,21 @@ impl<'p> Protocol<'p> {
                         retained,
                         earlier,
                         next,
-                        tail,
                         ..
                     }
                     | Unfold::Before {
                         retained,
                         earlier,
                         next,
-                        tail,
                         ..
                     },
-                    Head::Sequence([left, right]),
+                    Head::Sequence([left, _]),
                 ) => {
                     let source = layout
                         .retained(*self, left, retained)
                         .ok_or(UnfoldingError::Step { index })?;
-                    assign(earlier, left)?;
+                    assign(earlier, expected)?;
                     assign(next, source)?;
-                    assign(tail, right)?;
                 }
                 _ => return Err(UnfoldingError::Step { index }),
             }
@@ -251,23 +256,36 @@ impl<'p> Protocol<'p> {
                 Unfold::Alongside {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 }
                 | Unfold::Before {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 } => {
-                    if subtree_at(*self, steps, rows, tail, focus, focus[0]).is_none() {
+                    if subtree_at(*self, steps, rows, earlier, focus, focus[0]).is_none() {
+                        return Err(UnfoldingError::Step { index });
+                    }
+                    let Some(Head::Sequence([_, right])) = layout.head(*self, get(rows, index))
+                    else {
+                        return Err(UnfoldingError::Step { index });
+                    };
+                    let prior = Unfolded {
+                        protocol: *self,
+                        steps: &steps[..=earlier],
+                        rows: &rows[..5 * (earlier + 1)],
+                    };
+                    if (focus[0]..focus[1]).any(|event| {
+                        !prior.origin(event).is_some_and(|origin| {
+                            right.start <= usize::from(origin) && usize::from(origin) < right.end
+                        })
+                    }) {
                         return Err(UnfoldingError::Step { index });
                     }
                     count(earlier)
                         .checked_add(count(next))
-                        .and_then(|n| n.checked_add(count(tail)))
                         .ok_or(UnfoldingError::Overflow { index })?
                 }
             };
@@ -327,19 +345,17 @@ impl Unfolded<'_, '_> {
                 } if local >= self.count(earlier) && contains(retained) => resumed = true,
                 Unfold::Alongside {
                     retained,
-                    earlier,
                     next,
                     focus,
                     ..
                 }
                 | Unfold::Before {
                     retained,
-                    earlier,
                     next,
                     focus,
                     ..
                 } => {
-                    let start = self.count(earlier) + focus[0];
+                    let start = focus[0];
                     if start <= local && local - start < self.count(next) && contains(retained) {
                         resumed = true;
                     }
@@ -391,34 +407,25 @@ impl Unfolded<'_, '_> {
                 Unfold::Alongside {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 }
                 | Unfold::Before {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
-                } => {
-                    if event < self.count(earlier) {
-                        at = earlier;
-                        continue;
-                    }
-                    event -= self.count(earlier);
-                    base += self.count(earlier);
-                    if focus[0] <= event && event - focus[0] < self.count(next) {
-                        event -= focus[0];
+                } => match insertion_part(event, focus[0], self.count(next)) {
+                    InsertPart::Resumed(local) => {
+                        event = local;
                         at = next;
-                    } else {
-                        if event >= focus[0] {
-                            event -= self.count(next);
-                        }
-                        base += self.count(next);
-                        at = tail;
                     }
-                }
+                    InsertPart::Earlier(local) => {
+                        event = local;
+                        base += self.count(next);
+                        at = earlier;
+                    }
+                },
             }
         }
     }
@@ -464,10 +471,18 @@ impl Unfolded<'_, '_> {
         }
     }
 
-    pub(super) fn has_insertions(&self) -> bool {
-        self.steps
-            .iter()
-            .any(|step| matches!(step, Unfold::Alongside { .. } | Unfold::Before { .. }))
+    pub(super) fn resumption_target(&self, event: usize) -> bool {
+        let mut target = false;
+        self.contexts(event, |proof, _, local| {
+            if let Unfold::Alongside { next, focus, .. } | Unfold::Before { next, focus, .. } =
+                self.steps[proof]
+            {
+                let added = self.count(next);
+                target = focus[0] + added <= local && local < focus[1] + added;
+            }
+            !target
+        });
+        target
     }
 
     pub(super) fn same_resumption(
@@ -517,45 +532,30 @@ impl Unfolded<'_, '_> {
                 Unfold::Alongside {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 }
                 | Unfold::Before {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 } => {
-                    let start = self.count(earlier) + focus[0];
+                    let start = focus[0];
                     let stop = start + self.count(next);
                     if start <= prior
                         && prior < stop
                         && start <= entered
                         && entered < stop
                         && stop <= target
-                        && target < self.count(earlier) + focus[1] + self.count(next)
+                        && target < focus[1] + self.count(next)
                         && self.copy_range(next, prior - start).is_some_and(|copy| {
                             self.copy_range(next, entered - start) == Some(copy)
                         })
                     {
                         return true;
                     }
-                    let locate = |event: usize| {
-                        if event < self.count(earlier) {
-                            InsertPart::Earlier(event)
-                        } else if start <= event && event < stop {
-                            InsertPart::Resumed(event - start)
-                        } else {
-                            let local = event - self.count(earlier);
-                            InsertPart::Continuation(if local >= focus[0] {
-                                local - self.count(next)
-                            } else {
-                                local
-                            })
-                        }
-                    };
+                    let locate = |event| insertion_part(event, start, self.count(next));
                     let (child, positions) = match (locate(prior), locate(target), locate(entered))
                     {
                         (
@@ -568,11 +568,6 @@ impl Unfolded<'_, '_> {
                             InsertPart::Resumed(t),
                             InsertPart::Resumed(e),
                         ) => (next, [p, t, e]),
-                        (
-                            InsertPart::Continuation(p),
-                            InsertPart::Continuation(t),
-                            InsertPart::Continuation(e),
-                        ) => (tail, [p, t, e]),
                         _ => return false,
                     };
                     at = child;
@@ -582,53 +577,52 @@ impl Unfolded<'_, '_> {
         }
     }
 
-    pub(super) fn resumption_anchor(&self, proof: usize) -> Option<[usize; 2]> {
+    pub(super) fn resumption_anchor_contains(&self, proof: usize, event: usize) -> bool {
         match self.steps[proof] {
             Unfold::After {
                 retained, earlier, ..
-            } => match self.steps[earlier] {
-                Unfold::Sequence([focused, _]) => self.anchor(focused, retained),
-                Unfold::Source => {
-                    let layout = Layout::checked(self.protocol);
-                    let region = get(self.rows, earlier);
-                    let Head::Sequence([left, _]) = layout.head(self.protocol, region)? else {
-                        return None;
-                    };
-                    let scope = layout.retained(self.protocol, left, retained)?;
-                    Some([scope.start - region.start, scope.end - region.start])
-                }
-                _ => None,
-            },
+            } => event < self.count(earlier) && self.anchor_contains(earlier, retained, event),
             Unfold::Alongside {
-                retained, earlier, ..
+                retained,
+                earlier,
+                next,
+                focus,
             }
             | Unfold::Before {
-                retained, earlier, ..
-            } => self.anchor(earlier, retained),
-            _ => None,
+                retained,
+                earlier,
+                next,
+                focus,
+            } => match insertion_part(event, focus[0], self.count(next)) {
+                InsertPart::Earlier(local) => self.anchor_contains(earlier, retained, local),
+                InsertPart::Resumed(_) => false,
+            },
+            _ => false,
         }
     }
 
-    fn anchor(&self, mut at: usize, retained: u16) -> Option<[usize; 2]> {
+    fn anchor_contains(&self, mut at: usize, retained: u16, mut event: usize) -> bool {
         let layout = Layout::checked(self.protocol);
-        let target = layout.canonical(
-            self.protocol,
-            layout.retained(self.protocol, get(self.rows, at), retained)?,
-        );
-        let mut base = 0;
+        let Some(scope) = layout.retained(self.protocol, get(self.rows, at), retained) else {
+            return false;
+        };
+        let target = layout.canonical(self.protocol, scope);
         loop {
+            if event >= self.count(at) {
+                return false;
+            }
             if get(self.rows, at) == target {
                 return match self.steps[at] {
-                    Unfold::Source | Unfold::Once(_) => Some([base, base + self.count(at)]),
-                    Unfold::More([earlier, next]) => Some([
-                        base + self.count(earlier),
-                        base + self.count(earlier) + self.count(next),
-                    ]),
-                    _ => None,
+                    Unfold::Source | Unfold::Once(_) => true,
+                    Unfold::More([earlier, _]) => self.count(earlier) <= event,
+                    _ => false,
                 };
             }
             match self.steps[at] {
-                Unfold::Sequence([a, b]) | Unfold::Parallel([a, b]) | Unfold::Choice([a, b]) => {
+                Unfold::Sequence([a, b])
+                | Unfold::Parallel([a, b])
+                | Unfold::Choice([a, b])
+                | Unfold::Independent([a, b]) => {
                     if layout
                         .retained(self.protocol, get(self.rows, a), retained)
                         .is_some()
@@ -638,26 +632,81 @@ impl Unfolded<'_, '_> {
                         .retained(self.protocol, get(self.rows, b), retained)
                         .is_some()
                     {
-                        base += self.count(a);
+                        if event < self.count(a) {
+                            return false;
+                        }
+                        event -= self.count(a);
                         at = b;
                     } else {
-                        return None;
+                        return false;
                     }
                 }
                 Unfold::Source => {
                     let region = get(self.rows, at);
-                    let scope = layout.retained(self.protocol, region, retained)?;
-                    return Some([
-                        base + scope.start - region.start,
-                        base + scope.end - region.start,
-                    ]);
+                    return scope.start - region.start <= event && event < scope.end - region.start;
                 }
                 Unfold::Once(body) => at = body,
                 Unfold::More([earlier, next]) => {
-                    base += self.count(earlier);
+                    if event < self.count(earlier) {
+                        return false;
+                    }
+                    event -= self.count(earlier);
                     at = next;
                 }
-                _ => return None,
+                Unfold::After {
+                    retained: resumed,
+                    earlier,
+                    next,
+                } => {
+                    if resumed == retained {
+                        return self.count(earlier) <= event;
+                    }
+                    if layout
+                        .retained(self.protocol, get(self.rows, next), retained)
+                        .is_some()
+                    {
+                        if event < self.count(earlier) {
+                            return false;
+                        }
+                        event -= self.count(earlier);
+                        at = next;
+                    } else {
+                        at = earlier;
+                    }
+                }
+                Unfold::Alongside {
+                    earlier,
+                    next,
+                    focus,
+                    ..
+                }
+                | Unfold::Before {
+                    earlier,
+                    next,
+                    focus,
+                    ..
+                } => match insertion_part(event, focus[0], self.count(next)) {
+                    InsertPart::Resumed(local) => {
+                        if layout
+                            .retained(self.protocol, get(self.rows, next), retained)
+                            .is_none()
+                        {
+                            return false;
+                        }
+                        event = local;
+                        at = next;
+                    }
+                    InsertPart::Earlier(local) => {
+                        if layout
+                            .retained(self.protocol, get(self.rows, next), retained)
+                            .is_some()
+                        {
+                            return false;
+                        }
+                        event = local;
+                        at = earlier;
+                    }
+                },
             }
         }
     }
@@ -723,42 +772,28 @@ impl Unfolded<'_, '_> {
                 Unfold::Alongside {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 }
                 | Unfold::Before {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 } => {
-                    if second < count(earlier) {
-                        at = earlier;
-                        continue;
-                    }
-                    if first < count(earlier) {
-                        return false;
-                    }
-                    first -= count(earlier);
-                    second -= count(earlier);
-                    let inserted =
-                        |event: usize| focus[0] <= event && event - focus[0] < count(next);
-                    match (inserted(first), inserted(second)) {
-                        (true, true) => {
-                            first -= focus[0];
-                            second -= focus[0];
-                            at = next;
+                    match (
+                        insertion_part(first, focus[0], count(next)),
+                        insertion_part(second, focus[0], count(next)),
+                    ) {
+                        (InsertPart::Earlier(a), InsertPart::Earlier(b)) => {
+                            first = a;
+                            second = b;
+                            at = earlier;
                         }
-                        (false, false) => {
-                            if first >= focus[0] {
-                                first -= count(next);
-                            }
-                            if second >= focus[0] {
-                                second -= count(next);
-                            }
-                            at = tail;
+                        (InsertPart::Resumed(a), InsertPart::Resumed(b)) => {
+                            first = a;
+                            second = b;
+                            at = next;
                         }
                         _ => return false,
                     }
@@ -803,32 +838,24 @@ impl Unfolded<'_, '_> {
                 Unfold::Alongside {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 }
                 | Unfold::Before {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
-                } => {
-                    if event < count(earlier) {
+                } => match insertion_part(event, focus[0], count(next)) {
+                    InsertPart::Earlier(local) => {
+                        event = local;
                         at = earlier;
-                        continue;
                     }
-                    event -= count(earlier);
-                    if focus[0] <= event && event - focus[0] < count(next) {
-                        event -= focus[0];
+                    InsertPart::Resumed(local) => {
+                        event = local;
                         at = next;
-                    } else {
-                        if event >= focus[0] {
-                            event -= count(next);
-                        }
-                        at = tail;
                     }
-                }
+                },
             }
         }
     }
@@ -878,55 +905,42 @@ impl Unfolded<'_, '_> {
                 Unfold::Alongside {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 }
                 | Unfold::Before {
                     earlier,
                     next,
-                    tail,
                     focus,
                     ..
                 } => {
                     let preceding = matches!(self.steps[at], Unfold::Before { .. });
-                    if second < count(earlier) {
-                        at = earlier;
-                        continue;
-                    }
-                    if first < count(earlier) {
-                        return true;
-                    }
-                    first -= count(earlier);
-                    second -= count(earlier);
-                    let inserted =
-                        |event: usize| focus[0] <= event && event - focus[0] < count(next);
-                    match (inserted(first), inserted(second)) {
-                        (true, true) => {
-                            first -= focus[0];
-                            second -= focus[0];
+                    match (
+                        insertion_part(first, focus[0], count(next)),
+                        insertion_part(second, focus[0], count(next)),
+                    ) {
+                        (InsertPart::Earlier(a), InsertPart::Earlier(b)) => {
+                            first = a;
+                            second = b;
+                            at = earlier;
+                        }
+                        (InsertPart::Resumed(a), InsertPart::Resumed(b)) => {
+                            first = a;
+                            second = b;
                             at = next;
                         }
-                        (false, false) => {
-                            if first >= focus[0] {
-                                first -= count(next);
-                            }
-                            if second >= focus[0] {
-                                second -= count(next);
-                            }
-                            at = tail;
-                        }
-                        (true, false) => {
-                            second -= count(next);
-                            if second < focus[1] {
+                        (InsertPart::Resumed(_), InsertPart::Earlier(b)) => {
+                            if b < focus[1] {
                                 return preceding;
                             }
                             first = focus[0];
-                            at = tail;
+                            second = b;
+                            at = earlier;
                         }
-                        (false, true) => {
+                        (InsertPart::Earlier(a), InsertPart::Resumed(_)) => {
+                            first = a;
                             second = focus[0];
-                            at = tail;
+                            at = earlier;
                         }
                     }
                 }
@@ -1200,7 +1214,9 @@ fn subtree_at(
         if span[0] >= span[1] || span[1] > count(at) {
             return None;
         }
-        if span == [0, count(at)] {
+        if span == [0, count(at)]
+            && !matches!(steps[at], Unfold::Alongside { .. } | Unfold::Before { .. })
+        {
             return Some(match steps[at] {
                 Unfold::Source => {
                     return Layout::checked(protocol).source_at(
@@ -1228,8 +1244,8 @@ fn subtree_at(
                     ),
                     event < count(a),
                 ),
-                Unfold::Alongside { earlier, .. } | Unfold::Before { earlier, .. } => {
-                    (NodeKind::Sequence, event < count(earlier))
+                Unfold::Alongside { .. } | Unfold::Before { .. } => {
+                    unreachable!("insertions use the graft traversal below");
                 }
             });
         }
@@ -1262,59 +1278,46 @@ fn subtree_at(
             Unfold::Alongside {
                 earlier,
                 next,
-                tail,
                 focus,
                 ..
             }
             | Unfold::Before {
                 earlier,
                 next,
-                tail,
                 focus,
                 ..
             } => {
-                if span[1] <= count(earlier) {
-                    at = earlier;
-                    continue;
-                }
-                if span[0] < count(earlier) {
-                    return None;
-                }
-                span[0] -= count(earlier);
-                span[1] -= count(earlier);
-                event -= count(earlier);
-                if span == [focus[0], focus[1] + count(next)] {
+                let added = count(next);
+                if span == [focus[0], focus[1] + added] {
                     return Some((
                         if matches!(steps[at], Unfold::Before { .. }) {
                             NodeKind::Sequence
                         } else {
                             NodeKind::Parallel
                         },
-                        event < focus[0] + count(next),
+                        event < focus[0] + added,
                     ));
                 }
-                if focus[0] <= span[0] && span[1] <= focus[0] + count(next) {
+                if focus[0] <= span[0] && span[1] <= focus[0] + added {
                     span[0] -= focus[0];
                     span[1] -= focus[0];
                     event -= focus[0];
                     at = next;
                 } else {
-                    if span[1] <= focus[0] { /* unchanged prefix */
-                    } else if span[0] >= focus[0] + count(next) {
-                        span[0] -= count(next);
-                        span[1] -= count(next);
-                        event -= count(next);
-                    } else if span[0] <= focus[0] && span[1] >= focus[1] + count(next) {
-                        span[1] -= count(next);
-                        // All inserted events occupy the original focus's
-                        // side of every enclosing binary node.
+                    if span[1] <= focus[0] {
+                    } else if span[0] >= focus[0] + added {
+                        span[0] -= added;
+                        span[1] -= added;
+                        event -= added;
+                    } else if span[0] <= focus[0] && span[1] >= focus[1] + added {
+                        span[1] -= added;
                         if event >= focus[0] {
-                            event = focus[0] + event.saturating_sub(focus[0] + count(next));
+                            event = focus[0] + event.saturating_sub(focus[0] + added);
                         }
                     } else {
                         return None;
                     }
-                    at = tail;
+                    at = earlier;
                 }
             }
         }

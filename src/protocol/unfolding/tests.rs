@@ -15,6 +15,17 @@ fn compare(snapshot: &[TapEvent], steps: &[Unfold]) {
     let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
     let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(steps)];
     let source = protocol.unfolding(steps, &mut scratch).unwrap();
+    for target in 0..=source.event_count() {
+        let mut witnessed = false;
+        for prior in 0..source.event_count() {
+            for entered in 0..source.event_count() {
+                let related = source.same_resumption(prior, target, entered);
+                assert!(!related || source.resumption_target(target));
+                witnessed |= related;
+            }
+        }
+        assert_eq!(source.resumption_target(target), witnessed);
+    }
     let mut parts = vec![usize::MAX; Layout::path_index_words(source.event_count()).unwrap()];
     let mut parents = vec![0; source.event_count()];
     let mut stack = vec![0; 2 * source.event_count()];
@@ -117,35 +128,31 @@ fn structural_splits_match_full_cut_enumeration_across_all_unfolding_constructor
             let inner = if inner_before {
                 Unfold::Before {
                     retained: rolls[1],
-                    earlier: 3,
+                    earlier: 5,
                     next: 3,
-                    tail: 4,
-                    focus: [0, 1],
+                    focus: [1, 2],
                 }
             } else {
                 Unfold::Alongside {
                     retained: rolls[1],
-                    earlier: 3,
+                    earlier: 5,
                     next: 3,
-                    tail: 4,
-                    focus: [0, 1],
+                    focus: [1, 2],
                 }
             };
             let outer = if outer_before {
                 Unfold::Before {
                     retained: rolls[0],
-                    earlier: 1,
+                    earlier: 7,
                     next: 1,
-                    tail: 5,
-                    focus: [1, 3],
+                    focus: [2, 4],
                 }
             } else {
                 Unfold::Alongside {
                     retained: rolls[0],
-                    earlier: 1,
+                    earlier: 7,
                     next: 1,
-                    tail: 5,
-                    focus: [1, 3],
+                    focus: [2, 4],
                 }
             };
             compare(
@@ -156,7 +163,9 @@ fn structural_splits_match_full_cut_enumeration_across_all_unfolding_constructor
                     Unfold::Source,
                     Unfold::Once(2),
                     Unfold::Source,
+                    Unfold::Sequence([3, 4]),
                     inner,
+                    Unfold::Sequence([1, 6]),
                     outer,
                 ],
             );
