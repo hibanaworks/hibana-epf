@@ -218,18 +218,6 @@ fn retained_seed(
                 if layout.retained(protocol, region, key)? != node {
                     return None;
                 }
-                // Nested visits have their own per-enclosing-visit demand.
-                // Leave that preference to the ordinary structural seed.
-                if protocol.records[layout.scopes.clone()].iter().any(|row| {
-                    row.causal_key() >> 13 == 1
-                        && row.arg1() & 3 == 0
-                        && protocol.scope(row.causal_key()).is_some_and(|outer| {
-                            outer.first < layout.scopes.start + node.first
-                                && layout.scopes.start + node.last - 1 < outer.last
-                        })
-                }) {
-                    return None;
-                }
                 if (at + 1..=left).any(|later| {
                     matches!(steps[later], Unfold::More(_)) && get(source.rows, later) == node
                 }) {
@@ -415,6 +403,38 @@ fn retained_seed(
                     return size;
                 };
                 Unfold::Before {
+                    retained: key,
+                    earlier: mapped[at],
+                    next,
+                    focus,
+                }
+            } else if observed_before(
+                captures,
+                session,
+                (key, visit, [region.start, region.end]),
+                (key, 0, [continuation.start, continuation.end]),
+            ) == Some(true)
+            {
+                // This actor entered its later body before receiving the
+                // continuation, and completed that body afterwards. Keep
+                // the existing continuation subtree and overlap the next
+                // explicit visit with it, including inside an enclosing roll.
+                // This only prefers an existing source derivation; its
+                // selection and complete capture still pass the checker.
+                let Some(focus) = visit_range((steps, counts), (mapped[at], mapped[right]), 0)
+                else {
+                    return size;
+                };
+                let Some(next) = append(
+                    Unfold::Once(mapped[body]),
+                    count,
+                    &mut output,
+                    steps,
+                    counts,
+                ) else {
+                    return size;
+                };
+                Unfold::Alongside {
                     retained: key,
                     earlier: mapped[at],
                     next,
@@ -982,6 +1002,162 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn nested_retained_seed_preserves_a_receive_between_two_parallel_body_halves() {
+        use crate::SourcePoint;
+        let body = g::seq(
+            g::send::<1, 0, g::Msg<1, ()>>(),
+            g::seq(
+                g::send::<0, 1, g::Msg<2, ()>>(),
+                g::par(
+                    g::seq(
+                        g::send::<0, 2, g::Msg<3, ()>>(),
+                        g::send::<2, 0, g::Msg<4, ()>>(),
+                    ),
+                    g::send::<0, 1, g::Msg<16, ()>>(),
+                ),
+            ),
+        );
+        let approved = || {
+            g::seq(
+                g::send::<1, 0, g::Msg<5, ()>>(),
+                g::seq(
+                    g::send::<0, 2, g::Msg<6, ()>>(),
+                    g::send::<0, 1, g::Msg<7, ()>>(),
+                ),
+            )
+        };
+        let global = g::route(approved(), g::seq(body.roll(), approved())).roll();
+        let snapshot: std::vec::Vec<_> = tap::projected(&project::<0>(&global)).collect();
+        let origin = |label| {
+            snapshot
+                .iter()
+                .rfind(|row| row.id() == tap::PROJECTED_SOURCE && row.arg0() as u8 == label)
+                .unwrap()
+        };
+        let reset = snapshot
+            .iter()
+            .find(|row| {
+                row.id() == tap::PROJECTED_SCOPE
+                    && row.causal_key() >> 13 == 1
+                    && row.arg1() & 3 == 0
+                    && row.arg0() == origin(1).ts()
+            })
+            .unwrap()
+            .causal_key();
+        let mut records = vec![];
+        let labels = [1, 2, 3, 16, 4, 0, 1, 2, 3, 16, 5, 4, 6, 7];
+        for label in labels {
+            if label == 0 {
+                for actor in [0u16, 1] {
+                    records.push(observation(
+                        records.len(),
+                        tap::SCOPE_REENTRY,
+                        actor << 8 | actor,
+                        u32::from(reset) << 16 | origin(1).ts(),
+                    ));
+                }
+                continue;
+            }
+            let row = origin(label);
+            let sender = (row.arg0() >> 24) as u8;
+            let receiver = (row.arg0() >> 16) as u8;
+            let lane = (row.arg0() >> 8) as u8;
+            for (kind, actor, direction) in [
+                (tap::ENDPOINT_SEND, sender, 1),
+                (tap::ENDPOINT_RECV, receiver, 2),
+            ] {
+                records.push(observation(
+                    records.len(),
+                    kind,
+                    u16::from(actor) << 8 | direction,
+                    u32::from(actor) << 24 | u32::from(lane) << 16 | row.ts(),
+                ));
+            }
+        }
+        // These commit/reset hints guide the seed. Capture provenance and
+        // transport-call completeness are separate from this source-word test.
+        let captures = [Capture::new(&records, Some(records.len() as u32)).unwrap()];
+        let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+        let mut steps = vec![Unfold::Source; 2 * records.len() + 1];
+        let mut scratch = vec![0; 8 * steps.len() + 2 * Layout::checked(protocol).sources.len()];
+        let size = seed(protocol, &captures, 1, &mut steps, &mut scratch).unwrap();
+        let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps[..size])];
+        let source = protocol.unfolding(&steps[..size], &mut proof).unwrap();
+        let mut storage = vec![0; source.path_workspace_len().unwrap()];
+        let (actors, rest) = storage.split_at_mut(source.event_count());
+        let (parts, scratch) =
+            rest.split_at_mut(Layout::path_index_words(source.event_count()).unwrap());
+        source.index_source(parts, actors, scratch).unwrap();
+        let path = source
+            .select_by(|_, _, _| Ok(true), |_, _| true, actors, parts, scratch)
+            .unwrap();
+        let mut counts = vec![[0usize; 2]; Layout::checked(protocol).sources.len()];
+        let mut word = vec![];
+        for row in &records {
+            let side = match row.id() {
+                tap::ENDPOINT_SEND => 0,
+                tap::ENDPOINT_RECV => 1,
+                _ => continue,
+            };
+            let origin = row.arg1() as u16;
+            let event = (0..source.event_count())
+                .filter(|&event| {
+                    source.origin(event) == Some(origin) && path.actors(event).is_some()
+                })
+                .nth(counts[usize::from(origin)][side])
+                .unwrap();
+            counts[usize::from(origin)][side] += 1;
+            if side == 0 {
+                word.extend([SourcePoint::Accepted(event), SourcePoint::Sent(event)]);
+            } else {
+                word.push(SourcePoint::Received(event));
+            }
+        }
+        path.check_word(&word).unwrap();
+        let source_point = |point| {
+            source
+                .origin(match point {
+                    SourcePoint::Accepted(event)
+                    | SourcePoint::Sent(event)
+                    | SourcePoint::Received(event)
+                    | SourcePoint::Local(event) => event,
+                })
+                .unwrap()
+        };
+        let final_start = word
+            .iter()
+            .position(|&point| {
+                matches!(point, SourcePoint::Accepted(_))
+                    && source_point(point) == origin(6).ts() as u16
+            })
+            .unwrap();
+        let second_reply = word
+            .iter()
+            .rposition(|&point| {
+                matches!(point, SourcePoint::Received(_))
+                    && source_point(point) == origin(4).ts() as u16
+            })
+            .unwrap();
+        let final_message: std::vec::Vec<_> = word.drain(final_start..final_start + 3).collect();
+        word.splice(second_reply..second_reply, final_message);
+        assert!(
+            path.check_word(&word).is_err(),
+            "the outgoing continuation still needs the current reply"
+        );
+    }
+
+    fn observation(ordinal: usize, kind: u16, key: u16, arg1: u32) -> tap::TapEvent {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(&(ordinal as u32).to_be_bytes());
+        bytes[4..6].copy_from_slice(&kind.to_be_bytes());
+        bytes[6..8].copy_from_slice(&key.to_be_bytes());
+        bytes[8..12].copy_from_slice(&1u32.to_be_bytes());
+        bytes[12..].copy_from_slice(&arg1.to_be_bytes());
+        bytes.into()
     }
 
     #[test]

@@ -426,6 +426,11 @@ the same actor's observations within one producer supply an order preference;
 missing or conflicting hints preserve the source preference. Ordinals do not
 order different producers. The source, actor, ownership and
 execution checks still decide whether any proposed tree is acceptable.
+An actor's later body may begin before an incoming continuation and finish
+afterwards. The initial candidate preserves that overlap with the existing
+alongside derivation, including for nested rolls. An ordered later body keeps
+the after-continuation derivation. Neither preference changes source readiness,
+capture completeness or the final execution check.
 Opposite route arms add their visit demands; sequential and parallel children
 share visits, while nested rolls account for their own repetitions.
 Nested roll counts are not divided by enclosing visits that selected another
