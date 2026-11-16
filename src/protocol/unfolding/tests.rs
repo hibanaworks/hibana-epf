@@ -15,6 +15,37 @@ fn compare(snapshot: &[TapEvent], steps: &[Unfold]) {
     let protocol = Protocol::new(snapshot, &mut source_storage).unwrap();
     let mut scratch = std::vec![0; Protocol::unfolding_workspace_len(steps)];
     let source = protocol.unfolding(steps, &mut scratch).unwrap();
+    for first in 0..=source.event_count() {
+        let mut left = Vec::new();
+        source.contexts(first, |proof, base, _| {
+            left.push((proof, base));
+            true
+        });
+        for second in 0..=source.event_count() {
+            let mut right = Vec::new();
+            source.contexts(second, |proof, base, _| {
+                right.push((proof, base));
+                true
+            });
+            let expected = left.iter().copied().rfind(|at| right.contains(at));
+            assert_eq!(
+                source.common_context(first, second),
+                expected,
+                "common context for {first}/{second}, steps {steps:?}"
+            );
+            let mut shared = expected.is_some();
+            for at in &left {
+                assert_eq!(
+                    shared,
+                    right.contains(at),
+                    "shared invocations form one prefix"
+                );
+                if Some(*at) == expected {
+                    shared = false;
+                }
+            }
+        }
+    }
     for target in 0..=source.event_count() {
         let mut witnessed = false;
         for prior in 0..source.event_count() {

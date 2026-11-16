@@ -369,6 +369,44 @@ impl Unfolded<'_, '_> {
 
     // A proof step plus its base in proof-leaf order uniquely identifies an
     // invocation even when the same DAG step is reused in several visits.
+    fn context_child(&self, proof: usize, event: usize) -> Option<(usize, usize, usize)> {
+        match self.steps[proof] {
+            Unfold::Source => None,
+            Unfold::Once(body) => Some((body, 0, event)),
+            Unfold::Sequence([a, b])
+            | Unfold::Parallel([a, b])
+            | Unfold::Choice([a, b])
+            | Unfold::More([a, b])
+            | Unfold::Independent([a, b])
+            | Unfold::After {
+                earlier: a,
+                next: b,
+                ..
+            } => {
+                if event < self.count(a) {
+                    Some((a, 0, event))
+                } else {
+                    Some((b, self.count(a), event - self.count(a)))
+                }
+            }
+            Unfold::Alongside {
+                earlier,
+                next,
+                focus,
+                ..
+            }
+            | Unfold::Before {
+                earlier,
+                next,
+                focus,
+                ..
+            } => match insertion_part(event, focus[0], self.count(next)) {
+                InsertPart::Resumed(local) => Some((next, 0, local)),
+                InsertPart::Earlier(local) => Some((earlier, self.count(next), local)),
+            },
+        }
+    }
+
     pub(super) fn contexts(
         &self,
         mut event: usize,
@@ -383,49 +421,37 @@ impl Unfolded<'_, '_> {
             if !inspect(at, base, event) {
                 return;
             }
-            match self.steps[at] {
-                Unfold::Source => return,
-                Unfold::Once(body) => at = body,
-                Unfold::Sequence([a, b])
-                | Unfold::Parallel([a, b])
-                | Unfold::Choice([a, b])
-                | Unfold::More([a, b])
-                | Unfold::Independent([a, b])
-                | Unfold::After {
-                    earlier: a,
-                    next: b,
-                    ..
-                } => {
-                    if event < self.count(a) {
-                        at = a;
-                    } else {
-                        event -= self.count(a);
-                        base += self.count(a);
-                        at = b;
-                    }
+            let Some((child, offset, local)) = self.context_child(at, event) else {
+                return;
+            };
+            at = child;
+            base += offset;
+            event = local;
+        }
+    }
+
+    // Walk the two paths together once. Re-querying target membership from
+    // the root at every prior ancestor would make this quadratic in depth.
+    fn common_context(&self, mut first: usize, mut second: usize) -> Option<(usize, usize)> {
+        if first >= self.event_count() || second >= self.event_count() {
+            return None;
+        }
+        let mut at = self.steps.len() - 1;
+        let mut base = 0;
+        loop {
+            match (
+                self.context_child(at, first),
+                self.context_child(at, second),
+            ) {
+                (Some((a, offset_a, local_a)), Some((b, offset_b, local_b)))
+                    if a == b && offset_a == offset_b =>
+                {
+                    at = a;
+                    base += offset_a;
+                    first = local_a;
+                    second = local_b;
                 }
-                Unfold::Alongside {
-                    earlier,
-                    next,
-                    focus,
-                    ..
-                }
-                | Unfold::Before {
-                    earlier,
-                    next,
-                    focus,
-                    ..
-                } => match insertion_part(event, focus[0], self.count(next)) {
-                    InsertPart::Resumed(local) => {
-                        event = local;
-                        at = next;
-                    }
-                    InsertPart::Earlier(local) => {
-                        event = local;
-                        base += self.count(next);
-                        at = earlier;
-                    }
-                },
+                _ => return Some((at, base)),
             }
         }
     }
@@ -484,11 +510,16 @@ impl Unfolded<'_, '_> {
             return false;
         };
         let layout = Layout::checked(self.protocol);
+        let Some(last_shared) = self.common_context(prior, target) else {
+            return false;
+        };
         let mut common = None;
+        let mut shared = true;
         let mut credited = false;
         self.contexts(prior, |proof, base, local| {
-            if self.local_position(target, proof, base).is_some() {
+            if shared {
                 common = Some(proof);
+                shared = (proof, base) != last_shared;
             }
             let Unfold::More([earlier, _]) = self.steps[proof] else {
                 return true;

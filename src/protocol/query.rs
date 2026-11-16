@@ -169,10 +169,10 @@ impl SourcePath<'_, '_, '_> {
         }
         let mandatory = |prior: SourcePoint, prefix: Option<&[usize]>| {
             !matches!(point, SourcePoint::Sent(_))
-                && !self.may_credit_incoming(prior, point)
                 && self
                     .point_binding(prior)
                     .is_some_and(|(_, binding)| binding == u32::from(actor))
+                && !self.may_credit_incoming(prior, point)
                 && self.unavoidable_before(prior.event(), point.event(), |span| {
                     prefix.is_some_and(|prefix| {
                         prefix[span[0]..span[1]]
@@ -192,7 +192,7 @@ impl SourcePath<'_, '_, '_> {
                 SourcePoint::Received(event),
             ]
             .into_iter()
-            .any(|prior| mandatory(prior, None) && prefix[prior.event()] & prior.bit() == 0)
+            .any(|prior| prefix[prior.event()] & prior.bit() == 0 && mandatory(prior, None))
         {
             return false;
         }
@@ -230,13 +230,13 @@ impl SourcePath<'_, '_, '_> {
             for prior in history.clone() {
                 if matches!(prior, SourcePoint::Local(_) | SourcePoint::Received(_))
                     && prior.event() >= introduced.event()
+                    && self.point_actor(prior) == Some(actor)
                     && !self.may_credit_incoming(introduced, prior)
                     && self.prerequisite_ordered(history.clone(), prior)(
                         introduced,
                         actor,
                         domains[prior.event()] & SOURCE_ORDER != 0,
                     )
-                    && self.point_actor(prior) == Some(actor)
                 {
                     return false;
                 }
@@ -248,7 +248,7 @@ impl SourcePath<'_, '_, '_> {
         // from the old visit. Pruning cannot assume its completion credit is
         // unchanged; the candidate's final readiness rechecks that credit.
         let required = |prior, actor, ordered| {
-            !self.may_credit_incoming(prior, point) && exact(prior, actor, ordered)
+            exact(prior, actor, ordered) && !self.may_credit_incoming(prior, point)
         };
         if self
             .fixed_prefix_blocked_until(point, actor, domains)
