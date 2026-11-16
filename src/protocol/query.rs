@@ -26,7 +26,11 @@ impl SourcePath<'_, '_, '_> {
     ) -> Option<usize> {
         let count = self.unfolding().event_count();
         let event = point.event();
-        if matches!(point, SourcePoint::Sent(_)) || count < 2 || event >= count {
+        if (matches!(point, SourcePoint::Sent(_))
+            || matches!(point, SourcePoint::Received(_)) && self.unfolding().has_repeated_visits())
+            || count < 2
+            || event >= count
+        {
             return None;
         }
         let mut node = if event > 0 && self.index[3 * (event - 1) + 1] == event + 1 {
@@ -165,6 +169,7 @@ impl SourcePath<'_, '_, '_> {
         }
         let mandatory = |prior: SourcePoint, prefix: Option<&[usize]>| {
             !matches!(point, SourcePoint::Sent(_))
+                && !self.may_credit_incoming(prior, point)
                 && self
                     .point_binding(prior)
                     .is_some_and(|(_, binding)| binding == u32::from(actor))
@@ -225,6 +230,7 @@ impl SourcePath<'_, '_, '_> {
             for prior in history.clone() {
                 if matches!(prior, SourcePoint::Local(_) | SourcePoint::Received(_))
                     && prior.event() >= introduced.event()
+                    && !self.may_credit_incoming(introduced, prior)
                     && self.prerequisite_ordered(history.clone(), prior)(
                         introduced,
                         actor,
@@ -237,7 +243,13 @@ impl SourcePath<'_, '_, '_> {
             }
         }
         self.mark_source_before(point.event(), domains);
-        let required = self.prerequisite_ordered(history.clone(), point);
+        let exact = self.prerequisite_ordered(history.clone(), point);
+        // A different uncommitted arm can remove a missing actor-local row
+        // from the old visit. Pruning cannot assume its completion credit is
+        // unchanged; the candidate's final readiness rechecks that credit.
+        let required = |prior, actor, ordered| {
+            !self.may_credit_incoming(prior, point) && exact(prior, actor, ordered)
+        };
         if self
             .fixed_prefix_blocked_until(point, actor, domains)
             .is_some()
@@ -248,7 +260,7 @@ impl SourcePath<'_, '_, '_> {
             let missing = self.missing_with(
                 point,
                 |prior| domains[prior.event()] & bit(prior) != 0,
-                |prior, actor| required(prior, actor, domains[prior.event()] & SOURCE_ORDER != 0),
+                |prior, actor| exact(prior, actor, domains[prior.event()] & SOURCE_ORDER != 0),
             );
             let Some(prior) = missing else {
                 return true;
@@ -441,7 +453,9 @@ impl SourcePath<'_, '_, '_> {
                 } else {
                     SourcePoint::Received(event)
                 };
-                if self.prerequisite(history.clone(), point)(prior, actor) {
+                if !self.may_credit_incoming(prior, point)
+                    && self.prerequisite(history.clone(), point)(prior, actor)
+                {
                     return true;
                 }
                 event = previous[event];
@@ -526,12 +540,25 @@ impl SourcePath<'_, '_, '_> {
             if let Ok(path) = candidate
                 && available(&path)
             {
-                // `history` is a checked prefix of `self`. Forced domains
-                // retain its committed leaves, and the row predicate above
-                // retains their actors and rejects every newly required
-                // predecessor. Rechecking every whole prefix here would
-                // repeatedly prove the unchanged part of the same word.
-                return true;
+                // Forced domains retain the checked prefix's committed
+                // leaves. The row predicate retains their actors and rejects
+                // newly required predecessors in ordinary source order.
+                // An alternative can introduce an actor-local operation in
+                // an earlier visit that supplied completion credit. Preserve
+                // the actual prefix at every incoming receipt; retaining the
+                // old actors alone would not preserve that credit.
+                if !source.has_repeated_visits()
+                    || history.clone().enumerate().all(|(index, committed)| {
+                        !matches!(committed, SourcePoint::Received(_))
+                            || path
+                                .missing(history.clone().take(index), committed, |prior| {
+                                    history.clone().take(index).any(|entry| entry == prior)
+                                })
+                                .is_none()
+                    })
+                {
+                    return true;
+                }
             }
             let Some(index) = choices[..used].iter().rposition(|&choice| choice == 0) else {
                 return false;

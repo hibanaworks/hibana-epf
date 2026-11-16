@@ -247,7 +247,12 @@ fn retained_seed(
                         } else if tail.start <= origin
                             && origin < tail.end
                             && inside[word] & bit != 0
+                            && record.id() == tap::ENDPOINT_SEND
                         {
+                            // A late incoming continuation can use completion
+                            // of an earlier copy. Only an outgoing continuation
+                            // followed by new body commits suggests a retained
+                            // insertion instead of ordinary repeated copies.
                             crossed[word] |= bit;
                         }
                     }

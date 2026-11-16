@@ -338,8 +338,16 @@ Acceptance, sender publication, receiver commit and a local action are
 different points. It checks source order, uniqueness, wire prerequisites and
 outgoing-continuation prerequisites activated by a committed resumed body.
 An incoming continuation already accepted by its sender does not acquire a
-new outgoing prerequisite. Reusing a proof DAG in two visits does not share
-their dynamic entry history.
+new outgoing prerequisite. With ordinary repeated copies, an earlier selected
+visit can supply the same physical actor's completion for a late incoming
+continuation. The earlier visit must contain at least one of that actor's
+operations, and all its selected local/publication/receipt points must have
+committed. This never replaces transport acceptance or the same occurrence's
+colocated publication, and never enables a new outgoing or local action. The
+checked source sequence and enclosing invocation must match; an inner visit
+in another outer iteration cannot supply credit. Alternative selections
+recheck the previous receipts against their exact prefixes. Reusing a proof
+DAG in two visits does not share their dynamic entry history.
 
 Readiness queries reject an impossible logical operation kind or a mismatched
 terminal actor binding before searching alternative choices. Conditional actor
@@ -647,7 +655,8 @@ comparison checks both membership and preservation of the source-phase bits;
 Lean proves the corresponding filtered-prefix membership identity.
 
 `CaptureExecution.lean` interprets these per-query selections and source advances
-using the selected core's existing source-occurrence semantics. It proves that a checked
+using the selected core's source-occurrence semantics. Its `check` relation
+covers the strict source-order fragment without incoming completion credit. It proves that a checked
 record list has a source execution, preserves the exact source prefix at every
 append, rejects every extension of the same rejected prefix, and retains each
 advance's resumption check. Polling does not append a
@@ -659,6 +668,13 @@ require completion evidence and place acceptance after its poll and before each
 observed completion, allowing receipt before sender publication. These are
 contracts for the evidence interpreter. They do not prove the Rust snapshot
 reader, occurrence matcher or whole checker implements those contracts.
+The completion extension separately proves that a credited visit is nonempty,
+all selected commits of its physical actor are observed, acceptance alone is
+insufficient, and a missing selected commit invalidates it. Credit preserves
+every outgoing/local dependency, incoming acceptance and same-event publication.
+The extraction of eligible earlier visits from the Rust unfolding and the
+complete implementation refinement are not established by these component
+claims; the Endpoint and source-word regressions exercise that correspondence.
 
 The selected core dependency supplies committed-body resumption and
 independent visits of physically disjoint parallel rolls. The proof gate imports

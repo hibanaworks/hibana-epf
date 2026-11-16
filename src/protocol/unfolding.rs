@@ -471,6 +471,68 @@ impl Unfolded<'_, '_> {
         }
     }
 
+    // Earlier complete copies can retain an incoming continuation while a
+    // later copy is unfinished. Require the same source-sequence invocation:
+    // a matching original scope in another enclosing visit is insufficient.
+    pub(super) fn earlier_visits(
+        &self,
+        prior: usize,
+        target: usize,
+        mut complete: impl FnMut(usize, usize, [usize; 2]) -> bool,
+    ) -> bool {
+        let Some(target_origin) = self.origin(target).map(usize::from) else {
+            return false;
+        };
+        let layout = Layout::checked(self.protocol);
+        let mut common = None;
+        let mut credited = false;
+        self.contexts(prior, |proof, base, local| {
+            if self.local_position(target, proof, base).is_some() {
+                common = Some(proof);
+            }
+            let Unfold::More([earlier, _]) = self.steps[proof] else {
+                return true;
+            };
+            let body = get(self.rows, proof);
+            let follows = common.is_some_and(|parent| {
+                let region = get(self.rows, parent);
+                matches!(self.steps[parent], Unfold::Sequence(_))
+                    && region.start <= body.start
+                    && body.end <= region.end
+                    && body.end <= target_origin
+                    && target_origin < region.end
+                    && layout.source_before(
+                        self.protocol,
+                        region,
+                        body.end - 1 - region.start,
+                        target_origin - region.start,
+                    )
+            });
+            if local < self.count(earlier) || !follows {
+                return true;
+            }
+            let mut first = 0;
+            while first < self.count(earlier) {
+                let Some(span) = self.copy_range(earlier, first) else {
+                    break;
+                };
+                if complete(proof, base, span) {
+                    credited = true;
+                    return false;
+                }
+                first = span[1];
+            }
+            true
+        });
+        credited
+    }
+
+    pub(super) fn has_repeated_visits(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, Unfold::More(_)))
+    }
+
     pub(super) fn resumption_target(&self, event: usize) -> bool {
         let mut target = false;
         self.contexts(event, |proof, _, local| {

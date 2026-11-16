@@ -675,4 +675,125 @@ theorem a_committed_branch_cannot_be_replaced_by_an_opposite_query :
     check pendingPlan [] [.advance (.accepted 0), .advance (.committed ⟨0, .send⟩),
       .poll (pendingQuery true) 1] = false := by decide
 
+/-- Actor-local completion of a selected earlier visit. Acceptance is not a
+commit, and an actor absent from this visit cannot obtain vacuous completion.
+`visit` is an immutable event set from the checked unfolding, not application
+state. The Rust extraction of same-roll/same-enclosing-visit event sets remains
+a correspondence obligation, exercised by the actual Endpoint and word tests. -/
+def completedVisit (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (actor : Nat) (visit : List Nat) : Bool :=
+  let owned := fun point => match point with
+    | .accepted _ => false
+    | .committed action => visit.contains action.event &&
+        decide (occurrenceActor? plan point = some actor)
+  let domain := sourceVisitPoints plan.path.bindings
+  domain.any owned && domain.all (fun point => !owned point || observed point)
+
+theorem completed_visit_has_a_committed_member
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (actor : Nat) (visit : List Nat)
+    (complete : completedVisit plan observed actor visit = true) :
+    ∃ action, SourcePoint.committed action ∈ sourceVisitPoints plan.path.bindings ∧
+      action.event ∈ visit ∧ occurrenceActor? plan (.committed action) = some actor ∧
+      observed (.committed action) = true := by
+  have fields := Bool.and_eq_true_iff.mp complete
+  obtain ⟨point, member, owned⟩ := List.any_eq_true.mp fields.1
+  cases point with
+  | accepted => contradiction
+  | committed action =>
+    have facts := Bool.and_eq_true_iff.mp owned
+    have present := List.all_eq_true.mp fields.2 _ member
+    exact ⟨action, member, List.contains_iff_mem.mp facts.1,
+      of_decide_eq_true facts.2, by simpa only [owned, Bool.not_true, Bool.false_or] using present⟩
+
+theorem completed_visit_requires_every_selected_actor_commit
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (actor : Nat) (visit : List Nat) (action : ActionId)
+    (complete : completedVisit plan observed actor visit = true)
+    (member : .committed action ∈ sourceVisitPoints plan.path.bindings)
+    (inside : action.event ∈ visit)
+    (same : occurrenceActor? plan (.committed action) = some actor) :
+    observed (.committed action) = true := by
+  have all := List.all_eq_true.mp (Bool.and_eq_true_iff.mp complete).2 _ member
+  simpa only [List.contains_iff_mem.mpr inside, same, decide_true, Bool.and_self,
+    Bool.not_true, Bool.false_or] using all
+
+theorem acceptance_alone_cannot_complete_a_visit
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (actor : Nat) (visit : List Nat)
+    (noCommits : ∀ action, observed (.committed action) = false) :
+    completedVisit plan observed actor visit = false := by
+  apply Bool.eq_false_iff.mpr
+  intro complete
+  obtain ⟨action, _, _, _, done⟩ :=
+    completed_visit_has_a_committed_member plan observed actor visit complete
+  rw [noCommits action] at done
+  contradiction
+
+theorem a_missing_selected_actor_commit_refutes_completion
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (actor : Nat) (visit : List Nat) (action : ActionId)
+    (member : .committed action ∈ sourceVisitPoints plan.path.bindings)
+    (inside : action.event ∈ visit)
+    (same : occurrenceActor? plan (.committed action) = some actor)
+    (missing : observed (.committed action) = false) :
+    completedVisit plan observed actor visit = false := by
+  apply Bool.eq_false_iff.mpr
+  intro complete
+  have done := completed_visit_requires_every_selected_actor_commit
+    plan observed actor visit action complete member inside same
+  rw [missing] at done
+  contradiction
+
+/-- Only a different event's incoming receipt may use completion credit.
+Eligible earlier visits are derived from the checked source invocation. This
+component theorem does not certify arbitrary caller-supplied event sets or
+establish the complete Rust/source refinement. -/
+def incomingCredit (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (eligible : SourcePoint → SourcePoint → List (List Nat)) :
+    SourcePoint → SourcePoint → Bool
+  | .committed prior, .committed target =>
+      decide (target.side = .receive ∧ prior.event ≠ target.event) &&
+        match occurrenceActor? plan (.committed target) with
+        | none => false
+        | some actor =>
+            decide (occurrenceActor? plan (.committed prior) = some actor) &&
+              (eligible (.committed prior) (.committed target)).any
+                (completedVisit plan observed actor)
+  | _, _ => false
+
+def creditDepends (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (eligible : SourcePoint → SourcePoint → List (List Nat))
+    (prior target : SourcePoint) : Bool :=
+  sourcePointDepends plan.expanded plan.path.bindings prior target &&
+    !incomingCredit plan observed eligible prior target
+
+theorem outgoing_acceptance_keeps_every_source_dependency
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (eligible : SourcePoint → SourcePoint → List (List Nat)) (prior : SourcePoint) (event : Nat) :
+    creditDepends plan observed eligible prior (.accepted event) =
+      sourcePointDepends plan.expanded plan.path.bindings prior (.accepted event) := by
+  cases prior <;> simp [creditDepends, incomingCredit]
+
+theorem local_actions_keep_every_source_dependency
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (eligible : SourcePoint → SourcePoint → List (List Nat)) (prior : SourcePoint) (event : Nat) :
+    creditDepends plan observed eligible prior (.committed ⟨event, .local⟩) =
+      sourcePointDepends plan.expanded plan.path.bindings prior (.committed ⟨event, .local⟩) := by
+  cases prior <;> simp [creditDepends, incomingCredit]
+
+theorem an_incoming_receipt_keeps_its_acceptance_dependency
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (eligible : SourcePoint → SourcePoint → List (List Nat)) (event : Nat) :
+    creditDepends plan observed eligible (.accepted event) (.committed ⟨event, .receive⟩) = true := by
+  simp [creditDepends, sourcePointDepends, incomingCredit]
+
+theorem an_incoming_receipt_keeps_the_same_events_colocated_publication
+    (plan : SourceOccurrenceCut source) (observed : SourcePoint → Bool)
+    (eligible : SourcePoint → SourcePoint → List (List Nat)) (event : Nat) :
+    creditDepends plan observed eligible (.committed ⟨event, .send⟩) (.committed ⟨event, .receive⟩) =
+      sourcePointDepends plan.expanded plan.path.bindings
+        (.committed ⟨event, .send⟩) (.committed ⟨event, .receive⟩) := by
+  simp [creditDepends, incomingCredit]
+
 end Hibana.Epf.CaptureExecution

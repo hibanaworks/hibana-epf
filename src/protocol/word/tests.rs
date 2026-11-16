@@ -8,6 +8,122 @@ use hibana::{
 use std::{vec, vec::Vec};
 
 #[test]
+fn completed_roll_receipts_allow_a_late_incoming_continuation_but_not_a_new_send() {
+    use SourcePoint::{Accepted as A, Received as R, Sent as S};
+    type FileLoan<'a> = g::Msg<10, hibana::Endpoint<'a, 33>>;
+    type ControlLoan<'a> = g::Msg<11, hibana::Endpoint<'a, 5>>;
+    let global = g::seq(
+        g::send::<0, 1, FileLoan>(),
+        g::seq(
+            g::seq(
+                g::send::<5, 1, g::Msg<1, ()>>(),
+                g::send::<1, 33, g::Msg<2, ()>>(),
+            )
+            .roll(),
+            g::seq(
+                g::send::<6, 2, ControlLoan>(),
+                g::seq(
+                    g::send::<2, 1, g::Msg<3, ()>>(),
+                    g::send::<1, 2, g::Msg<4, ()>>(),
+                ),
+            ),
+        ),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<1>(&global)).collect();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let steps = [
+        Unfold::Source,
+        Unfold::Source,
+        Unfold::Once(1),
+        Unfold::More([2, 1]),
+        Unfold::Source,
+        Unfold::Sequence([3, 4]),
+        Unfold::Sequence([0, 5]),
+    ];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut actors = vec![0; source.path_workspace_len().unwrap()];
+    let path = source.select(&[], &mut actors).unwrap();
+    let mut history = vec![
+        A(0),
+        S(0),
+        R(0),
+        A(1),
+        S(1),
+        R(1),
+        A(2),
+        S(2),
+        R(2),
+        A(3),
+        S(3),
+        A(5),
+        S(5),
+        R(5),
+        A(6),
+        S(6),
+        R(3),
+        A(4),
+        S(4),
+    ];
+    path.check_word(&history).unwrap();
+    let complete = |point| history.contains(&point);
+    assert!(path.completed_incoming_visit(4, 6, 1, complete));
+    for missing in [R(1), S(2), R(2)] {
+        assert!(
+            !path
+                .completed_incoming_visit(4, 6, 1, |point| { point != missing && complete(point) }),
+            "{missing:?} must have committed in the earlier visit"
+        );
+    }
+    assert!(!path.completed_incoming_visit(4, 6, 255, complete));
+    assert!(!path.completed_incoming_visit(2, 6, 1, complete));
+    assert!(!path.completed_incoming_visit(3, 4, 1, complete));
+    let mut query = vec![0; path.query_workspace_len().unwrap()];
+    assert!(path.query_from_word(history.iter().copied(), (R(6), 1), &mut query));
+    history.push(R(6));
+    path.check_word(&history).unwrap();
+    assert!(!path.query_from_word(history.iter().copied(), (A(7), 1), &mut query));
+    assert!(matches!(
+        path.check_word(&[history.clone(), vec![A(7)]].concat()),
+        Err(WordError::Predecessor { prior: R(4), .. })
+    ));
+    history.extend([R(4), A(7), S(7), R(7)]);
+    path.check_word(&history).unwrap();
+}
+
+#[test]
+fn completion_credit_cannot_cross_an_enclosing_visit() {
+    let global = g::seq(
+        g::send::<1, 0, g::Msg<1, ()>>().roll(),
+        g::send::<1, 0, g::Msg<2, ()>>(),
+    )
+    .roll();
+    let snapshot: Vec<_> = tap::projected(&project::<0>(&global)).collect();
+    let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+    let steps = [
+        Unfold::Source,
+        Unfold::Once(0),
+        Unfold::More([1, 0]),
+        Unfold::Source,
+        Unfold::Sequence([2, 3]),
+        Unfold::Once(4),
+        Unfold::More([5, 4]),
+    ];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut storage = vec![0; source.path_workspace_len().unwrap()];
+    let path = source.select(&[], &mut storage).unwrap();
+    let old = |point| matches!(point, SourcePoint::Sent(0) | SourcePoint::Received(0));
+    assert!(path.completed_incoming_visit(1, 2, 0, old));
+    assert!(!path.completed_incoming_visit(1, 5, 0, old));
+    assert!(!path.completed_incoming_visit(4, 5, 0, old));
+    let current = |point| matches!(point, SourcePoint::Sent(3) | SourcePoint::Received(3));
+    assert!(path.completed_incoming_visit(4, 5, 0, current));
+}
+
+#[test]
 fn indexed_query_preconditions_match_direct_membership_for_every_small_word() {
     let global = g::seq(
         g::send::<0, 1, g::Msg<1, ()>>(),

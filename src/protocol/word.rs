@@ -206,7 +206,15 @@ impl SourcePath<'_, '_, '_> {
                 ),
                 _ => source_before,
             };
-            ordered
+            (ordered
+                && !(matches!(point, SourcePoint::Received(_))
+                    && prior.event() != point.event()
+                    && self.completed_incoming_visit(
+                        prior.event(),
+                        point.event(),
+                        actor,
+                        |entry| history.clone().any(|observed| observed == entry),
+                    )))
                 || can_resume
                     && prior.event() < point.event()
                     && history.clone().any(|entry| {
@@ -215,6 +223,51 @@ impl SourcePath<'_, '_, '_> {
                             && source.same_resumption(prior.event(), point.event(), entry.event())
                     })
         }
+    }
+
+    // Completion belongs to this physical actor in one selected earlier
+    // visit. Both halves of a colocated wire message must have committed;
+    // transport acceptance alone, another actor, or an empty arm gives no credit.
+    pub(super) fn completed_incoming_visit(
+        &self,
+        prior: usize,
+        target: usize,
+        actor: u8,
+        contains: impl Fn(SourcePoint) -> bool,
+    ) -> bool {
+        let source = self.unfolding();
+        source.earlier_visits(prior, target, |proof, base, span| {
+            let mut present = false;
+            for event in 0..prior {
+                if !source
+                    .local_position(event, proof, base)
+                    .is_some_and(|local| span[0] <= local && local < span[1])
+                {
+                    continue;
+                }
+                for point in [
+                    SourcePoint::Local(event),
+                    SourcePoint::Sent(event),
+                    SourcePoint::Received(event),
+                ] {
+                    if self.point_actor(point) == Some(actor) {
+                        present = true;
+                        if !contains(point) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            present
+        })
+    }
+
+    pub(super) fn may_credit_incoming(&self, prior: SourcePoint, target: SourcePoint) -> bool {
+        matches!(target, SourcePoint::Received(_))
+            && prior.event() != target.event()
+            && self
+                .unfolding()
+                .earlier_visits(prior.event(), target.event(), |_, _, _| true)
     }
 
     // For a fixed target, the nearest boundary at or after `first` whose
