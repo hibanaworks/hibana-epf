@@ -106,17 +106,21 @@ theorem attributed_prefix_append_membership
       ((history.filterMap id).contains event || (extra.filterMap id).contains event) := by
   simp
 
-/-- The two preferred acceptance variants precede the original enumeration;
-every original rank is still present at its rank plus two. This certifies the
-rank arithmetic, not the full Rust search or a recovered runtime ordering. -/
-theorem a_preferred_pair_retains_every_original_candidate
-    (events preferred rank : Nat) (within : rank < 2 * events) :
-    rank + 2 < 2 * events + 2 ∧
-      (if rank + 2 < 2 then 2 * preferred + (rank + 2) else rank + 2 - 2) = rank := by
-  have later : ¬ rank + 2 < 2 := by omega
-  constructor
-  · omega
-  · simp [later]
+/-- The first preferred pair provides both ranks omitted from ordinary
+enumeration. This certifies coverage of the candidate ranks. -/
+theorem first_preferred_pair_and_remaining_candidates_cover
+    (events first hints rank : Nat) (hasHint : 2 ≤ hints) (within : rank < 2 * events) :
+    ∃ index, index < 2 * events + hints ∧
+      (index < 2 ∨ hints ≤ index ∧ (index - hints) / 2 ≠ first) ∧
+      (if index < hints then 2 * first + index else index - hints) = rank := by
+  by_cases preferred : rank / 2 = first
+  · refine ⟨rank % 2, by omega, Or.inl (by omega), ?_⟩
+    rw [if_pos (by omega)]
+    omega
+  · refine ⟨rank + hints, by omega, Or.inr ⟨by omega, ?_⟩, ?_⟩
+    · simpa using preferred
+    · rw [if_neg (by omega)]
+      omega
 
 /-- A necessary condition that only reads prefix membership may use that
 index. Full source readiness and final execution checking are still required. -/

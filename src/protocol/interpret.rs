@@ -371,9 +371,9 @@ impl SourcePath<'_, '_, '_> {
                     // occurrence before enumerating every visit of this route.
                     // This is only a preference: the next same-actor commit
                     // can belong to an independent view or a later visit.
-                    // Both preferred variants are followed by the complete
-                    // original domain, using the existing per-depth rank.
-                    let preferred = if relevant
+                    // The initial hint is followed by the remaining original
+                    // domain, using the existing per-depth rank.
+                    let next_commit = if relevant
                         && captures.len() == 1
                         && matches!(record.id(), tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION)
                     {
@@ -385,18 +385,33 @@ impl SourcePath<'_, '_, '_> {
                                     && next.causal_key() >> 8 == record.causal_key() >> 8
                                     && execution::committed(**next)
                             })
-                            .and_then(|(offset, _)| {
-                                links.root_rank(RecordId {
-                                    producer: 0,
-                                    ordinal: id.ordinal + 1 + offset,
-                                })
-                            })
-                            .filter(|&first| first < depth)
-                            .and_then(|first| occurrences[first])
                     } else {
                         None
                     };
-                    let preference = 2 * usize::from(preferred.is_some());
+                    let preferred = next_commit
+                        .and_then(|(offset, _)| {
+                            links.root_rank(RecordId {
+                                producer: 0,
+                                ordinal: id.ordinal + 1 + offset,
+                            })
+                        })
+                        .filter(|&first| first < depth)
+                        .and_then(|first| occurrences[first]);
+                    // An outgoing callback's next commit usually has a future
+                    // sender root, so it has no attributed occurrence yet.
+                    // Its observed static source still supplies a useful order
+                    // over all visits. The first hint is always tried; later
+                    // hints may be skipped when a whole arm is consumed.
+                    let preferred_origins = if preferred.is_none() {
+                        next_commit
+                            .map_or(&[][..], |(_, next)| self.origin_events(next.arg1() as u16))
+                    } else {
+                        &[]
+                    };
+                    let preference = 2 * preferred_origins
+                        .len()
+                        .max(usize::from(preferred.is_some()));
+                    let first_hint = preferred.or(preferred_origins.first().copied());
                     let alternatives = alternatives
                         .checked_add(preference)
                         .ok_or(InterpretationError::Overflow)?;
@@ -414,13 +429,18 @@ impl SourcePath<'_, '_, '_> {
                             next_event[depth] = next_event[depth].max(2 * event);
                         }
                         let hinted = next_event[depth] < preference;
-                        let candidate = if let Some(event) = preferred.filter(|_| hinted) {
-                            2 * event + next_event[depth]
+                        let candidate = if hinted {
+                            let event = preferred
+                                .unwrap_or_else(|| preferred_origins[next_event[depth] / 2]);
+                            2 * event + next_event[depth] % 2
                         } else {
                             next_event[depth] - preference
                         };
                         next_event[depth] += 1;
                         let event = candidate / 2;
+                        if !hinted && first_hint == Some(event) {
+                            continue;
+                        }
                         let accepts = candidate % 2 != 0;
                         if accepts && !first_poll
                             || first_poll
@@ -547,14 +567,17 @@ impl SourcePath<'_, '_, '_> {
                                     continue;
                                 }
                             }
-                            if matches!(
-                                record.id(),
-                                tap::SEND_POLL | tap::RESOLVER_AUDIT | tap::ROUTE_ARM_SELECTION
-                            ) && let Some(end) = self.fixed_prefix_blocked_until(
-                                SourcePoint::Accepted(event),
-                                (record.causal_key() >> 8) as u8,
-                                prefix,
-                            ) {
+                            // This certificate is for outgoing admission.
+                            // Choice observations may instead name a credited
+                            // incoming continuation; query those directions
+                            // separately below before rejecting the record.
+                            if record.id() == tap::SEND_POLL
+                                && let Some(end) = self.fixed_prefix_blocked_until(
+                                    SourcePoint::Accepted(event),
+                                    (record.causal_key() >> 8) as u8,
+                                    prefix,
+                                )
+                            {
                                 // An empty mandatory predecessor excludes
                                 // this actor throughout the same sequential
                                 // right child. This proof is independent of

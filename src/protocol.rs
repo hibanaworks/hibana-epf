@@ -216,11 +216,20 @@ impl Layout {
         events.saturating_sub(1).checked_mul(3)
     }
 
-    fn path_index_words(events: usize) -> Option<usize> {
+    fn source_index_words(events: usize) -> Option<usize> {
         Self::binary_words(events)?
             .checked_add(events.checked_mul(3)?)?
             .checked_add(events.saturating_sub(1).checked_mul(4)?)?
             .checked_add(1)
+    }
+
+    fn path_index_words(events: usize) -> Option<usize> {
+        // A nonempty branching proof has at most events - 1 More nodes.
+        // Each retains (proof, proof-leaf base, earlier enclosing More).
+        // Two event permutations locate its innermost eligible More and rank.
+        Self::source_index_words(events)?
+            .checked_add(events.saturating_sub(1).checked_mul(3)?)?
+            .checked_add(events.checked_mul(2)?)
     }
 
     fn path_words(&self, events: usize) -> Option<usize> {

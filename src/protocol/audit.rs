@@ -152,76 +152,110 @@ impl<'p> Protocol<'p> {
             occurrences,
             acceptances,
         } = execution;
-        let (size, selected, accepted) = {
-            let mut seed =
-                super::unfolding::generate::seed(*self, captures, session, &mut *unfolding, search);
-            let mut derivations = Derivations::new(*self, &mut *unfolding, search);
-            'search: loop {
-                let Some(size) = seed.take().or_else(|| derivations.next()) else {
-                    return Err(AuditError::Exhausted {
-                        derivation_capacity: capacity,
-                    });
+        let (size, selected, accepted) = 'search: {
+            for observed in [true, false] {
+                let mut seed = if observed {
+                    super::unfolding::generate::observed_seed(
+                        *self,
+                        captures,
+                        session,
+                        &mut *unfolding,
+                        search,
+                    )
+                } else {
+                    super::unfolding::generate::seed(
+                        *self,
+                        captures,
+                        session,
+                        &mut *unfolding,
+                        search,
+                    )
                 };
-                let Ok(source) = self.unfolding(&derivations.steps[..size], proof) else {
-                    continue;
-                };
-                if source.event_count() > events {
-                    continue;
-                }
-                if !enough_occurrences(source, captures, session, scratch) {
-                    continue;
-                }
-                // The unfolding is immutable across every route candidate.
-                // Build its existing locators once, including for route
-                // preferences, rather than reparsing each earlier subtree.
-                if source.index_source(parts, actors, scratch).is_err() {
-                    continue;
-                }
-                let mut retained = 0;
-                loop {
-                    let selected =
-                        route_choices(source, parts, choices, retained, captures, session, scratch);
-                    if let Ok(path) = source.select_in(
-                        read_choices(&choices[..3 * selected]),
-                        actors,
-                        parts,
+                let mut derivations = Derivations::new(*self, &mut *unfolding, search);
+                while let Some(size) = seed
+                    .take()
+                    .or_else(|| if observed { None } else { derivations.next() })
+                {
+                    let Ok(source) = self.unfolding(&derivations.steps[..size], proof) else {
+                        continue;
+                    };
+                    if source.event_count() > events {
+                        continue;
+                    }
+                    if !enough_occurrences(
+                        captures,
+                        (session, layout.sources.len()),
+                        (0..source.event_count()).map(|event| source.origin(event).unwrap()),
                         scratch,
                     ) {
-                        match path.interpret(
+                        continue;
+                    }
+                    // The unfolding is immutable across every route candidate.
+                    // Build its existing locators once, including for route
+                    // preferences, rather than reparsing each earlier subtree.
+                    if source.index_source(parts, actors, scratch).is_err() {
+                        continue;
+                    }
+                    let mut retained = 0;
+                    loop {
+                        let selected = route_choices(
+                            source, parts, choices, retained, captures, session, scratch,
+                        );
+                        if let Ok(path) = source.select_in(
+                            read_choices(&choices[..3 * selected]),
+                            actors,
+                            parts,
+                            scratch,
+                        ) && enough_occurrences(
                             captures,
-                            ExecutionStorage {
-                                session,
-                                observed_producers,
-                                order: &mut *order,
-                                occurrences: &mut *occurrences,
-                                acceptances: &mut *acceptances,
-                            },
+                            (session, layout.sources.len()),
+                            (0..source.event_count())
+                                .filter(|&event| path.actors(event).is_some())
+                                .map(|event| path.origin(event).unwrap()),
                             scratch,
                         ) {
-                            Ok(witness) => {
-                                break 'search (size, selected, witness.acceptances.len());
-                            }
-                            Err(InterpretationError::NoInterpretation) => {}
-                            Err(error) => return Err(AuditError::Evidence(error)),
-                        }
-                    }
-                    let Some(index) = (0..selected).rev().find(|&i| {
-                        (choices[3 * i + 2] != 0)
-                            == route_preference(
-                                source,
-                                parts,
-                                read_choices(&choices[..3 * i]),
-                                [choices[3 * i], choices[3 * i + 1]],
+                            match path.interpret(
                                 captures,
-                                session,
-                            )
-                    }) else {
-                        break;
-                    };
-                    choices[3 * index + 2] ^= 1;
-                    retained = index + 1;
+                                ExecutionStorage {
+                                    session,
+                                    observed_producers,
+                                    order: &mut *order,
+                                    occurrences: &mut *occurrences,
+                                    acceptances: &mut *acceptances,
+                                },
+                                scratch,
+                            ) {
+                                Ok(witness) => {
+                                    break 'search (size, selected, witness.acceptances.len());
+                                }
+                                Err(InterpretationError::NoInterpretation) => {}
+                                Err(error) => return Err(AuditError::Evidence(error)),
+                            }
+                        }
+                        if observed {
+                            break;
+                        }
+                        let Some(index) = (0..selected).rev().find(|&i| {
+                            (choices[3 * i + 2] != 0)
+                                == route_preference(
+                                    source,
+                                    parts,
+                                    read_choices(&choices[..3 * i]),
+                                    [choices[3 * i], choices[3 * i + 1]],
+                                    captures,
+                                    session,
+                                )
+                        }) else {
+                            break;
+                        };
+                        choices[3 * index + 2] ^= 1;
+                        retained = index + 1;
+                    }
                 }
             }
+            return Err(AuditError::Exhausted {
+                derivation_capacity: capacity,
+            });
         };
         // Publish only immutable witnesses reconstructed from the winning
         // outputs, and check the exact returned combination once more.
@@ -249,19 +283,16 @@ impl<'p> Protocol<'p> {
 }
 
 fn enough_occurrences(
-    source: Unfolded<'_, '_>,
     captures: &[Capture<'_>],
-    session: u32,
+    (session, origins): (u32, usize),
+    available: impl Iterator<Item = u16>,
     scratch: &mut [usize],
 ) -> bool {
-    let protocol = source.protocol();
-    let layout = Layout::checked(protocol);
-    // Reuse selection scratch before a path is built. Count every expanded
-    // origin once, with separate budgets for its send and receive commits.
-    let counts = &mut scratch[..2 * layout.sources.len()];
+    // Every commit needs a distinct source point in the checked path.
+    // Each available occurrence supplies at most one commit per direction.
+    let counts = &mut scratch[..2 * origins];
     counts.fill(0);
-    for event in 0..source.event_count() {
-        let origin = usize::from(source.origin(event).expect("checked unfolding origin"));
+    for origin in available.map(usize::from) {
         counts[2 * origin] += 1;
         counts[2 * origin + 1] += 1;
     }
@@ -476,7 +507,12 @@ mod tests {
                         })
                 });
                 assert_eq!(
-                    enough_occurrences(source, &captures, 1, &mut scratch),
+                    enough_occurrences(
+                        &captures,
+                        (1, 3),
+                        (0..source.event_count()).map(|event| source.origin(event).unwrap()),
+                        &mut scratch,
+                    ),
                     direct
                 );
             }

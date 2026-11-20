@@ -7,6 +7,158 @@ use super::{Head, InsertPart, Layout, Protocol, Region, Unfold, get, insertion_p
 use crate::Capture;
 use hibana::runtime::tap;
 
+/// Prefer one source body per observed visit. A single producer supplies an
+/// arrival order for the reset hints. These cuts only build a candidate:
+/// independent actors may have crossed a cut at different times.
+pub(crate) fn observed_seed(
+    protocol: Protocol<'_>,
+    captures: &[Capture<'_>],
+    session: u32,
+    steps: &mut [Unfold],
+    workspace: &mut [usize],
+) -> Option<usize> {
+    let [capture] = captures else {
+        return None;
+    };
+    let records = capture.records();
+    if steps.is_empty()
+        || !records.iter().any(|event| {
+            event.id() == tap::SCOPE_REENTRY && event.arg0() == session && event.arg1() >> 29 == 1
+        })
+    {
+        return None;
+    }
+    let layout = Layout::checked(protocol);
+    let capacity = steps.len();
+    let (frames, rest) = workspace.split_at_mut(5 * capacity);
+    let (first, rest) = rest.split_at_mut(capacity);
+    let (starts, rest) = rest.split_at_mut(capacity);
+    let ends = &mut rest[..capacity];
+    put(
+        frames,
+        0,
+        Region {
+            start: 0,
+            end: layout.sources.len(),
+            first: 0,
+            last: layout.scopes.len(),
+            rolled: false,
+        },
+    );
+    frames[4] = 0;
+    starts[0] = 0;
+    ends[0] = records.len();
+    let mut depth = 0;
+    let mut output = 0;
+    let mut returned = None;
+    loop {
+        let region = layout.canonical(protocol, get(frames, depth));
+        let head = layout.head(protocol, region)?;
+        let phase = frames[5 * depth + 4];
+        let start = starts[depth];
+        let end = ends[depth];
+        let compact = phase == 0
+            && protocol.records
+                [layout.scopes.start + region.first..layout.scopes.start + region.last]
+                .iter()
+                .all(|marker| marker.causal_key() >> 13 != 1);
+        let append = |step, output: &mut usize, steps: &mut [Unfold]| {
+            let at = *output;
+            *steps.get_mut(at)? = step;
+            *output += 1;
+            Some(at)
+        };
+        let mut descend = None;
+        returned = match (phase, head) {
+            (0, _) if compact => Some(append(Unfold::Source, &mut output, steps)?),
+            (0, Head::Message) => Some(append(Unfold::Source, &mut output, steps)?),
+            (
+                0 | 1,
+                Head::Sequence(children) | Head::Parallel(children) | Head::Choice(_, children),
+            ) => {
+                if phase == 1 {
+                    first[depth] = returned.take()?;
+                }
+                descend = Some((children[phase], start, end));
+                None
+            }
+            (2, Head::Sequence(_) | Head::Parallel(_) | Head::Choice(_, _)) => {
+                let children = [first[depth], returned.take()?];
+                Some(append(
+                    match head {
+                        Head::Sequence(_) => Unfold::Sequence(children),
+                        Head::Parallel(_) => Unfold::Parallel(children),
+                        Head::Choice(_, _) => Unfold::Choice(children),
+                        _ => unreachable!(),
+                    },
+                    &mut output,
+                    steps,
+                )?)
+            }
+            (phase, Head::Roll(body)) => {
+                // Head::Roll is a real source marker in this traversal. The
+                // candidate does not introduce synthetically rolled regions.
+                let key = protocol.records[layout.scopes.start + body.first - 1].causal_key();
+                let is_reset = |event: &tap::TapEvent| {
+                    event.id() == tap::SCOPE_REENTRY
+                        && event.arg0() == session
+                        && event.arg1() >> 16 == u32::from(key)
+                };
+                if phase == 0 {
+                    first[depth] = usize::MAX;
+                    let cut = records[start..end]
+                        .iter()
+                        .position(is_reset)
+                        .map_or(end, |offset| start + offset);
+                    descend = Some((body, start, cut));
+                    None
+                } else {
+                    let body_step = returned.take()?;
+                    let earlier = first[depth];
+                    let roll = append(
+                        if earlier == usize::MAX {
+                            Unfold::Once(body_step)
+                        } else {
+                            Unfold::More([earlier, body_step])
+                        },
+                        &mut output,
+                        steps,
+                    )?;
+                    let next = ends[depth + 1];
+                    if next == end {
+                        Some(roll)
+                    } else {
+                        first[depth] = roll;
+                        let actor = records[next].causal_key() >> 8;
+                        let cut = records[next + 1..end]
+                            .iter()
+                            .position(|event| is_reset(event) && event.causal_key() >> 8 == actor)
+                            .map_or(end, |offset| next + 1 + offset);
+                        descend = Some((body, next, cut));
+                        None
+                    }
+                }
+            }
+            _ => unreachable!("source traversal phase"),
+        };
+        if let Some((child, start, end)) = descend {
+            frames[5 * depth + 4] += 1;
+            depth += 1;
+            if depth == capacity {
+                return None;
+            }
+            put(frames, depth, child);
+            frames[5 * depth + 4] = 0;
+            starts[depth] = start;
+            ends[depth] = end;
+        } else if depth == 0 {
+            return Some(output);
+        } else {
+            depth -= 1;
+        }
+    }
+}
+
 /// A cheap first candidate for common, uniformly repeated bodies. Counts only
 /// guide construction: they never establish a visit or bypass checking. The
 /// exhaustive source-typed search still follows if this candidate fails.
@@ -365,7 +517,7 @@ fn retained_seed(
                 protocol.records[layout.scopes.start + get(rows, retained).first].causal_key();
             let region = get(rows, retained);
             let count = counts[mapped[body]];
-            let mut focus: Option<[usize; 2]> = None;
+            let mut focus = None;
             for pivot in 0..=right {
                 let Unfold::More([_, pivot_body]) = steps[pivot] else {
                     continue;
@@ -384,20 +536,24 @@ fn retained_seed(
                 while let Some(span) =
                     visit_range((steps, counts), (mapped[at], mapped[pivot_body]), rank)
                 {
-                    let preferred = observed_before(
+                    let observed = observed_before(
                         captures,
                         session,
                         (key, visit, [region.start, region.end]),
                         (marker.causal_key(), rank, [node.start, node.end]),
-                    )
-                    .unwrap_or(rank == visit);
-                    if preferred && focus.is_none_or(|current| span[0] < current[0]) {
-                        focus = Some(span);
+                    );
+                    // A same-actor observation takes precedence over a guessed
+                    // alignment in an earlier sibling with unrelated actors.
+                    let candidate = (observed.is_none(), span);
+                    if observed.unwrap_or(rank == visit)
+                        && focus.is_none_or(|current| candidate < current)
+                    {
+                        focus = Some(candidate);
                     }
                     rank += 1;
                 }
             }
-            let step = if let Some(focus) = focus {
+            let step = if let Some((_, focus)) = focus {
                 let Some(next) = append(
                     Unfold::Once(mapped[body]),
                     count,
@@ -1007,6 +1163,93 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn a_shared_actors_observed_visit_takes_precedence_over_a_siblings_guessed_rank() {
+        let global = g::seq(
+            g::seq(
+                g::send::<1, 0, g::Msg<1, ()>>(),
+                g::send::<0, 1, g::Msg<2, ()>>(),
+            )
+            .roll(),
+            g::par(
+                g::seq(
+                    g::send::<3, 4, g::Msg<3, ()>>(),
+                    g::send::<4, 3, g::Msg<4, ()>>(),
+                )
+                .roll(),
+                g::seq(
+                    g::send::<2, 0, g::Msg<5, ()>>(),
+                    g::send::<0, 2, g::Msg<6, ()>>(),
+                )
+                .roll(),
+            ),
+        );
+        let snapshot: std::vec::Vec<_> = tap::projected(&project::<0>(&global)).collect();
+        let origin = |label| {
+            snapshot
+                .iter()
+                .find(|row| row.id() == tap::PROJECTED_SOURCE && row.arg0() as u8 == label)
+                .unwrap()
+        };
+        let mut records = vec![];
+        for (label, revisit) in [
+            (1, false),
+            (3, false),
+            (5, false),
+            (3, true),
+            (5, true),
+            (1, true),
+            (5, true),
+        ] {
+            if revisit {
+                let first = origin(label);
+                let scope = snapshot
+                    .iter()
+                    .find(|row| {
+                        row.id() == tap::PROJECTED_SCOPE
+                            && row.causal_key() >> 13 == 1
+                            && row.arg1() & 3 == 0
+                            && row.arg0() == first.ts()
+                    })
+                    .unwrap();
+                for actor in [
+                    (first.arg0() >> 24) as u16,
+                    (first.arg0() >> 16) as u8 as u16,
+                ] {
+                    records.push(observation(
+                        records.len(),
+                        tap::SCOPE_REENTRY,
+                        actor << 8 | actor,
+                        u32::from(scope.causal_key()) << 16 | first.ts(),
+                    ));
+                }
+            }
+            for row in [origin(label), origin(label + 1)] {
+                let sender = (row.arg0() >> 24) as u16;
+                let receiver = (row.arg0() >> 16) as u8 as u16;
+                for (id, actor) in [(tap::ENDPOINT_SEND, sender), (tap::ENDPOINT_RECV, receiver)] {
+                    records.push(observation(records.len(), id, actor << 8, row.ts()));
+                }
+            }
+        }
+        let captures = [Capture::new(&records, Some(records.len() as u32)).unwrap()];
+        let mut storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+        let protocol = Protocol::new(&snapshot, &mut storage).unwrap();
+        let mut steps = vec![Unfold::Source; 2 * records.len() + 1];
+        let mut scratch = vec![0; 8 * steps.len() + 2 * Layout::checked(protocol).sources.len()];
+        let size = seed(protocol, &captures, 1, &mut steps, &mut scratch).unwrap();
+        let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps[..size])];
+        let source = protocol.unfolding(&steps[..size], &mut proof).unwrap();
+        let visit = |label, rank| {
+            (0..source.event_count())
+                .filter(|&event| source.origin(event) == Some(origin(label).ts() as u16))
+                .nth(rank)
+                .unwrap()
+        };
+        assert!(visit(5, 1) < visit(1, 1));
+        assert!(visit(1, 1) < visit(5, 2));
     }
 
     #[test]

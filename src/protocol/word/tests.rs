@@ -8,6 +8,135 @@ use hibana::{
 use std::{vec, vec::Vec};
 
 #[test]
+fn a_before_graft_preserves_the_completed_receivers_incoming_continuation() {
+    let global = g::seq(
+        g::send::<0, 1, g::Msg<1, ()>>().roll(),
+        g::seq(
+            g::send::<2, 1, g::Msg<2, ()>>(),
+            g::send::<1, 2, g::Msg<3, ()>>(),
+        ),
+    );
+    let snapshot: Vec<_> = tap::projected(&project::<1>(&global)).collect();
+    let retained = snapshot
+        .iter()
+        .find(|row| row.id() == tap::PROJECTED_SCOPE && row.causal_key() >> 13 == 1)
+        .unwrap()
+        .causal_key();
+    let mut protocol_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut protocol_storage).unwrap();
+    let steps = [
+        Unfold::Source,
+        Unfold::Once(0),
+        Unfold::Source,
+        Unfold::Sequence([1, 2]),
+        Unfold::Before {
+            retained,
+            earlier: 3,
+            next: 1,
+            focus: [1, 3],
+        },
+    ];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut storage = vec![0; source.path_workspace_len().unwrap()];
+    let path = source.select(&[], &mut storage).unwrap();
+    use SourcePoint::{Accepted as A, Received as R, Sent as S};
+    // Actor 1 completed the retained visit. Actor 2 accepted and published
+    // its continuation before actor 0 resumed that roll. The late receipt
+    // keeps the completed visit, while a new outgoing reply still waits.
+    let mut history = vec![A(0), S(0), R(0), A(2), S(2), A(1), S(1)];
+    path.check_word(&history).unwrap();
+    assert!(path.completed_incoming_visit(1, 2, 1, |point| history.contains(&point)));
+    assert!(!path.completed_incoming_visit(1, 2, 255, |point| history.contains(&point)));
+    assert!(!path.completed_incoming_visit(1, 2, 1, |point| {
+        point != R(0) && history.contains(&point)
+    }));
+    let mut query = vec![0; path.query_workspace_len().unwrap()];
+    assert!(path.query_from_word(history.iter().copied(), (R(2), 1), &mut query));
+    history.push(R(2));
+    path.check_word(&history).unwrap();
+    assert!(!path.query_from_word(history.iter().copied(), (A(3), 1), &mut query));
+    assert!(matches!(
+        path.check_word(&[history.clone(), vec![A(3)]].concat()),
+        Err(WordError::Predecessor { prior: R(1), .. })
+    ));
+    history.extend([R(1), A(3), S(3), R(3)]);
+    path.check_word(&history).unwrap();
+}
+
+#[test]
+fn graft_completion_cannot_borrow_another_enclosing_visits_receipts() {
+    let global = g::seq(
+        g::send::<0, 1, g::Msg<1, ()>>().roll(),
+        g::seq(
+            g::send::<2, 1, g::Msg<2, ()>>(),
+            g::send::<1, 2, g::Msg<3, ()>>(),
+        ),
+    )
+    .roll();
+    let snapshot: Vec<_> = tap::projected(&project::<1>(&global)).collect();
+    let mut protocol_storage = vec![0; Protocol::workspace_len(&snapshot).unwrap()];
+    let protocol = Protocol::new(&snapshot, &mut protocol_storage).unwrap();
+    let retained = snapshot
+        .iter()
+        .find(|row| {
+            row.id() == tap::PROJECTED_SCOPE
+                && row.causal_key() >> 13 == 1
+                && protocol
+                    .scope(row.causal_key())
+                    .is_some_and(|scope| scope.end == 1)
+        })
+        .unwrap()
+        .causal_key();
+    let steps = [
+        Unfold::Source,
+        Unfold::Once(0),
+        Unfold::Source,
+        Unfold::Sequence([1, 2]),
+        Unfold::Before {
+            retained,
+            earlier: 3,
+            next: 1,
+            focus: [1, 3],
+        },
+        Unfold::Once(3),
+        Unfold::More([5, 4]),
+    ];
+    let mut proof = vec![0; Protocol::unfolding_workspace_len(&steps)];
+    let source = protocol.unfolding(&steps, &mut proof).unwrap();
+    let mut storage = vec![0; source.path_workspace_len().unwrap()];
+    let path = source.select(&[], &mut storage).unwrap();
+    use SourcePoint::{Accepted as A, Received as R, Sent as S};
+    let mut history = vec![
+        A(0),
+        S(0),
+        R(0),
+        A(1),
+        S(1),
+        R(1),
+        A(2),
+        S(2),
+        R(2),
+        A(3),
+        S(3),
+        A(5),
+        S(5),
+        A(4),
+        S(4),
+    ];
+    path.check_word(&history).unwrap();
+    assert!(!path.completed_incoming_visit(4, 5, 1, |point| history.contains(&point)));
+    assert!(matches!(
+        path.check_word(&[history.clone(), vec![R(5)]].concat()),
+        Err(WordError::Predecessor { prior: R(3), .. })
+    ));
+    history.push(R(3));
+    assert!(path.completed_incoming_visit(4, 5, 1, |point| history.contains(&point)));
+    history.extend([R(5), R(4), A(6), S(6), R(6)]);
+    path.check_word(&history).unwrap();
+}
+
+#[test]
 fn completed_roll_receipts_allow_a_late_incoming_continuation_but_not_a_new_send() {
     use SourcePoint::{Accepted as A, Received as R, Sent as S};
     type FileLoan<'a> = g::Msg<10, hibana::Endpoint<'a, 33>>;
@@ -330,7 +459,15 @@ fn reference(
                         && path.point_actor(*entry) == Some(actor)
                         && source.same_resumption(event, point.event(), entry.event())
                 });
-            if (ordered || resumed) && !history.contains(&prior) {
+            // This comparison checks factoring of the prerequisite loop,
+            // keeping completion as its separately tested semantic component.
+            // Literal graft regressions above check its actor/visit boundary.
+            let credited = matches!(point, SourcePoint::Received(_))
+                && event != point.event()
+                && path.completed_incoming_visit(event, point.event(), actor, |point| {
+                    history.contains(&point)
+                });
+            if (ordered && !credited || resumed) && !history.contains(&prior) {
                 return Some(prior);
             }
         }

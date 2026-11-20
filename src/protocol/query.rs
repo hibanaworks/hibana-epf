@@ -160,11 +160,12 @@ impl SourcePath<'_, '_, '_> {
         }
         // A different choice cannot undo publication or repeat a committed
         // point of this same unfolding. Acceptance alone is not publication.
-        if !point.query_preconditions(|prior| {
+        let contains = |prior: SourcePoint| {
             prefix
                 .get(prior.event())
                 .is_some_and(|points| points & prior.bit() != 0)
-        }) {
+        };
+        if !point.query_preconditions(contains) {
             return false;
         }
         let mandatory = |prior: SourcePoint, prefix: Option<&[usize]>| {
@@ -192,7 +193,24 @@ impl SourcePath<'_, '_, '_> {
                 SourcePoint::Received(event),
             ]
             .into_iter()
-            .any(|prior| prefix[prior.event()] & prior.bit() == 0 && mandatory(prior, None))
+            .any(|prior| !contains(prior) && mandatory(prior, None))
+        {
+            return false;
+        }
+        // Check the current selection directly before allocating scratch for
+        // alternatives. This is the same readiness predicate used below;
+        // a selected row introduces no new actor or operation into the prefix.
+        // In particular, a publication needs only its checked acceptance.
+        if self.point_actor(point) == Some(actor)
+            && self.missing(history.clone(), point, contains).is_none()
+        {
+            return true;
+        }
+        // This pruning reads committed-point bits only. Copying the complete
+        // prefix and computing source-order bits cannot change its result.
+        if self
+            .fixed_prefix_blocked_until(point, actor, prefix)
+            .is_some()
         {
             return false;
         }
@@ -202,8 +220,8 @@ impl SourcePath<'_, '_, '_> {
         let (domains, storage) = workspace.split_at_mut(count);
         let (choices, storage) = storage.split_at_mut(count);
         let (actors, scratch) = storage.split_at_mut(count);
-        // Bits above each binary domain retain this event's observed points.
-        // The immutable word is indexed once; it is not an execution cursor.
+        // Prefix membership remains in its immutable index. Scratch holds
+        // choice masks and one reusable source-order bit, not another history.
         let bit = SourcePoint::bit;
         // Selecting an inactive fixed-actor leaf also introduces its
         // publication/receipt. It cannot become a new prerequisite of an
@@ -218,13 +236,9 @@ impl SourcePath<'_, '_, '_> {
         let introduced = (binding == u32::from(actor)
             && self.point_actor(introduced) != Some(actor))
         .then_some(introduced);
-        // The interpreter and final checker already maintain exact membership
-        // of this checked word. Copy only point bits; attribution and choice
-        // bookkeeping are not committed source points. Keep the full word
-        // for the independent resumption/conditional-actor checks below.
-        for (domain, points) in domains.iter_mut().zip(prefix) {
-            *domain = points & 60;
-        }
+        // Borrow exact prefix membership from the interpreter/checker. Only
+        // candidate domains and source-order bits belong in query scratch;
+        // copying the entire observation index into every query is redundant.
         if let Some(introduced) = introduced {
             self.mark_source_after(introduced.event(), domains);
             for prior in history.clone() {
@@ -232,7 +246,7 @@ impl SourcePath<'_, '_, '_> {
                     && prior.event() >= introduced.event()
                     && self.point_actor(prior) == Some(actor)
                     && !self.may_credit_incoming(introduced, prior)
-                    && self.prerequisite_ordered(history.clone(), prior)(
+                    && self.prerequisite_ordered(history.clone(), prior, contains)(
                         introduced,
                         actor,
                         domains[prior.event()] & SOURCE_ORDER != 0,
@@ -243,25 +257,17 @@ impl SourcePath<'_, '_, '_> {
             }
         }
         self.mark_source_before(point.event(), domains);
-        let exact = self.prerequisite_ordered(history.clone(), point);
+        let exact = self.prerequisite_ordered(history.clone(), point, contains);
         // A different uncommitted arm can remove a missing actor-local row
         // from the old visit. Pruning cannot assume its completion credit is
         // unchanged; the candidate's final readiness rechecks that credit.
         let required = |prior, actor, ordered| {
             exact(prior, actor, ordered) && !self.may_credit_incoming(prior, point)
         };
-        if self
-            .fixed_prefix_blocked_until(point, actor, domains)
-            .is_some()
-        {
-            return false;
-        }
         if self.point_actor(point) == Some(actor) {
-            let missing = self.missing_with(
-                point,
-                |prior| domains[prior.event()] & bit(prior) != 0,
-                |prior, actor| exact(prior, actor, domains[prior.event()] & SOURCE_ORDER != 0),
-            );
+            let missing = self.missing_with(point, contains, |prior, actor| {
+                exact(prior, actor, domains[prior.event()] & SOURCE_ORDER != 0)
+            });
             let Some(prior) = missing else {
                 return true;
             };
@@ -270,7 +276,7 @@ impl SourcePath<'_, '_, '_> {
             // forced by a commit in that arm. Acceptance alone does not
             // force an arm. Conditional actors and resumption-only
             // prerequisites still use the full selection checks below.
-            if mandatory(prior, Some(domains)) {
+            if mandatory(prior, Some(prefix)) {
                 return false;
             }
         }
@@ -308,7 +314,7 @@ impl SourcePath<'_, '_, '_> {
             let mut total = 0;
             for (event, before) in demands.iter_mut().enumerate() {
                 *before = total;
-                total += usize::from(event == point.event() || domains[event] & 56 != 0);
+                total += usize::from(event == point.event() || prefix[event] & 56 != 0);
             }
             choices[0] = 0;
             actors[0] = root;
@@ -332,7 +338,7 @@ impl SourcePath<'_, '_, '_> {
                     // point forces either arm. The ordinary traversal would
                     // mark every leaf viable and every internal domain 3.
                     // Binary boundaries fill exactly this contiguous range;
-                    // preserve the independent observation bits in each word.
+                    // Source-order bits remain independent of choice masks.
                     for domain in &mut domains[span[0]..end - 1] {
                         *domain |= 3;
                     }
@@ -351,7 +357,7 @@ impl SourcePath<'_, '_, '_> {
                         .any(|prior| {
                             self.point_binding(prior).is_some_and(|(_, binding)| {
                                 binding == u32::from(actor)
-                                    && domains[prior.event()] & bit(prior) == 0
+                                    && prefix[prior.event()] & bit(prior) == 0
                                     && required(
                                         prior,
                                         actor,
@@ -431,7 +437,7 @@ impl SourcePath<'_, '_, '_> {
         // it neither discards a commit nor adds mutable execution state.
         let (previous, scratch) = scratch.split_at_mut(count);
         let mut committed = [usize::MAX; u8::MAX as usize + 1];
-        for (event, points) in domains.iter().enumerate() {
+        for (event, points) in prefix.iter().enumerate() {
             let point = if points & 32 != 0 {
                 SourcePoint::Local(event)
             } else if points & 16 != 0 {
@@ -448,13 +454,13 @@ impl SourcePath<'_, '_, '_> {
         let newly_required = |prior: SourcePoint, actor: u8| {
             let mut event = committed[usize::from(actor)];
             while event != usize::MAX && event >= prior.event() {
-                let point = if domains[event] & 32 != 0 {
+                let point = if prefix[event] & 32 != 0 {
                     SourcePoint::Local(event)
                 } else {
                     SourcePoint::Received(event)
                 };
                 if !self.may_credit_incoming(prior, point)
-                    && self.prerequisite(history.clone(), point)(prior, actor)
+                    && self.prerequisite(history.clone(), point, contains)(prior, actor)
                 {
                     return true;
                 }
@@ -463,19 +469,12 @@ impl SourcePath<'_, '_, '_> {
             false
         };
         let available = |path: &SourcePath<'_, '_, '_>| {
+            let required = path.prerequisite_ordered(history.clone(), point, contains);
             path.point_actor(point) == Some(actor)
                 && path
-                    .missing_with(
-                        point,
-                        |prior| domains[prior.event()] & bit(prior) != 0,
-                        |prior, actor| {
-                            path.prerequisite_ordered(history.clone(), point)(
-                                prior,
-                                actor,
-                                domains[prior.event()] & SOURCE_ORDER != 0,
-                            )
-                        },
-                    )
+                    .missing_with(point, contains, |prior, actor| {
+                        required(prior, actor, domains[prior.event()] & SOURCE_ORDER != 0)
+                    })
                     .is_none()
         };
         choices.fill(0);
@@ -515,7 +514,7 @@ impl SourcePath<'_, '_, '_> {
                         let Some((side, _)) = self.point_binding(prior) else {
                             continue;
                         };
-                        if domains[event] & bit(prior) != 0 {
+                        if prefix[event] & bit(prior) != 0 {
                             if self.point_actor(prior) != Some(actual[side]) {
                                 return false;
                             }

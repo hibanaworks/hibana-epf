@@ -316,8 +316,9 @@ impl<'p, 'u> Unfolded<'p, 'u> {
                 actual: parts.len() + parents.len() + stack.len(),
             });
         }
-        let (parts, locators) = parts[..Layout::path_index_words(count).unwrap()]
-            .split_at_mut(Layout::binary_words(count).unwrap());
+        let (source_index, rolls) = parts[..Layout::path_index_words(count).unwrap()]
+            .split_at_mut(Layout::source_index_words(count).unwrap());
+        let (parts, locators) = source_index.split_at_mut(Layout::binary_words(count).unwrap());
         let (locators, routes) = locators.split_at_mut(3 * count);
         let (route_count, routes) = routes.split_first_mut().unwrap();
         let mut used_routes = 0;
@@ -401,6 +402,7 @@ impl<'p, 'u> Unfolded<'p, 'u> {
             *slot = event;
         }
         by_origin.sort_unstable_by_key(|&event| (origins[event], event));
+        self.index_prior_rolls(order, rolls, parents, stack)?;
         Ok(())
     }
 
@@ -492,6 +494,19 @@ impl<'p, 'u> Unfolded<'p, 'u> {
 mod tests;
 
 impl SourcePath<'_, '_, '_> {
+    /// Every occurrence of this original message, in expanded event order.
+    /// Inactive arms remain in the domain; this is a lookup, not readiness.
+    pub(super) fn origin_events(&self, origin: u16) -> &[usize] {
+        let count = self.source.event_count();
+        let start = Layout::binary_words(count).unwrap();
+        let origins = &self.index[start..start + count];
+        let by_origin = &self.index[start + 2 * count..start + 3 * count];
+        let origin = usize::from(origin);
+        let first = by_origin.partition_point(|&event| origins[event] < origin);
+        let end = first + by_origin[first..].partition_point(|&event| origins[event] == origin);
+        &by_origin[first..end]
+    }
+
     pub(super) fn choice_at(&self, event: usize, scope: u16) -> Option<bool> {
         let (span, right) = self.route_at(event, scope)?;
         if self.actors(event).is_some() {

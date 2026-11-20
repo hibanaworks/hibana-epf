@@ -1,5 +1,5 @@
 //! Check finite source unfoldings without enumerating a fixed catalogue of visits.
-use super::{Layout, Protocol};
+use super::{Layout, PathError, Protocol, SourcePath};
 
 pub(super) mod generate;
 
@@ -497,65 +497,165 @@ impl Unfolded<'_, '_> {
         }
     }
 
-    // Earlier complete copies can retain an incoming continuation while a
-    // later copy is unfinished. Require the same source-sequence invocation:
-    // a matching original scope in another enclosing visit is insufficient.
-    pub(super) fn earlier_visits(
+    // A Before graft places a new visit before one subtree of an existing
+    // continuation. Its retained anchor is still an earlier visit of this
+    // same invocation, even though the common proof node is not Sequence.
+    // Return only membership in that anchor; completion belongs to the
+    // selected physical actor and is checked by the common visit predicate.
+    pub(super) fn earlier_graft(
         &self,
         prior: usize,
         target: usize,
-        mut complete: impl FnMut(usize, usize, [usize; 2]) -> bool,
-    ) -> bool {
-        let Some(target_origin) = self.origin(target).map(usize::from) else {
-            return false;
+    ) -> Option<impl Fn(usize) -> bool + '_> {
+        let (proof, base) = self.common_context(prior, target)?;
+        let Unfold::Before {
+            retained,
+            earlier,
+            next,
+            focus,
+        } = self.steps[proof]
+        else {
+            return None;
         };
-        let layout = Layout::checked(self.protocol);
-        let Some(last_shared) = self.common_context(prior, target) else {
-            return false;
+        let added = self.count(next);
+        if !matches!(
+            insertion_part(self.local_position(prior, proof, base)?, focus[0], added),
+            InsertPart::Resumed(_)
+        ) {
+            return None;
+        }
+        let InsertPart::Earlier(target) =
+            insertion_part(self.local_position(target, proof, base)?, focus[0], added)
+        else {
+            return None;
         };
-        let mut common = None;
-        let mut shared = true;
-        let mut credited = false;
-        self.contexts(prior, |proof, base, local| {
-            if shared {
-                common = Some(proof);
-                shared = (proof, base) != last_shared;
-            }
-            let Unfold::More([earlier, _]) = self.steps[proof] else {
-                return true;
-            };
-            let body = get(self.rows, proof);
-            let follows = common.is_some_and(|parent| {
-                let region = get(self.rows, parent);
-                matches!(self.steps[parent], Unfold::Sequence(_))
-                    && region.start <= body.start
-                    && body.end <= region.end
-                    && body.end <= target_origin
-                    && target_origin < region.end
-                    && layout.source_before(
-                        self.protocol,
-                        region,
-                        body.end - 1 - region.start,
-                        target_origin - region.start,
-                    )
-            });
-            if local < self.count(earlier) || !follows {
-                return true;
-            }
-            let mut first = 0;
-            while first < self.count(earlier) {
-                let Some(span) = self.copy_range(earlier, first) else {
-                    break;
-                };
-                if complete(proof, base, span) {
-                    credited = true;
-                    return false;
+        if target < focus[0] {
+            return None;
+        }
+        Some(move |event| {
+            self.local_position(event, proof, base)
+                .is_some_and(|local| match insertion_part(local, focus[0], added) {
+                    InsertPart::Earlier(local) => self.anchor_contains(earlier, retained, local),
+                    InsertPart::Resumed(_) => false,
+                })
+        })
+    }
+
+    // Index only More invocations whose nonempty earlier copy precedes the
+    // event in proof-leaf order. Unary and empty children add no index rows;
+    // the actual expansion bounds both the rows and the pending DFS stack.
+    // This immutable data never records execution progress or grants credit.
+    pub(super) fn index_prior_rolls(
+        &self,
+        order: &[usize],
+        index: &mut [usize],
+        parents: &mut [usize],
+        stack: &mut [usize],
+    ) -> Result<(), PathError> {
+        let count = self.event_count();
+        let (heads, rest) = index.split_at_mut(count);
+        let (ranks, rows) = rest.split_at_mut(count);
+        let rows = rows.as_chunks_mut::<3>().0;
+        heads.fill(usize::MAX);
+        ranks.fill(usize::MAX);
+        let mut used = 0;
+        let mut pending = 0;
+        let (mut proof, mut base, mut enclosing) = (self.steps.len() - 1, 0, usize::MAX);
+        loop {
+            match self.steps[proof] {
+                Unfold::Source => {
+                    for (rank, &event) in
+                        order.iter().enumerate().skip(base).take(self.count(proof))
+                    {
+                        heads[event] = enclosing;
+                        ranks[event] = rank;
+                    }
                 }
-                first = span[1];
+                Unfold::Once(body) => {
+                    proof = body;
+                    continue;
+                }
+                step => {
+                    let [a, b] = match step {
+                        Unfold::Sequence(children)
+                        | Unfold::Parallel(children)
+                        | Unfold::Choice(children)
+                        | Unfold::More(children)
+                        | Unfold::Independent(children) => children,
+                        Unfold::After { earlier, next, .. } => [earlier, next],
+                        Unfold::Alongside { earlier, next, .. }
+                        | Unfold::Before { earlier, next, .. } => [next, earlier],
+                        Unfold::Source | Unfold::Once(_) => unreachable!(),
+                    };
+                    let left = self.count(a);
+                    if left == 0 {
+                        proof = b;
+                        continue;
+                    }
+                    if self.count(b) == 0 {
+                        proof = a;
+                        continue;
+                    }
+                    let next_enclosing = if matches!(step, Unfold::More(_)) {
+                        rows[used] = [proof, base, enclosing];
+                        used += 1;
+                        used - 1
+                    } else {
+                        enclosing
+                    };
+                    stack[2 * pending..2 * pending + 2].copy_from_slice(&[b, base + left]);
+                    parents[pending] = next_enclosing;
+                    pending += 1;
+                    proof = a;
+                    continue;
+                }
             }
-            true
-        });
-        credited
+            if pending == 0 {
+                break;
+            }
+            pending -= 1;
+            proof = stack[2 * pending];
+            base = stack[2 * pending + 1];
+            enclosing = parents[pending];
+        }
+
+        // Validate each indexed chain against the established context walk,
+        // once at construction. Insertion order differs from source order,
+        // so check the inverse permutation too before publishing SourcePath.
+        for event in 0..count {
+            let mut next = heads[event];
+            let mut depth = 0;
+            while next != usize::MAX {
+                stack[depth] = next;
+                depth += 1;
+                next = rows[next][2];
+            }
+            let mut valid = true;
+            self.contexts(event, |proof, base, local| {
+                if let Unfold::More([earlier, _]) = self.steps[proof]
+                    && self.count(earlier) != 0
+                    && local >= self.count(earlier)
+                {
+                    if depth == 0 {
+                        valid = false;
+                        return false;
+                    }
+                    depth -= 1;
+                    valid &= rows[stack[depth]][..2] == [proof, base];
+                }
+                if matches!(self.steps[proof], Unfold::Source) {
+                    valid &= ranks[event] == base + local;
+                }
+                valid
+            });
+            if !valid || depth != 0 || ranks[event] == usize::MAX {
+                return Err(PathError::Structure {
+                    start: event,
+                    end: event + 1,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn has_repeated_visits(&self) -> bool {
@@ -1062,6 +1162,62 @@ fn get(rows: &[usize], index: usize) -> Region {
         first: rows[5 * index + 2] & 0xffff,
         last: rows[5 * index + 3],
         rolled: rows[5 * index + 2] >> 16 != 0,
+    }
+}
+
+impl SourcePath<'_, '_, '_> {
+    // Locate nonempty earlier copies in the same source-sequence invocation.
+    // The chain contains only rolls whose next child contains prior. A roll
+    // also containing target is above the divergence, so cannot provide credit.
+    pub(super) fn earlier_rolls(
+        &self,
+        prior: usize,
+        target: usize,
+        mut complete: impl FnMut(usize, usize, usize) -> bool,
+    ) -> bool {
+        let source = self.unfolding();
+        let count = source.event_count();
+        let Some((common, _)) = source.common_context(prior, target) else {
+            return false;
+        };
+        if !matches!(source.steps[common], Unfold::Sequence(_)) {
+            return false;
+        }
+        let target_origin = usize::from(self.origin(target).unwrap());
+        let region = get(source.rows, common);
+        let layout = Layout::checked(source.protocol);
+        let index = &self.index[Layout::source_index_words(count).unwrap()..];
+        let (heads, rest) = index.split_at(count);
+        let (ranks, rows) = rest.split_at(count);
+        let rows = rows.as_chunks::<3>().0;
+        let mut next = heads[prior];
+        while next != usize::MAX {
+            let [proof, base, parent] = rows[next];
+            next = parent;
+            if base <= ranks[target] && ranks[target] - base < source.count(proof) {
+                continue;
+            }
+            let body = get(source.rows, proof);
+            if region.start <= body.start
+                && body.end <= region.end
+                && body.end <= target_origin
+                && target_origin < region.end
+                && layout.source_before(
+                    source.protocol,
+                    region,
+                    body.end - 1 - region.start,
+                    target_origin - region.start,
+                )
+            {
+                let Unfold::More([earlier, _]) = source.steps[proof] else {
+                    unreachable!();
+                };
+                if complete(proof, base, earlier) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

@@ -320,11 +320,16 @@ It compares them with the compiled conditional bindings under those same
 choices. Separate visits can choose different arms. Parallel transfer/use
 conflicts, overlapping physical actors in independent visits, unselected
 resumption anchors and changed entry owners are rejected. Path selection uses
-`8N - 3 + I + C + A` caller-owned words for `N > 0` expanded messages,
+`18N - 9 + I + C + A` caller-owned words for `N > 0` expanded messages,
 `I` initial bindings, `C` compiled choices and `A = max_role + 1` actor tags.
 This includes actor rows, the immutable index and reusable traversal scratch.
-The checked source's binary boundaries are indexed once, using three words
-per boundary and two words per message for its origin and proof-leaf order.
+The checked source's binary boundaries are indexed once. The index retains
+three words per boundary, three per message for origins and their permutations,
+and a header plus four words per possible route boundary. Prior-roll lookup
+adds two words per message and three per possible nonempty `More` invocation
+(at most `N - 1`). Each chain and inverse proof-leaf rank is checked against
+the source context walk before publication. Readiness then visits only prior
+rolls that can supply credit, instead of walking every proof ancestor again.
 Readiness queries borrow that immutable index instead of rediscovering the
 same subtrees for each alternative choice. Only the actor
 rows and index remain borrowed; selection scratch is reused for execution
@@ -340,7 +345,9 @@ outgoing-continuation prerequisites activated by a committed resumed body.
 An incoming continuation already accepted by its sender does not acquire a
 new outgoing prerequisite. With ordinary repeated copies, an earlier selected
 visit can supply the same physical actor's completion for a late incoming
-continuation. The earlier visit must contain at least one of that actor's
+continuation. A `Before` graft retains the same possibility through its earlier
+anchor in that invocation. Both use one actor-local completion predicate.
+The earlier visit must contain at least one of that actor's
 operations, and all its selected local/publication/receipt points must have
 committed. This never replaces transport acceptance or the same occurrence's
 colocated publication, and never enables a new outgoing or local action. The

@@ -267,9 +267,9 @@ fn a_missing_prefix_receive_skips_every_unrelated_suffix_choice() {
         None::<SourcePoint>
     });
     assert!(!path.query_from_word(history, (SourcePoint::Accepted(2), 1), &mut scratch));
-    // Source conditions are propagated once. Unrelated choices must not
-    // multiply reads of the supplied history.
-    assert_eq!(reads.get(), 2);
+    // Index the empty prefix once. Its missing fixed predecessor rejects
+    // before alternative-choice propagation needs another history walk.
+    assert_eq!(reads.get(), 1);
     scratch.fill(usize::MAX);
     assert!(!path.query_from_word([].into_iter(), (SourcePoint::Accepted(1), 1), &mut scratch));
     assert!(
@@ -1014,7 +1014,15 @@ fn ready_from_source(path: &SourcePath, history: &[SourcePoint], point: SourcePo
                         && path.point_actor(entry) == Some(actor)
                         && source.same_resumption(prior.event(), point.event(), entry.event())
                 });
-            !ordered && !resumed
+            // Enumerate choices and prerequisites independently of query
+            // pruning. The actor-local completion component is shared with
+            // the word specification and has literal positive/negative tests.
+            let credited = matches!(point, SourcePoint::Received(_))
+                && event != point.event()
+                && path.completed_incoming_visit(event, point.event(), actor, |point| {
+                    history.contains(&point)
+                });
+            (!ordered || credited) && !resumed
         })
     })
 }
@@ -1148,10 +1156,11 @@ fn compare(snapshot: &[tap::TapEvent], steps: &[Unfold]) {
                 SourcePoint::Received(event),
             ] {
                 if let Some(actor) = path.point_actor(prior) {
-                    assert!(!path
-                        .prerequisite(history.clone(), SourcePoint::Accepted(0))(
-                        prior, actor
-                    ));
+                    assert!(!path.prerequisite(
+                        history.clone(),
+                        SourcePoint::Accepted(0),
+                        |_| false
+                    )(prior, actor));
                 }
             }
         }
@@ -1281,16 +1290,20 @@ fn compare(snapshot: &[tap::TapEvent], steps: &[Unfold]) {
                             {
                                 assert!(event < end && end <= source.event_count());
                                 for later in event..end {
-                                    for excluded in [
-                                        SourcePoint::Local(later),
-                                        SourcePoint::Accepted(later),
-                                        SourcePoint::Received(later),
-                                    ] {
-                                        assert!(
-                                            !reference(path, &paths, &word, excluded, actor),
-                                            "blocked span event={event} end={end} actor={actor} query={excluded:?} history={word:?}"
-                                        );
-                                    }
+                                    // A certificate belongs to this point
+                                    // kind. A blocked outgoing operation need
+                                    // not block a credited incoming receipt.
+                                    // The outer loop checks every kind itself.
+                                    let excluded = match point {
+                                        SourcePoint::Local(_) => SourcePoint::Local(later),
+                                        SourcePoint::Accepted(_) => SourcePoint::Accepted(later),
+                                        SourcePoint::Sent(_) => SourcePoint::Sent(later),
+                                        SourcePoint::Received(_) => SourcePoint::Received(later),
+                                    };
+                                    assert!(
+                                        !reference(path, &paths, &word, excluded, actor),
+                                        "blocked span event={event} end={end} actor={actor} query={excluded:?} history={word:?}"
+                                    );
                                 }
                             }
                             assert_eq!(

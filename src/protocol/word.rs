@@ -100,7 +100,11 @@ impl SourcePath<'_, '_, '_> {
         if self.point_actor(point).is_none() {
             return Err(WordError::Point { index });
         }
-        if let Some(earlier) = history.clone().position(|prior| prior == point) {
+        if contains(point) {
+            let earlier = history
+                .clone()
+                .position(|prior| prior == point)
+                .expect("membership describes the same source prefix");
             return Err(WordError::Duplicate { index, earlier });
         }
         if let Some(prior) = self.missing(history, point, contains) {
@@ -117,7 +121,11 @@ impl SourcePath<'_, '_, '_> {
         point: SourcePoint,
         contains: impl Fn(SourcePoint) -> bool,
     ) -> Option<SourcePoint> {
-        self.missing_with(point, contains, self.prerequisite(history, point))
+        self.missing_with(
+            point,
+            &contains,
+            self.prerequisite(history, point, &contains),
+        )
     }
 
     pub(super) fn missing_with(
@@ -179,8 +187,9 @@ impl SourcePath<'_, '_, '_> {
         &self,
         history: impl Clone + Iterator<Item = SourcePoint>,
         point: SourcePoint,
+        contains: impl Fn(SourcePoint) -> bool,
     ) -> impl Fn(SourcePoint, u8) -> bool {
-        let required = self.prerequisite_ordered(history, point);
+        let required = self.prerequisite_ordered(history, point, contains);
         move |prior, actor| {
             let ordered = !matches!(point, SourcePoint::Sent(_))
                 && prior.event() != point.event()
@@ -193,6 +202,7 @@ impl SourcePath<'_, '_, '_> {
         &self,
         history: impl Clone + Iterator<Item = SourcePoint>,
         point: SourcePoint,
+        contains: impl Fn(SourcePoint) -> bool,
     ) -> impl Fn(SourcePoint, u8, bool) -> bool {
         let source = self.unfolding();
         let can_resume =
@@ -213,7 +223,7 @@ impl SourcePath<'_, '_, '_> {
                         prior.event(),
                         point.event(),
                         actor,
-                        |entry| history.clone().any(|observed| observed == entry),
+                        &contains,
                     )))
                 || can_resume
                     && prior.event() < point.event()
@@ -236,38 +246,69 @@ impl SourcePath<'_, '_, '_> {
         contains: impl Fn(SourcePoint) -> bool,
     ) -> bool {
         let source = self.unfolding();
-        source.earlier_visits(prior, target, |proof, base, span| {
-            let mut present = false;
-            for event in 0..prior {
-                if !source
-                    .local_position(event, proof, base)
-                    .is_some_and(|local| span[0] <= local && local < span[1])
-                {
-                    continue;
+        if let Some(anchor) = source.earlier_graft(prior, target)
+            && self.completed_visit((prior, actor), &contains, anchor)
+        {
+            return true;
+        }
+        self.earlier_rolls(prior, target, |proof, base, earlier| {
+            let mut first = 0;
+            while first < source.count(earlier) {
+                let Some(span) = source.copy_range(earlier, first) else {
+                    break;
+                };
+                if self.completed_visit((prior, actor), &contains, |event| {
+                    source
+                        .local_position(event, proof, base)
+                        .is_some_and(|local| span[0] <= local && local < span[1])
+                }) {
+                    return true;
                 }
-                for point in [
-                    SourcePoint::Local(event),
-                    SourcePoint::Sent(event),
-                    SourcePoint::Received(event),
-                ] {
-                    if self.point_actor(point) == Some(actor) {
-                        present = true;
-                        if !contains(point) {
-                            return false;
-                        }
+                first = span[1];
+            }
+            false
+        })
+    }
+
+    fn completed_visit(
+        &self,
+        (before, actor): (usize, u8),
+        contains: impl Fn(SourcePoint) -> bool,
+        member: impl Fn(usize) -> bool,
+    ) -> bool {
+        let mut present = false;
+        for event in 0..before {
+            if !self
+                .actors(event)
+                .is_some_and(|actors| actors.contains(&actor))
+                || !member(event)
+            {
+                continue;
+            }
+            for point in [
+                SourcePoint::Local(event),
+                SourcePoint::Sent(event),
+                SourcePoint::Received(event),
+            ] {
+                if self.point_actor(point) == Some(actor) {
+                    present = true;
+                    if !contains(point) {
+                        return false;
                     }
                 }
             }
-            present
-        })
+        }
+        present
     }
 
     pub(super) fn may_credit_incoming(&self, prior: SourcePoint, target: SourcePoint) -> bool {
         matches!(target, SourcePoint::Received(_))
             && prior.event() != target.event()
-            && self
+            && (self
                 .unfolding()
-                .earlier_visits(prior.event(), target.event(), |_, _, _| true)
+                .earlier_graft(prior.event(), target.event())
+                .is_some()
+                || self.earlier_rolls(prior.event(), target.event(), |_, _, _| true))
     }
 
     // For a fixed target, the nearest boundary at or after `first` whose
@@ -289,7 +330,7 @@ impl SourcePath<'_, '_, '_> {
     // Transpose of the same relation. Ancestors extend the covered suffix in
     // disjoint intervals; each interval inherits its first containing node's
     // sequence/par/route kind. Used before the backwards query sweep so both
-    // directions share one temporary bit in the existing observation words.
+    // directions share one temporary bit in the query's existing words.
     pub(super) fn mark_source_after(&self, target: usize, rows: &mut [usize]) {
         for row in rows.iter_mut() {
             *row &= !SOURCE_ORDER;
